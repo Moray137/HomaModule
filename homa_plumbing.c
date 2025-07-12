@@ -965,11 +965,8 @@ int homa_getsockopt(struct sock *sk, int level, int optname,
 	return 0;
 }
 
-static int __homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen, int flags) {
+static int __homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen) {
 	struct homa_sock *hsk = homa_sk(sk);
-	if (flags != 0) {
-		return -EINVAL;
-	}
 	if (hsk->connected) {
 		return -EISCONN;
 	}
@@ -1010,10 +1007,10 @@ static int __homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen, i
  * @addr_len: The length of the address
  * @flags:    Not used by Homa
  */
-int homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen, int flags) {
+int homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen) {
 	int res;
 	homa_sock_lock(homa_sk(sk));
-	res = __homa_connect(sk, addr, addrlen, flags);
+	res = __homa_connect(sk, addr, addrlen);
 	homa_sock_unlock(homa_sk(sk));
 	return res;
 }
