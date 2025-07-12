@@ -233,6 +233,8 @@ int homa_sock_init(struct homa_sock *hsk)
 	hlist_add_head_rcu(&hsk->socktab_links,
 			   &socktab->buckets[homa_socktab_bucket(hnet,
 								 hsk->port)]);
+	hsk->connected = false;
+	memset(&(hsk->target_addr), 0, sizeof(hsk->target_addr));
 	spin_unlock_bh(&socktab->write_lock);
 	return result;
 
