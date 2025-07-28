@@ -864,6 +864,8 @@ int homa_setsockopt(struct sock *sk, int level, int optname,
 {
 	struct homa_sock *hsk = homa_sk(sk);
 	int ret;
+	// This boolean value checks whether the call is from kernel.
+	bool in_kernel = (current->mm == NULL);
 
 	if (level != IPPROTO_HOMA)
 		return -ENOPROTOOPT;
@@ -880,15 +882,20 @@ int homa_setsockopt(struct sock *sk, int level, int optname,
 		if (copy_from_sockptr(&args, optval, optlen))
 			return -EFAULT;
 
-		/* Do a trivial test to make sure we can at least write the
+		if (in_kernel) {
+			ret = homa_pool_set_region(hsk, (void *)(uintptr_t)args.start, args.length, true);
+		}
+		else {
+			/* Do a trivial test to make sure we can at least write the
 		 * first page of the region.
 		 */
-		if (copy_to_user(u64_to_user_ptr(args.start), &args,
-				 sizeof(args)))
-			return -EFAULT;
+			if (copy_to_user(u64_to_user_ptr(args.start), &args,
+					 sizeof(args)))
+				return -EFAULT;
 
-		ret = homa_pool_set_region(hsk, u64_to_user_ptr(args.start),
-					   args.length);
+			ret = homa_pool_set_region(hsk, u64_to_user_ptr(args.start),
+									   args.length, false);
+		}
 		INC_METRIC(so_set_buf_calls, 1);
 		INC_METRIC(so_set_buf_cycles, homa_clock() - start);
 	} else if (optname == SO_HOMA_SERVER) {
@@ -1443,6 +1450,7 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 		INC_METRIC(reply_cycles, finish - start);
 	}
 	tt_record1("homa_sendmsg finished, id %d", args.id);
+	printk("You just sent out a in-kernel msg via a connected Homa socket. \n");
 	return 0;
 
 error:
@@ -1640,6 +1648,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	u64 start = homa_clock();
 	u64 finish;
 #endif /* See strip.py */
+	bool in_kernel = hsk->in_kernel;
 	int result;
 
 	INC_METRIC(recv_calls, 1);
@@ -1654,9 +1663,14 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	}
 	if (msg->msg_controllen != sizeof(control))
 		return -EINVAL;
-	if (unlikely(copy_from_user(&control, (void __user *)msg->msg_control,
-				    sizeof(control))))
-		return -EFAULT;
+	if (in_kernel) {
+		memcpy(&control, msg->msg_control, sizeof(control));
+	}
+	else {
+		if (unlikely(copy_from_user(&control, (void __user *)msg->msg_control,
+					sizeof(control))))
+			return -EFAULT;
+	}
 	control.completion_cookie = 0;
 	tt_record2("homa_recvmsg starting, port %d, pid %d",
 		   hsk->port, current->pid);
@@ -1773,16 +1787,20 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	}
 
 done:
-	if (unlikely(copy_to_user((__force void __user *)msg->msg_control,
+	if (in_kernel) {
+		memcpy(msg->msg_control, &control, sizeof(control));
+	}
+	else {
+		if (unlikely(copy_to_user((__force void __user *)msg->msg_control,
 				  &control, sizeof(control)))) {
 #ifndef __UPSTREAM__ /* See strip.py */
-		/* Note: in this case the message's buffers will be leaked. */
-		pr_notice("%s couldn't copy back args to 0x%px\n",
-			  __func__, msg->msg_control);
+			/* Note: in this case the message's buffers will be leaked. */
+			pr_notice("%s couldn't copy back args to 0x%px\n",
+				  __func__, msg->msg_control);
 #endif /* See strip.py */
-		result = -EFAULT;
+			result = -EFAULT;
+				  }
 	}
-
 #ifndef __STRIP__ /* See strip.py */
 	finish = homa_clock();
 #endif /* See strip.py */

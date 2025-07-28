@@ -696,7 +696,7 @@ int      homa_bind(struct socket *sk, struct sockaddr *addr,
 		   int addr_len);
 void     homa_close(struct sock *sock, long timeout);
 int      homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen);
-int      homa_copy_to_user(struct homa_rpc *rpc);
+int      homa_copy_to_pool(struct homa_rpc *rpc);
 void     homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
 void     homa_destroy(struct homa *homa);
 void     homa_dispatch_pkts(struct sk_buff *skb);

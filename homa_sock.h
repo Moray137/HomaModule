@@ -269,6 +269,12 @@ struct homa_sock {
 	 * always be CONNECTIONLESS.
 	 */
 	union sockaddr_in_union target_addr;
+
+	/**
+	 * @in_kernel: For NVMe/Homa. Distinguishes a socket's origin, say whether it was
+	 * for in-kernel purposes or user space purposes.
+	 */
+	bool in_kernel;
 };
 
 /**

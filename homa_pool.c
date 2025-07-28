@@ -67,10 +67,12 @@ struct homa_pool *homa_pool_alloc(struct homa_sock *hsk)
  * @region:       First byte of the memory region for the pool, allocated
  *                by the application; must be page-aligned.
  * @region_size:  Total number of bytes available at @buf_region.
+ *
+ * @from_kernel:  Tell the method whether this set is from kernel.
  * Return: Either zero (for success) or a negative errno for failure.
  */
-int homa_pool_set_region(struct homa_sock *hsk, void __user *region,
-			 u64 region_size)
+int homa_pool_set_region(struct homa_sock *hsk, void *region,
+                         u64 region_size, bool from_kernel)
 {
 	struct homa_pool_core __percpu *cores;
 	struct homa_bpage *descriptors;
@@ -104,7 +106,9 @@ int homa_pool_set_region(struct homa_sock *hsk, void __user *region,
 		goto error;
 	}
 
-	pool->region = (char __user *)region;
+	/* Set region depending on whether buffer is from kernel or user space */
+	pool->region = (from_kernel) ? (char *)region : (char __user *)region;
+	hsk->in_kernel = from_kernel;
 	pool->num_bpages = num_bpages;
 	pool->descriptors = descriptors;
 	atomic_set(&pool->free_bpages, pool->num_bpages);

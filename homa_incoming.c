@@ -264,6 +264,8 @@ keep:
 /**
  * homa_copy_to_user() - Copy as much data as possible from incoming
  * packet buffers to buffers in user space.
+ * Edit: To support in-kernel operations, this method is renamed to homa_copy_to_pool.
+ * The method checks whether a hsk is for kernel usage only (its buffer pool lives in kernel)
  * @rpc:     RPC for which data should be copied. Must be locked by caller.
  * Return:   Zero for success or a negative errno if there is an error.
  *           It is possible for the RPC to be freed while this function
@@ -272,7 +274,7 @@ keep:
  *           will be RPC_DEAD. Clears the RPC_PKTS_READY bit in @rpc->flags
  *           if all available packets have been copied out.
  */
-int homa_copy_to_user(struct homa_rpc *rpc)
+int homa_copy_to_pool(struct homa_rpc *rpc)
 	__must_hold(rpc_bucket_lock)
 {
 #ifdef __UNIT_TEST__
@@ -291,6 +293,8 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 #endif /* See strip.py */
 	int n = 0;             /* Number of filled entries in skbs. */
 	int i;
+	/* If using kernel apps like NVMe-oF, we will need to copy to kernel */
+	bool in_kernel = rpc->hsk->in_kernel;
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -326,7 +330,7 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 		homa_rpc_hold(rpc);
 		homa_rpc_unlock(rpc);
 
-		tt_record1("starting copy to user space for id %d",
+		tt_record1("starting copy to buffer pool for id %d",
 			   rpc->id);
 
 		/* Each iteration of this loop copies out one skb. */
@@ -338,7 +342,7 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 			int buf_bytes, chunk_size;
 			struct iov_iter iter;
 			int copied = 0;
-			char __user *dst;
+			char *dst;
 
 			/* Each iteration of this loop copies to one
 			 * user buffer.
@@ -356,16 +360,21 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 					}
 					chunk_size = buf_bytes;
 				}
-				error = import_ubuf(READ, dst, chunk_size,
-						    &iter);
-				if (error)
-					goto free_skbs;
-				error = skb_copy_datagram_iter(skbs[i],
-							       sizeof(*h) +
-							       copied,  &iter,
-							       chunk_size);
-				if (error)
-					goto free_skbs;
+
+				if (in_kernel)
+					memcpy(dst, skbs[i]->data + sizeof(*h) + copied, chunk_size);
+				else {
+					error = import_ubuf(READ, (void __user *) dst, chunk_size,
+							&iter);
+					if (error)
+						goto free_skbs;
+					error = skb_copy_datagram_iter(skbs[i],
+									   sizeof(*h) +
+									   copied,  &iter,
+									   chunk_size);
+					if (error)
+						goto free_skbs;
+				}
 				copied += chunk_size;
 			}
 #ifndef __UPSTREAM__ /* See strip.py */
@@ -1085,7 +1094,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 	 */
 	while (1) {
 		if (!rpc->error)
-			rpc->error = homa_copy_to_user(rpc);
+			rpc->error = homa_copy_to_pool(rpc);
 		if (rpc->error) {
 			result = rpc->error;
 			break;
@@ -1220,7 +1229,7 @@ struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking)
 		atomic_andnot(APP_NEEDS_LOCK, &rpc->flags);
 		homa_rpc_put(rpc);
 		if (!rpc->error)
-			rpc->error = homa_copy_to_user(rpc);
+			rpc->error = homa_copy_to_pool(rpc);
 		if (rpc->error) {
 			if (rpc->state != RPC_DEAD)
 				break;
