@@ -349,8 +349,8 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			 */
 			while (copied < pkt_length) {
 				chunk_size = pkt_length - copied;
-				dst = homa_pool_get_buffer(rpc, offset + copied,
-							   &buf_bytes);
+				dst = in_kernel ? (void *) homa_pool_get_buffer(rpc, offset + copied, &buf_bytes) :
+				homa_pool_get_buffer(rpc, offset + copied, &buf_bytes);
 				if (buf_bytes < chunk_size) {
 					if (buf_bytes == 0) {
 						/* skb has data beyond message
