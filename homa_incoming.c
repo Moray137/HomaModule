@@ -361,9 +361,12 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 					chunk_size = buf_bytes;
 				}
 
-				if (in_kernel)
+				if (in_kernel) {
+					printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
 					memcpy(dst, skbs[i]->data + sizeof(*h) + copied, chunk_size);
+				}
 				else {
+					pr_err("seems like you are copying to a wrong place? You are in kernel.\n");
 					error = import_ubuf(READ, (void __user *) dst, chunk_size,
 							&iter);
 					if (error)

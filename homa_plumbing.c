@@ -1698,6 +1698,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		}
 		result = homa_wait_private(rpc, nonblocking);
 		if (result != 0) {
+			pr_err("recvmsg had an issue when waiting privately, errno %d\n", result);
 			homa_rpc_unlock(rpc);
 			control.id = 0;
 			goto done;

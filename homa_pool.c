@@ -107,7 +107,11 @@ int homa_pool_set_region(struct homa_sock *hsk, void *region,
 	}
 
 	/* Set region depending on whether buffer is from kernel or user space */
-	pool->region = (from_kernel) ? (char *)region : (char __user *)region;
+	if ((from_kernel)) {
+		pool->region = (char *) region;
+		printk("pool_set_region found your region is from kernel.\n");
+	} else
+		pool->region = (char __user *) region;
 	hsk->in_kernel = from_kernel;
 	pool->num_bpages = num_bpages;
 	pool->descriptors = descriptors;
