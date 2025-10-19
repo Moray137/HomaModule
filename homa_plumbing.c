@@ -1640,6 +1640,7 @@ int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
 int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		 int *addr_len)
 {
+	printk("You are calling recvmsg() using Homa.");
 	struct homa_sock *hsk = homa_sk(sk);
 	struct homa_recvmsg_args control;
 	struct homa_rpc *rpc;
@@ -1664,6 +1665,7 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	if (msg->msg_controllen != sizeof(control))
 		return -EINVAL;
 	if (in_kernel) {
+		printk("You are using recvmsg() in-kernel with Homa and has reached line 1667.\n");
 		memcpy(&control, msg->msg_control, sizeof(control));
 	}
 	else {
