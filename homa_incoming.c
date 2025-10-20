@@ -364,7 +364,11 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 
 				if (in_kernel) {
 					printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
-					memcpy(dst, skbs[i]->data + sizeof(*h) + copied, chunk_size);
+					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
+						error = -EFAULT;
+						pr_err("homa_incoming_copy_to_pool: bad address %d.\n", error);
+						goto free_skbs;
+					}
 				}
 				else {
 					pr_err("seems like you are copying to a wrong place? You are in kernel.\n");
