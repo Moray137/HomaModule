@@ -147,7 +147,7 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 	/* Initialize fields that don't require the socket lock. */
 	srpc = kmalloc(sizeof(*srpc), GFP_ATOMIC | __GFP_ZERO);
 	if (!srpc) {
-		printk("line 148 in homa_rpc.c, no srpc can be allocated.\n");
+		pr_err("line 148 in homa_rpc.c, no srpc can be allocated.\n");
 		err = -ENOMEM;
 		goto error;
 	}
@@ -184,8 +184,10 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 #else /* See strip.py */
 	err = homa_message_in_init(srpc, ntohl(h->message_length));
 #endif /* See strip.py */
-	if (err != 0)
+	if (err != 0) {
+		pr_err("homa_message_in_init: we got an error captain.\n");
 		goto error;
+	}
 
 	/* Initialize fields that require socket to be locked. */
 	homa_sock_lock(hsk);

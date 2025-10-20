@@ -84,7 +84,7 @@ struct homa_pool {
 	 * memory). Divided into bpages. 0 means the pool hasn't yet been
 	 * initialized.
 	 */
-	char __user *region;
+	char *region;
 
 	/** @num_bpages: total number of bpages in the pool. */
 	int num_bpages;

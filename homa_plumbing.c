@@ -865,7 +865,7 @@ int homa_setsockopt(struct sock *sk, int level, int optname,
 	struct homa_sock *hsk = homa_sk(sk);
 	int ret;
 	// This boolean value checks whether the call is from kernel.
-	bool in_kernel = (current->mm == NULL);
+	bool in_kernel = hsk->in_kernel;
 
 	if (level != IPPROTO_HOMA)
 		return -ENOPROTOOPT;

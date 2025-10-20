@@ -304,8 +304,10 @@ int homa_pool_alloc_msg(struct homa_rpc *rpc)
 	struct homa_bpage *bpage;
 	struct homa_rpc *other;
 
-	if (!pool->region)
+	if (!pool->region) {
+		pr_err("Your buffer pool has no proper region mate.\n");
 		return -ENOMEM;
+	}
 
 	/* First allocate any full bpages that are needed. */
 	full_pages = rpc->msgin.length >> HOMA_BPAGE_SHIFT;
