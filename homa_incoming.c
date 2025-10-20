@@ -350,8 +350,13 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			 */
 			while (copied < pkt_length) {
 				chunk_size = pkt_length - copied;
-				dst = in_kernel ? (void *) homa_pool_get_buffer(rpc, offset + copied, &buf_bytes) :
-				homa_pool_get_buffer(rpc, offset + copied, &buf_bytes);
+				dst = homa_pool_get_buffer(rpc, offset + copied, &buf_bytes);
+				if (!dst || buf_bytes <= 0) {
+					pr_err("homa_copy_to_pool: invalid destination (offset %d, available %d)\n",
+						   offset + copied, buf_bytes);
+					error = -EFAULT;
+					goto free_skbs;
+				}
 				if (buf_bytes < chunk_size) {
 					if (buf_bytes == 0) {
 						/* skb has data beyond message
