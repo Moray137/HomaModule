@@ -431,7 +431,7 @@ queued:
  * Return:      The application's virtual address for buffer space corresponding
  *              to @offset in the incoming message for @rpc.
  */
-void __user *homa_pool_get_buffer(struct homa_rpc *rpc, int offset,
+void  *homa_pool_get_buffer(struct homa_rpc *rpc, int offset,
 				  int *available)
 {
 	int bpage_index, bpage_offset;
