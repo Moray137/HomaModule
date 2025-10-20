@@ -307,6 +307,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 		struct sk_buff *skb;
 
 		if (rpc->state == RPC_DEAD) {
+			pr_err("rpc %llu is dead", rpc->id);
 			error = -EINVAL;
 			break;
 		}
@@ -1087,7 +1088,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 
 	if (!(atomic_read(&rpc->flags) & RPC_PRIVATE))
 		return -EINVAL;
-
+	printk("incoming line 1088 paseed.\n");
 	homa_rpc_hold(rpc);
 
 	/* Each iteration through this loop waits until rpc needs attention
@@ -1099,6 +1100,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 		if (!rpc->error)
 			rpc->error = homa_copy_to_pool(rpc);
 		if (rpc->error) {
+			pr_err("copy_to_pool is not happy, incoming line 1101, errno %d.", rpc->error);
 			result = rpc->error;
 			break;
 		}
