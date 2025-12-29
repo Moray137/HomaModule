@@ -122,14 +122,14 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 	int err;
 
 	if (!hsk->buffer_pool) {
-		printk("seems like the pool struct is not allocated correctly for your homa socket.\n");
+		pr_err("seems like the pool struct is not allocated correctly for your homa socket.\n");
 		return ERR_PTR(-ENOMEM);
 	}
 
 	/* Lock the bucket, and make sure no-one else has already created
 	 * the desired RPC.
 	 */
-	printk("you survived the hsk->buffer_pool test.\n");
+	// printk("you survived the hsk->buffer_pool test.\n");
 	bucket = homa_server_rpc_bucket(hsk, id);
 	homa_bucket_lock(bucket, id);
 	hlist_for_each_entry(srpc, &bucket->rpcs, hash_links) {

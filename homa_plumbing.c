@@ -1450,7 +1450,7 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 		INC_METRIC(reply_cycles, finish - start);
 	}
 	tt_record1("homa_sendmsg finished, id %d", args.id);
-	printk("You just sent out a in-kernel msg via a connected Homa socket. \n");
+	// printk("You just sent out a in-kernel msg via a connected Homa socket. \n");
 	return 0;
 
 error:

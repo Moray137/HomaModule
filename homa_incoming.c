@@ -368,7 +368,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 				}
 
 				if (in_kernel) {
-					printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
+					// printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
 					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
 						error = -EFAULT;
 						pr_err("homa_incoming_copy_to_pool: bad address %d.\n", error);
@@ -1097,7 +1097,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 
 	if (!(atomic_read(&rpc->flags) & RPC_PRIVATE))
 		return -EINVAL;
-	printk("incoming line 1088 paseed.\n");
+	// printk("incoming line 1088 paseed.\n");
 	homa_rpc_hold(rpc);
 
 	/* Each iteration through this loop waits until rpc needs attention
