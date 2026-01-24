@@ -1346,12 +1346,6 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 		goto error;
 	}
 
-	if (args.flags & ~HOMA_SENDMSG_VALID_FLAGS ||
-	    args.reserved != 0) {
-		result = -EINVAL;
-		goto error;
-	}
-
 	if (!homa_sock_wmem_avl(hsk)) {
 		result = homa_sock_wait_wmem(hsk,
 					     msg->msg_flags & MSG_DONTWAIT);
@@ -1364,13 +1358,19 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 		goto error;
 	}
 	if (msg->msg_namelen != 0) {
-		tt_record("homa_sendmsg error: msg_namelen shall always be 0");
+		tt_record("homa_sendmsg error: non-zero msg_namelen when using connected sendmsg()");
 		result = -EINVAL;
 		goto error;
 	}
 
 	// Copy from the msg_control, probably needs modification as zero-copy needed
 	memcpy(&args, msg->msg_control, sizeof(args));
+
+	if (args.flags & ~HOMA_SENDMSG_VALID_FLAGS ||
+	    args.reserved != 0) {
+		result = -EINVAL;
+		goto error;
+	}
 
 	if (!args.id) {
 		/* This is a request message. */
