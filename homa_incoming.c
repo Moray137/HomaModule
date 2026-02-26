@@ -168,6 +168,12 @@ void homa_add_packet(struct homa_rpc *rpc, struct sk_buff *skb)
 	int start = ntohl(h->seg.offset);
 	int length = homa_data_len(skb);
 	enum skb_drop_reason reason;
+	// NVMe-oH debugfs
+	u64 tl_start = 0;
+
+	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+		tl_start = ktime_get_ns();
+
 	int end = start + length;
 
 	if ((start + length) > rpc->msgin.length) {
@@ -262,6 +268,9 @@ discard:
 #endif /* See strip.py */
 	tt_record4("homa_add_packet discarding packet for id %d, offset %d, length %d, retransmit %d",
 		   rpc->id, start, length, h->retransmit);
+	// NVMe-oH debugfs
+	if (tl_start)
+		homa_tl_record(HOMA_TL_ADD_PACKET, tl_start, length, 1);
 	kfree_skb_reason(skb, reason);
 	return;
 
@@ -281,11 +290,16 @@ keep:
 			   rpc->msgin.bytes_remaining == 0);
 	}
 #endif /* See strip.py */
+	// NVMe-oH debugfs
+	if (tl_start)
+		homa_tl_record(HOMA_TL_ADD_PACKET, tl_start, length, 1);
 }
 
 /**
  * homa_copy_to_user() - Copy as much data as possible from incoming
  * packet buffers to buffers in user space.
+ * Edit: To support in-kernel operations, this method is renamed to homa_copy_to_pool.
+ * The method checks whether a hsk is for kernel usage only (its buffer pool lives in kernel)
  * @rpc:     RPC for which data should be copied. Must be locked by caller.
  * Return:   Zero for success or a negative errno if there is an error.
  *           It is possible for the RPC to be freed while this function
@@ -294,7 +308,7 @@ keep:
  *           will be RPC_DEAD. Clears the RPC_PKTS_READY bit in @rpc->flags
  *           if all available packets have been copied out.
  */
-int homa_copy_to_user(struct homa_rpc *rpc)
+int homa_copy_to_pool(struct homa_rpc *rpc)
 	__must_hold(rpc->bucket->lock)
 {
 #ifdef __UNIT_TEST__
@@ -313,6 +327,8 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 	u64 start;
 #endif /* See strip.py */
 	int i;
+	/* If using kernel apps like NVMe-oF, we will need to copy to kernel */
+	bool in_kernel = rpc->hsk->in_kernel;
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -325,6 +341,7 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 		struct sk_buff *skb;
 
 		if (rpc->state == RPC_DEAD) {
+			pr_err("rpc %llu is dead", rpc->id);
 			error = -EINVAL;
 			break;
 		}
@@ -346,8 +363,14 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 		 * user space.
 		 */
 		homa_rpc_unlock(rpc);
+		// NVMe-oH debugfs
+		u64 tl_copy_start = 0, tl_free_start = 0;
+		u64 tl_bytes = 0;
 
-		tt_record1("starting copy to user space for id %d",
+		if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+			tl_copy_start = ktime_get_ns();
+
+		tt_record1("starting copy to buffer pool for id %d",
 			   rpc->id);
 
 		/* Each iteration of this loop copies out one skb. */
@@ -355,19 +378,27 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 			struct homa_data_hdr *h = (struct homa_data_hdr *)
 					skbs[i]->data;
 			int pkt_length = homa_data_len(skbs[i]);
+			// NVMe-oH debugfs
+			if (tl_copy_start)
+				tl_bytes += pkt_length;
 			int offset = ntohl(h->seg.offset);
 			int buf_bytes, chunk_size;
 			struct iov_iter iter;
 			int copied = 0;
-			char __user *dst;
+			char *dst;
 
 			/* Each iteration of this loop copies to one
 			 * user buffer.
 			 */
 			while (copied < pkt_length) {
 				chunk_size = pkt_length - copied;
-				dst = homa_pool_get_buffer(rpc, offset + copied,
-							   &buf_bytes);
+				dst = homa_pool_get_buffer(rpc, offset + copied, &buf_bytes);
+				if (!dst || buf_bytes <= 0) {
+					pr_err("homa_copy_to_pool: invalid destination (offset %d, available %d)\n",
+						   offset + copied, buf_bytes);
+					error = -EFAULT;
+					goto free_skbs;
+				}
 				if (buf_bytes < chunk_size) {
 					if (buf_bytes == 0) {
 						/* skb has data beyond message
@@ -377,16 +408,28 @@ int homa_copy_to_user(struct homa_rpc *rpc)
 					}
 					chunk_size = buf_bytes;
 				}
-				error = import_ubuf(READ, dst, chunk_size,
-						    &iter);
-				if (error)
-					goto free_skbs;
-				error = skb_copy_datagram_iter(skbs[i],
-							       sizeof(*h) +
-							       copied,  &iter,
-							       chunk_size);
-				if (error)
-					goto free_skbs;
+
+				if (in_kernel) {
+					// printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
+					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
+						error = -EFAULT;
+						pr_err("homa_incoming_copy_to_pool: bad address %d.\n", error);
+						goto free_skbs;
+					}
+				}
+				else {
+					pr_err("seems like you are copying to a wrong place? You are in kernel.\n");
+					error = import_ubuf(READ, (void __user *) dst, chunk_size,
+							&iter);
+					if (error)
+						goto free_skbs;
+					error = skb_copy_datagram_iter(skbs[i],
+									   sizeof(*h) +
+									   copied,  &iter,
+									   chunk_size);
+					if (error)
+						goto free_skbs;
+				}
 				copied += chunk_size;
 			}
 #ifndef __UPSTREAM__ /* See strip.py */
@@ -412,8 +455,22 @@ free_skbs:
 #ifndef __STRIP__ /* See strip.py */
 		start = homa_clock();
 #endif /* See strip.py */
+		
+		// NVMe-oH debugfs
+		if (tl_copy_start)
+			homa_tl_record(HOMA_TL_COPY_TO_POOL, tl_copy_start,
+				       tl_bytes, n);
+
+		if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+			tl_free_start = ktime_get_ns();
+
 		for (i = 0; i < n; i++)
 			consume_skb(skbs[i]);
+
+		// NVMe-oH debugfs
+		if (tl_free_start)
+			homa_tl_record(HOMA_TL_SKB_FREE, tl_free_start, 0, n);
+
 		INC_METRIC(skb_free_cycles, homa_clock() - start);
 		INC_METRIC(skb_frees, n);
 		tt_record2("finished freeing %d skbs for id %d",
@@ -1074,6 +1131,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 
 	if (!test_bit(RPC_PRIVATE, &rpc->flags))
 		return -EINVAL;
+	homa_rpc_hold(rpc);
 
 	/* Each iteration through this loop waits until rpc needs attention
 	 * in some way (e.g. packets have arrived), then deals with that need
@@ -1083,9 +1141,11 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 	while (1) {
 		result = 0;
 		if (!rpc->error)
-			rpc->error = homa_copy_to_user(rpc);
+			rpc->error = homa_copy_to_pool(rpc);
 		if (rpc->error) {
+			pr_err("copy_to_pool is not happy, incoming line 1101, errno %d.", rpc->error);
 			IF_NO_STRIP(avail_immediately = 0);
+			result = rpc->error;
 			break;
 		}
 		if (rpc->msgin.length >= 0 &&
@@ -1239,7 +1299,7 @@ struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking)
 
 		homa_rpc_lock_preempt(rpc);
 		if (!rpc->error)
-			rpc->error = homa_copy_to_user(rpc);
+			rpc->error = homa_copy_to_pool(rpc);
 		if (rpc->error) {
 			if (rpc->state != RPC_DEAD)
 				break;

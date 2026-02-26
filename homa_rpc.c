@@ -125,12 +125,15 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 	struct homa_rpc *srpc = NULL;
 	int err;
 
-	if (!hsk->buffer_pool)
+	if (!hsk->buffer_pool) {
+		pr_err("seems like the pool struct is not allocated correctly for your homa socket.\n");
 		return ERR_PTR(-ENOMEM);
+	}
 
 	/* Lock the bucket, and make sure no-one else has already created
 	 * the desired RPC.
 	 */
+	// printk("you survived the hsk->buffer_pool test.\n");
 	bucket = homa_server_rpc_bucket(hsk, id);
 	homa_bucket_lock(bucket, id);
 	hlist_for_each_entry(srpc, &bucket->rpcs, hash_links) {
@@ -148,6 +151,7 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 	/* Initialize fields that don't require the socket lock. */
 	srpc = kzalloc(sizeof(*srpc), GFP_ATOMIC);
 	if (!srpc) {
+		pr_err("line 148 in homa_rpc.c, no srpc can be allocated.\n");
 		err = -ENOMEM;
 		goto error;
 	}
@@ -186,8 +190,10 @@ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
 #else /* See strip.py */
 	err = homa_message_in_init(srpc, ntohl(h->message_length));
 #endif /* See strip.py */
-	if (err != 0)
+	if (err != 0) {
+		pr_err("homa_message_in_init: we got an error captain.\n");
 		goto error;
+	}
 
 	/* Initialize fields that require socket to be locked. */
 	homa_sock_lock(hsk);

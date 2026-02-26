@@ -15,6 +15,194 @@
 #include "homa_qdisc.h"
 #endif /* See strip.py */
 
+// NVMe-OH copy transport layer overhead stat analysis
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/math64.h>
+
+//Transport-layer stats debugfs
+
+DEFINE_PER_CPU(struct homa_tl_cpu_stats, homa_tl_stats);
+bool homa_tl_stats_enabled __read_mostly;
+
+static struct dentry *homa_tl_dbg_dir;
+
+static const char * const homa_tl_name[HOMA_TL_MAX] = {
+	[HOMA_TL_OUTFILL]      = "outfill",
+	[HOMA_TL_IP_XMIT]      = "ip_queue_xmit",
+	[HOMA_TL_ADD_PACKET]   = "add_packet",
+	[HOMA_TL_COPY_TO_POOL] = "copy_to_pool",
+	[HOMA_TL_SKB_FREE]     = "skb_free",
+};
+
+static __always_inline u64 homa_tl_stddev_ns(u64 sum, u64 sum2, u64 n)
+{
+	u64 mean, ex2, var;
+	__uint128_t mean2;
+
+	if (!n)
+		return 0;
+
+	mean = div64_u64(sum, n);
+	ex2  = div64_u64(sum2, n);
+
+	mean2 = (__uint128_t)mean * mean;
+	if (mean2 > (~0ULL))
+		return 0;
+
+	if (ex2 <= (u64)mean2)
+		return 0;
+
+	var = ex2 - (u64)mean2;
+	return int_sqrt64(var);
+}
+
+/* ns/4KB = (ns_total * 4096) / bytes_total */
+static __always_inline u64 homa_tl_ns_per_4k(u64 ns_total, u64 bytes_total)
+{
+	u64 ns_per_4k = 0;
+
+	if (bytes_total) {
+		__uint128_t tmp = (__uint128_t)ns_total * 4096ULL;
+		if (tmp > (~0ULL))
+			ns_per_4k = div64_u64(~0ULL, bytes_total);
+		else
+			ns_per_4k = div64_u64((u64)tmp, bytes_total);
+	}
+	return ns_per_4k;
+}
+
+static void homa_tl_stats_reset_all(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct homa_tl_cpu_stats *s = per_cpu_ptr(&homa_tl_stats, cpu);
+		memset(s, 0, sizeof(*s));
+	}
+}
+
+static int homa_tl_stats_show(struct seq_file *m, void *v)
+{
+	struct homa_tl_stat sum[HOMA_TL_MAX];
+	u64 tx_cnt = 0, tx_ns = 0, tx_ns2 = 0, tx_bytes = 0, tx_chunks = 0, tx_max = 0;
+	u64 rx_cnt = 0, rx_ns = 0, rx_ns2 = 0, rx_bytes = 0, rx_chunks = 0, rx_max = 0;
+	int cpu, i;
+
+	memset(sum, 0, sizeof(sum));
+
+	for_each_possible_cpu(cpu) {
+		struct homa_tl_cpu_stats *s = per_cpu_ptr(&homa_tl_stats, cpu);
+
+		for (i = 0; i < HOMA_TL_MAX; i++) {
+			sum[i].count        += s->st[i].count;
+			sum[i].ns_total     += s->st[i].ns_total;
+			sum[i].ns2_total    += s->st[i].ns2_total;
+			sum[i].bytes_total  += s->st[i].bytes_total;
+			sum[i].chunks_total += s->st[i].chunks_total;
+			if (s->st[i].ns_max > sum[i].ns_max)
+				sum[i].ns_max = s->st[i].ns_max;
+		}
+	}
+
+	seq_printf(m, "enable=%d\n", READ_ONCE(homa_tl_stats_enabled) ? 1 : 0);
+	seq_puts(m, "stage\tcount\tavg_ns\tstddev_ns\tmax_ns\tbytes\tns/4KB\tavg_chunks\n");
+
+	for (i = 0; i < HOMA_TL_MAX; i++) {
+		u64 cnt = sum[i].count;
+		u64 avg = cnt ? div64_u64(sum[i].ns_total, cnt) : 0;
+		u64 std = cnt ? homa_tl_stddev_ns(sum[i].ns_total, sum[i].ns2_total, cnt) : 0;
+		u64 ns_per_4k = homa_tl_ns_per_4k(sum[i].ns_total, sum[i].bytes_total);
+		u64 avg_chunks = cnt ? div64_u64(sum[i].chunks_total, cnt) : 0;
+
+		if (!cnt)
+			continue;
+
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   homa_tl_name[i], cnt, avg, std, sum[i].ns_max,
+			   sum[i].bytes_total, ns_per_4k, avg_chunks);
+
+		/* group totals: treat OUTFILL+IP_XMIT as tx, others as rx */
+		if (i == HOMA_TL_OUTFILL || i == HOMA_TL_IP_XMIT) {
+			tx_cnt += cnt; tx_ns += sum[i].ns_total; tx_ns2 += sum[i].ns2_total;
+			tx_bytes += sum[i].bytes_total; tx_chunks += sum[i].chunks_total;
+			if (sum[i].ns_max > tx_max) tx_max = sum[i].ns_max;
+		} else {
+			rx_cnt += cnt; rx_ns += sum[i].ns_total; rx_ns2 += sum[i].ns2_total;
+			rx_bytes += sum[i].bytes_total; rx_chunks += sum[i].chunks_total;
+			if (sum[i].ns_max > rx_max) rx_max = sum[i].ns_max;
+		}
+	}
+
+	if (tx_cnt) {
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   "total_tx",
+			   tx_cnt,
+			   div64_u64(tx_ns, tx_cnt),
+			   homa_tl_stddev_ns(tx_ns, tx_ns2, tx_cnt),
+			   tx_max,
+			   tx_bytes,
+			   homa_tl_ns_per_4k(tx_ns, tx_bytes),
+			   div64_u64(tx_chunks, tx_cnt));
+	}
+	if (rx_cnt) {
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   "total_rx",
+			   rx_cnt,
+			   div64_u64(rx_ns, rx_cnt),
+			   homa_tl_stddev_ns(rx_ns, rx_ns2, rx_cnt),
+			   rx_max,
+			   rx_bytes,
+			   homa_tl_ns_per_4k(rx_ns, rx_bytes),
+			   div64_u64(rx_chunks, rx_cnt));
+	}
+
+	return 0;
+}
+
+static int homa_tl_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, homa_tl_stats_show, inode->i_private);
+}
+
+static const struct file_operations homa_tl_stats_fops = {
+	.owner   = THIS_MODULE,
+	.open    = homa_tl_stats_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static ssize_t homa_tl_stats_reset_write(struct file *file,
+					const char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	homa_tl_stats_reset_all();
+	return count;
+}
+
+static const struct file_operations homa_tl_stats_reset_fops = {
+	.owner = THIS_MODULE,
+	.write = homa_tl_stats_reset_write,
+};
+
+static void homa_tl_stats_debugfs_init(void)
+{
+	homa_tl_dbg_dir = debugfs_create_dir("homa", NULL);
+	if (!homa_tl_dbg_dir)
+		return;
+
+	debugfs_create_bool("enable", 0644, homa_tl_dbg_dir, &homa_tl_stats_enabled);
+	debugfs_create_file("transport_stats", 0444, homa_tl_dbg_dir, NULL, &homa_tl_stats_fops);
+	debugfs_create_file("reset", 0200, homa_tl_dbg_dir, NULL, &homa_tl_stats_reset_fops);
+}
+
+static void homa_tl_stats_debugfs_exit(void)
+{
+	debugfs_remove_recursive(homa_tl_dbg_dir);
+	homa_tl_dbg_dir = NULL;
+}
+
 /* Identifier for retrieving Homa-specific data for a struct net. */
 unsigned int homa_net_id;
 
@@ -92,7 +280,7 @@ static struct proto homa_prot = {
 	.name		   = "HOMA",
 	.owner		   = THIS_MODULE,
 	.close		   = homa_close,
-	.connect	   = ip4_datagram_connect,
+	.connect	   = homa_connect,
 	.init		   = homa_socket,
 	.destroy	   = homa_sock_destroy,
 	.setsockopt	   = homa_setsockopt,
@@ -108,8 +296,8 @@ static struct proto homa_prot = {
 static struct proto homav6_prot = {
 	.name		   = "HOMAv6",
 	.owner		   = THIS_MODULE,
+	.connect       = homa_connect,
 	.close		   = homa_close,
-	.connect	   = ip6_datagram_connect,
 	.init		   = homa_socket,
 	.destroy	   = homa_sock_destroy,
 	.setsockopt	   = homa_setsockopt,
@@ -647,7 +835,8 @@ int __init homa_load(void)
 #ifndef __UPSTREAM__ /* See strip.py */
 	tt_set_temp(homa->temp);
 #endif /* See strip.py */
-
+	// NVMe-oH debugfs
+	homa_tl_stats_debugfs_init();
 	return 0;
 
 error:
@@ -715,6 +904,8 @@ void __exit homa_unload(void)
 	proto_unregister(&homa_prot);
 	proto_unregister(&homav6_prot);
 	homa_destroy(homa);
+	// NVMe-oH debugfs
+	homa_tl_stats_debugfs_exit();
 #ifndef __UPSTREAM__ /* See strip.py */
 	tt_destroy();
 #endif /* See strip.py */
@@ -999,6 +1190,8 @@ int homa_setsockopt(struct sock *sk, int level, int optname,
 {
 	struct homa_sock *hsk = homa_sk(sk);
 	int ret;
+	// This boolean value checks whether the call is from kernel.
+	bool in_kernel = hsk->in_kernel;
 
 	if (level != IPPROTO_HOMA) {
 		hsk->error_msg = "homa_setsockopt invoked with level not IPPROTO_HOMA";
@@ -1021,17 +1214,22 @@ int homa_setsockopt(struct sock *sk, int level, int optname,
 			return -EFAULT;
 		}
 
-		/* Do a trivial test to make sure we can at least write the
+		if (in_kernel) {
+			ret = homa_pool_set_region(hsk, (void *)(uintptr_t)args.start, args.length, true);
+		}
+		else {
+			/* Do a trivial test to make sure we can at least write the
 		 * first page of the region.
 		 */
-		if (copy_to_user(u64_to_user_ptr(args.start), &args,
-				 sizeof(args))) {
-			hsk->error_msg = "receive buffer region is not writable";
-			return -EFAULT;
-		}
+			if (copy_to_user(u64_to_user_ptr(args.start), &args,
+					 sizeof(args))) {
+				hsk->error_msg = "receive buffer region is not writable";
+				return -EFAULT;
+			}
 
-		ret = homa_pool_set_region(hsk, u64_to_user_ptr(args.start),
-					   args.length);
+			ret = homa_pool_set_region(hsk, u64_to_user_ptr(args.start),
+									   args.length, false);
+		}
 		INC_METRIC(so_set_buf_calls, 1);
 		INC_METRIC(so_set_buf_cycles, homa_clock() - start);
 	} else if (optname == SO_HOMA_SERVER) {
@@ -1127,20 +1325,60 @@ int homa_getsockopt(struct sock *sk, int level, int optname,
 	return 0;
 }
 
+static int __homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen) {
+	struct homa_sock *hsk = homa_sk(sk);
+	if (hsk->connected) {
+		return -EISCONN;
+	}
+	if (hsk->shutdown) {
+		return -ESHUTDOWN;
+	}
+	if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+		return -EAFNOSUPPORT;
+	}
+	if (addr->sa_family == AF_INET) {
+		if (addrlen < sizeof(struct sockaddr_in)) {
+			return -EINVAL;
+		}
+		memset(&hsk->target_addr, 0, sizeof(hsk->target_addr));
+		memcpy(&hsk->target_addr, addr, sizeof(struct sockaddr_in));
+		hsk->connected = true;
+		return 0;
+	}
+	if (addr->sa_family == AF_INET6) {
+		if (addrlen < sizeof(struct sockaddr_in6)) {
+			return -EINVAL;
+		}
+		memset(&hsk->target_addr, 0, sizeof(hsk->target_addr));
+		memcpy(&hsk->target_addr, addr, sizeof(struct sockaddr_in6));
+		hsk->connected = true;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 /**
- * homa_sendmsg() - Send a request or response message on a Homa socket.
- * @sk:     Socket on which the system call was invoked.
- * @msg:    Structure describing the message to send; the msg_control
- *          field points to additional information.
- * @length: Number of bytes of the message.
- * Return:  0 on success, otherwise a negative errno. Sets hsk->error_msg
- *          on errors.
+ * homa_connect() - For NVMe/Homa. UDP-style connect() by specifying the target
+ * address.
+ * Note that target side sockets never call this method as they need to stay
+ * CONNECTIONLESSS.
+ * @sk:       Socket on which the system call was invoked.
+ * @addr:     Structure storing the target address
+ * @addr_len: The length of the address
+ * @flags:    Not used by Homa
  */
-int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
-{
+int homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen) {
+	int res;
+	homa_sock_lock(homa_sk(sk));
+	res = __homa_connect(sk, addr, addrlen);
+	homa_sock_unlock(homa_sk(sk));
+	return res;
+}
+
+static int homa_sendmsg_user_connected(struct sock *sk, struct msghdr *msg, size_t length) {
 	struct homa_sock *hsk = homa_sk(sk);
 	struct homa_sendmsg_args args;
-	union sockaddr_in_union *addr;
+	union sockaddr_in_union *addr = &hsk->target_addr;
 	struct homa_rpc *rpc = NULL;
 	int result = 0;
 
@@ -1152,9 +1390,9 @@ int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
 			start;
 #endif /* See strip.py */
 
-	addr = (union sockaddr_in_union *)msg->msg_name;
-	if (!addr) {
-		hsk->error_msg = "no msg_name passed to sendmsg";
+	// Checks for the connected socket's NULL addr requirement
+	if (msg->msg_name != NULL) {
+		hsk->error_msg = "msg_name must be NULL for connected sendmsg";
 		result = -EINVAL;
 		goto error;
 	}
@@ -1190,10 +1428,9 @@ int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
 		result = -EAFNOSUPPORT;
 		goto error;
 	}
-	if (msg->msg_namelen < sizeof(struct sockaddr_in) ||
-	    (msg->msg_namelen < sizeof(struct sockaddr_in6) &&
-	     addr->in6.sin6_family == AF_INET6)) {
-		hsk->error_msg = "msg_namelen too short";
+	// Checks for the connected socket's NULL addr requirement
+	if (msg->msg_name != NULL) {
+		hsk->error_msg = "msg_name must be NULL for connected sendmsg";
 		result = -EINVAL;
 		goto error;
 	}
@@ -1211,10 +1448,10 @@ int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
 			set_bit(RPC_PRIVATE, &rpc->flags);
 		INC_METRIC(send_calls, 1);
 		tt_record4("homa_sendmsg request, target 0x%x:%d, id %u, length %d",
-			   (addr->in6.sin6_family == AF_INET)
-			   ? ntohl(addr->in4.sin_addr.s_addr)
-			   : tt_addr(addr->in6.sin6_addr),
-			   ntohs(addr->in6.sin6_port), rpc->id, length);
+			  (addr->in6.sin6_family == AF_INET)
+			  ? ntohl(addr->in4.sin_addr.s_addr)
+			  : tt_addr(addr->in6.sin6_addr),
+			  ntohs(addr->in6.sin6_port), rpc->id, length);
 		rpc->completion_cookie = args.completion_cookie;
 		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
 		if (result)
@@ -1302,6 +1539,461 @@ error_dont_end_rpc:
 	return result;
 }
 
+static int homa_sendmsg_user_unconnected(struct sock *sk, struct msghdr *msg, size_t length) {
+	struct homa_sock *hsk = homa_sk(sk);
+	struct homa_sendmsg_args args;
+	union sockaddr_in_union *addr;
+#ifndef __STRIP__ /* See strip.py */
+	u64 start = homa_clock();
+#endif /* See strip.py */
+	struct homa_rpc *rpc = NULL;
+	int result = 0;
+#ifndef __STRIP__ /* See strip.py */
+	u64 finish;
+
+	per_cpu(homa_offload_core, raw_smp_processor_id()).last_app_active =
+			start;
+#endif /* See strip.py */
+
+	addr = (union sockaddr_in_union *)msg->msg_name;
+	if (!addr) {
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (unlikely(!msg->msg_control_is_user)) {
+		tt_record("homa_sendmsg error: !msg->msg_control_is_user");
+		result = -EINVAL;
+		goto error;
+	}
+	if (unlikely(copy_from_user(&args, (void __user *)msg->msg_control,
+				    sizeof(args)))) {
+		result = -EFAULT;
+		goto error;
+	}
+	if (args.flags & ~HOMA_SENDMSG_VALID_FLAGS ||
+	    args.reserved != 0) {
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!homa_sock_wmem_avl(hsk)) {
+		result = homa_sock_wait_wmem(hsk,
+					     msg->msg_flags & MSG_DONTWAIT);
+		if (result != 0)
+			goto error;
+	}
+
+	if (addr->sa.sa_family != sk->sk_family) {
+		result = -EAFNOSUPPORT;
+		goto error;
+	}
+	if (msg->msg_namelen < sizeof(struct sockaddr_in) ||
+	    (msg->msg_namelen < sizeof(struct sockaddr_in6) &&
+	     addr->in6.sin6_family == AF_INET6)) {
+		tt_record("homa_sendmsg error: msg_namelen too short");
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!args.id) {
+		/* This is a request message. */
+		rpc = homa_rpc_alloc_client(hsk, addr);
+		if (IS_ERR(rpc)) {
+			result = PTR_ERR(rpc);
+			rpc = NULL;
+			goto error;
+		}
+		if (args.flags & HOMA_SENDMSG_PRIVATE)
+			set_bit(RPC_PRIVATE, &rpc->flags);
+		INC_METRIC(send_calls, 1);
+		tt_record4("homa_sendmsg request, target 0x%x:%d, id %u, length %d",
+			   (addr->in6.sin6_family == AF_INET)
+			   ? ntohl(addr->in4.sin_addr.s_addr)
+			   : tt_addr(addr->in6.sin6_addr),
+			   ntohs(addr->in6.sin6_port), rpc->id, length);
+		rpc->completion_cookie = args.completion_cookie;
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result)
+			goto error;
+		args.id = rpc->id;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_alloc_client. */
+		rpc = NULL;
+
+		if (unlikely(copy_to_user((void __user *)msg->msg_control,
+					  &args, sizeof(args)))) {
+			rpc = homa_rpc_find_client(hsk, args.id);
+			result = -EFAULT;
+			goto error;
+		}
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(send_cycles, finish - start);
+	} else {
+		/* This is a response message. */
+		struct in6_addr canonical_dest;
+
+		INC_METRIC(reply_calls, 1);
+		tt_record4("homa_sendmsg response, id %llu, port %d, pid %d, length %d",
+			   args.id, hsk->port, current->pid, length);
+		if (args.completion_cookie != 0) {
+			tt_record("homa_sendmsg error: nonzero cookie");
+			result = -EINVAL;
+			goto error;
+		}
+		canonical_dest = canonical_ipv6_addr(addr);
+
+		rpc = homa_rpc_find_server(hsk, &canonical_dest, args.id);
+		if (!rpc) {
+			/* Return without an error if the RPC doesn't exist;
+			 * this could be totally valid (e.g. client is
+			 * no longer interested in it).
+			 */
+			tt_record2("homa_sendmsg error: RPC id %d, peer 0x%x, doesn't exist",
+				   args.id, tt_addr(canonical_dest));
+			return 0;
+		}
+		if (rpc->error) {
+			result = rpc->error;
+			goto error;
+		}
+		if (rpc->state != RPC_IN_SERVICE) {
+			tt_record2("homa_sendmsg error: RPC id %d in bad state %d",
+				   rpc->id, rpc->state);
+			/* Locked by homa_rpc_find_server. */
+			homa_rpc_unlock(rpc);
+			rpc = NULL;
+			result = -EINVAL;
+			goto error;
+		}
+		rpc->state = RPC_OUTGOING;
+
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result && rpc->state != RPC_DEAD)
+			goto error;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(reply_cycles, finish - start);
+	}
+	tt_record1("homa_sendmsg finished, id %d", args.id);
+	return 0;
+
+error:
+	if (rpc) {
+		homa_rpc_end(rpc);
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+	}
+	tt_record2("homa_sendmsg returning error %d for id %d",
+		   result, args.id);
+	return result;
+}
+
+static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg, size_t length) {
+	struct homa_sock *hsk = homa_sk(sk);
+	struct homa_sendmsg_args args;
+	union sockaddr_in_union *addr = &hsk->target_addr;
+#ifndef __STRIP__ /* See strip.py */
+	u64 start = homa_clock();
+#endif /* See strip.py */
+	struct homa_rpc *rpc = NULL;
+	int result = 0;
+#ifndef __STRIP__ /* See strip.py */
+	u64 finish;
+
+	per_cpu(homa_offload_core, raw_smp_processor_id()).last_app_active =
+			start;
+#endif /* See strip.py */
+
+	// Checks for the connected socket's NULL addr requirement
+	if (msg->msg_name != NULL) {
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!homa_sock_wmem_avl(hsk)) {
+		result = homa_sock_wait_wmem(hsk,
+					     msg->msg_flags & MSG_DONTWAIT);
+		if (result != 0)
+			goto error;
+	}
+
+	if (addr->sa.sa_family != sk->sk_family) {
+		result = -EAFNOSUPPORT;
+		goto error;
+	}
+	if (msg->msg_namelen != 0) {
+		tt_record("homa_sendmsg error: non-zero msg_namelen when using connected sendmsg()");
+		result = -EINVAL;
+		goto error;
+	}
+
+	// Copy from the msg_control, probably needs modification as zero-copy needed
+	memcpy(&args, msg->msg_control, sizeof(args));
+
+	if (args.flags & ~HOMA_SENDMSG_VALID_FLAGS ||
+	    args.reserved != 0) {
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!args.id) {
+		/* This is a request message. */
+		rpc = homa_rpc_alloc_client(hsk, addr);
+		if (IS_ERR(rpc)) {
+			result = PTR_ERR(rpc);
+			rpc = NULL;
+			goto error;
+		}
+		if (args.flags & HOMA_SENDMSG_PRIVATE)
+			set_bit(RPC_PRIVATE, &rpc->flags);
+		INC_METRIC(send_calls, 1);
+		tt_record4("homa_sendmsg request, target 0x%x:%d, id %u, length %d",
+			  (addr->in6.sin6_family == AF_INET)
+			  ? ntohl(addr->in4.sin_addr.s_addr)
+			  : tt_addr(addr->in6.sin6_addr),
+			  ntohs(addr->in6.sin6_port), rpc->id, length);
+		rpc->completion_cookie = args.completion_cookie;
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result)
+			goto error;
+		args.id = rpc->id;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_alloc_client. */
+		rpc = NULL;
+		// in-kernel copy to update the rpc id, needs modification as zero-copy needed.
+		memcpy(msg->msg_control, &args, sizeof(args));
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(send_cycles, finish - start);
+	} else {
+		/* This is a response message. */
+		struct in6_addr canonical_dest;
+
+		INC_METRIC(reply_calls, 1);
+		tt_record4("homa_sendmsg response, id %llu, port %d, pid %d, length %d",
+			   args.id, hsk->port, current->pid, length);
+		if (args.completion_cookie != 0) {
+			tt_record("homa_sendmsg error: nonzero cookie");
+			result = -EINVAL;
+			goto error;
+		}
+		canonical_dest = canonical_ipv6_addr(addr);
+
+		rpc = homa_rpc_find_server(hsk, &canonical_dest, args.id);
+		if (!rpc) {
+			/* Return without an error if the RPC doesn't exist;
+			 * this could be totally valid (e.g. client is
+			 * no longer interested in it).
+			 */
+			tt_record2("homa_sendmsg error: RPC id %d, peer 0x%x, doesn't exist",
+				   args.id, tt_addr(canonical_dest));
+			return 0;
+		}
+		if (rpc->error) {
+			result = rpc->error;
+			goto error;
+		}
+		if (rpc->state != RPC_IN_SERVICE) {
+			tt_record2("homa_sendmsg error: RPC id %d in bad state %d",
+				   rpc->id, rpc->state);
+			/* Locked by homa_rpc_find_server. */
+			homa_rpc_unlock(rpc);
+			rpc = NULL;
+			result = -EINVAL;
+			goto error;
+		}
+		rpc->state = RPC_OUTGOING;
+
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result && rpc->state != RPC_DEAD)
+			goto error;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(reply_cycles, finish - start);
+	}
+	tt_record1("homa_sendmsg finished, id %d", args.id);
+	// printk("You just sent out a in-kernel msg via a connected Homa socket. \n");
+	return 0;
+
+error:
+	if (rpc) {
+		homa_rpc_end(rpc);
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+	}
+	tt_record2("homa_sendmsg returning error %d for id %d",
+		   result, args.id);
+	return result;
+}
+
+/**
+ * For NVMe/Homa. Should be used by target side. Note that the host side will
+ * never use this method as it aligns with NVMe's connection-oriented semantics
+ * See comment of homa_sendmsg() for param explanation.
+ */
+static int homa_sendmsg_in_kernel_unconnected(struct sock *sk, struct msghdr *msg, size_t length) {
+	struct homa_sock *hsk = homa_sk(sk);
+	struct homa_sendmsg_args args;
+	union sockaddr_in_union *addr;
+#ifndef __STRIP__ /* See strip.py */
+	u64 start = homa_clock();
+#endif /* See strip.py */
+	struct homa_rpc *rpc = NULL;
+	int result = 0;
+#ifndef __STRIP__ /* See strip.py */
+	u64 finish;
+
+	per_cpu(homa_offload_core, raw_smp_processor_id()).last_app_active =
+			start;
+#endif /* See strip.py */
+
+	addr = (union sockaddr_in_union *)msg->msg_name;
+	if (!addr) {
+		result = -EINVAL;
+		goto error;
+	}
+	// same as connected version
+	memcpy(&args, msg->msg_control, sizeof(args));
+	if (args.flags & ~HOMA_SENDMSG_VALID_FLAGS ||
+	    args.reserved != 0) {
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!homa_sock_wmem_avl(hsk)) {
+		result = homa_sock_wait_wmem(hsk,
+					     msg->msg_flags & MSG_DONTWAIT);
+		if (result != 0)
+			goto error;
+	}
+
+	if (addr->sa.sa_family != sk->sk_family) {
+		result = -EAFNOSUPPORT;
+		goto error;
+	}
+	if (msg->msg_namelen < sizeof(struct sockaddr_in) ||
+	    (msg->msg_namelen < sizeof(struct sockaddr_in6) &&
+	     addr->in6.sin6_family == AF_INET6)) {
+		tt_record("homa_sendmsg error: msg_namelen too short");
+		result = -EINVAL;
+		goto error;
+	}
+
+	if (!args.id) {
+		/* This is a request message. */
+		rpc = homa_rpc_alloc_client(hsk, addr);
+		if (IS_ERR(rpc)) {
+			result = PTR_ERR(rpc);
+			rpc = NULL;
+			goto error;
+		}
+		if (args.flags & HOMA_SENDMSG_PRIVATE)
+			set_bit(RPC_PRIVATE, &rpc->flags);
+		INC_METRIC(send_calls, 1);
+		tt_record4("homa_sendmsg request, target 0x%x:%d, id %u, length %d",
+			   (addr->in6.sin6_family == AF_INET)
+			   ? ntohl(addr->in4.sin_addr.s_addr)
+			   : tt_addr(addr->in6.sin6_addr),
+			   ntohs(addr->in6.sin6_port), rpc->id, length);
+		rpc->completion_cookie = args.completion_cookie;
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result)
+			goto error;
+		args.id = rpc->id;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_alloc_client. */
+		rpc = NULL;
+
+		memcpy(msg->msg_control, &args, sizeof(args));
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(send_cycles, finish - start);
+	} else {
+		/* This is a response message. */
+		struct in6_addr canonical_dest;
+
+		INC_METRIC(reply_calls, 1);
+		tt_record4("homa_sendmsg response, id %llu, port %d, pid %d, length %d",
+			   args.id, hsk->port, current->pid, length);
+		if (args.completion_cookie != 0) {
+			tt_record("homa_sendmsg error: nonzero cookie");
+			result = -EINVAL;
+			goto error;
+		}
+		canonical_dest = canonical_ipv6_addr(addr);
+
+		rpc = homa_rpc_find_server(hsk, &canonical_dest, args.id);
+		if (!rpc) {
+			/* Return without an error if the RPC doesn't exist;
+			 * this could be totally valid (e.g. client is
+			 * no longer interested in it).
+			 */
+			tt_record2("homa_sendmsg error: RPC id %d, peer 0x%x, doesn't exist",
+				   args.id, tt_addr(canonical_dest));
+			return 0;
+		}
+		if (rpc->error) {
+			result = rpc->error;
+			goto error;
+		}
+		if (rpc->state != RPC_IN_SERVICE) {
+			tt_record2("homa_sendmsg error: RPC id %d in bad state %d",
+				   rpc->id, rpc->state);
+			/* Locked by homa_rpc_find_server. */
+			homa_rpc_unlock(rpc);
+			rpc = NULL;
+			result = -EINVAL;
+			goto error;
+		}
+		rpc->state = RPC_OUTGOING;
+
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		if (result && rpc->state != RPC_DEAD)
+			goto error;
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+#ifndef __STRIP__ /* See strip.py */
+		finish = homa_clock();
+#endif /* See strip.py */
+		INC_METRIC(reply_cycles, finish - start);
+	}
+	tt_record1("homa_sendmsg finished, id %d", args.id);
+	return 0;
+
+error:
+	if (rpc) {
+		homa_rpc_end(rpc);
+		homa_rpc_unlock(rpc); /* Locked by homa_rpc_find_server. */
+	}
+	tt_record2("homa_sendmsg returning error %d for id %d",
+		   result, args.id);
+	return result;
+}
+
+/**
+ * homa_sendmsg() - Send a request or response message on a Homa socket.
+ * @sk:     Socket on which the system call was invoked.
+ * @msg:    Structure describing the message to send; the msg_control
+ *          field points to additional information.
+ * @length: Number of bytes of the message.
+ * Return: 0 on success, otherwise a negative errno.
+ */
+int homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t length)
+{
+	struct homa_sock *hsk = homa_sk(sk);
+	if (msg->msg_control_is_user) {
+		if (hsk->connected)
+			return homa_sendmsg_user_connected(sk, msg, length);
+		return homa_sendmsg_user_unconnected(sk, msg, length);
+	}
+	if (hsk->connected)
+		return homa_sendmsg_in_kernel_connected(sk, msg, length);
+	return homa_sendmsg_in_kernel_unconnected(sk, msg, length);
+}
+
 /**
  * homa_recvmsg() - Receive a message from a Homa socket.
  * @sk:          Socket on which the system call was invoked.
@@ -1310,19 +2002,21 @@ error_dont_end_rpc:
  * @flags:       Flags from system call; only MSG_DONTWAIT is used.
  * @addr_len:    Store the length of the sender address here
  * Return:       The length of the message on success, otherwise a negative
- *               errno. Sets hsk->error_msg on errors.
+ *               errno.
  */
 int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		 int *addr_len)
 {
 	struct homa_sock *hsk = homa_sk(sk);
 	struct homa_recvmsg_args control;
-	struct homa_rpc *rpc = NULL;
+	struct homa_rpc *rpc;
 	int nonblocking;
+#ifndef __STRIP__ /* See strip.py */
+	u64 start = homa_clock();
+	u64 finish;
+#endif /* See strip.py */
+	bool in_kernel = hsk->in_kernel;
 	int result;
-
-	IF_NO_STRIP(u64 start = homa_clock());
-	IF_NO_STRIP(u64 finish);
 
 	INC_METRIC(recv_calls, 1);
 #ifndef __STRIP__ /* See strip.py */
@@ -1332,57 +2026,47 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		/* This test isn't strictly necessary, but it provides a
 		 * hook for testing kernel call times.
 		 */
-		hsk->error_msg = "no msg_control passed to recvmsg";
 		return -EINVAL;
 	}
-	if (msg->msg_controllen != sizeof(control)) {
-		hsk->error_msg = "invalid msg_controllen in recvmsg";
+	if (msg->msg_controllen != sizeof(control))
 		return -EINVAL;
+	if (in_kernel) {
+		memcpy(&control, msg->msg_control, sizeof(control));
 	}
-	if (unlikely(copy_from_user(&control, (void __user *)msg->msg_control,
-				    sizeof(control)))) {
-		hsk->error_msg = "invalid address for msg_control argument to recvmsg";
-		return -EFAULT;
+	else {
+		if (unlikely(copy_from_user(&control, (void __user *)msg->msg_control,
+					sizeof(control))))
+			return -EFAULT;
 	}
 	control.completion_cookie = 0;
 	tt_record2("homa_recvmsg starting, port %d, pid %d",
 		   hsk->port, current->pid);
 
 	if (control.num_bpages > HOMA_MAX_BPAGES) {
-		hsk->error_msg = "num_pages exceeds HOMA_MAX_BPAGES";
-		result = -EINVAL;
-		goto done;
-	}
-	if (control.reserved != 0) {
-		hsk->error_msg = "reserved fields in homa_recvmsg_args must be zero";
 		result = -EINVAL;
 		goto done;
 	}
 	if (!hsk->buffer_pool) {
-		hsk->error_msg = "SO_HOMA_RECVBUF socket option has not been set";
 		result = -EINVAL;
 		goto done;
 	}
 	result = homa_pool_release_buffers(hsk->buffer_pool, control.num_bpages,
 					   control.bpage_offsets);
 	control.num_bpages = 0;
-	if (result != 0) {
-		hsk->error_msg = "error while releasing buffer pages";
+	if (result != 0)
 		goto done;
-	}
 
 	nonblocking = flags & MSG_DONTWAIT;
 	if (control.id != 0) {
 		rpc = homa_rpc_find_client(hsk, control.id); /* Locks RPC. */
 		if (!rpc) {
-			hsk->error_msg = "invalid RPC id passed to recvmsg";
 			result = -EINVAL;
 			goto done;
 		}
-		homa_rpc_hold(rpc);
 		result = homa_wait_private(rpc, nonblocking);
 		if (result != 0) {
-			hsk->error_msg = "error while waiting for private RPC to complete";
+			pr_err("recvmsg had an issue when waiting privately, errno %d\n", result);
+			homa_rpc_unlock(rpc);
 			control.id = 0;
 			goto done;
 		}
@@ -1393,17 +2077,9 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 			 * prevented us from finding an RPC to return. Errors
 			 * in the RPC itself are handled below.
 			 */
-			hsk->error_msg = "error while waiting for shared RPC to complete";
 			result = PTR_ERR(rpc);
-			rpc = NULL;
 			goto done;
 		}
-	}
-	if (rpc->error) {
-		hsk->error_msg = "RPC failed";
-		result = rpc->error;
-	} else {
-		result = rpc->msgin.length;
 	}
 	result = rpc->error ? rpc->error : rpc->msgin.length;
 
@@ -1485,12 +2161,15 @@ done:
 		homa_rpc_reap(hsk, true);
 	}
 
-	if (unlikely(copy_to_user((__force void __user *)msg->msg_control,
+	if (in_kernel) {
+		memcpy(msg->msg_control, &control, sizeof(control));
+	} else {
+		if (unlikely(copy_to_user((__force void __user *)msg->msg_control,
 				  &control, sizeof(control)))) {
-		hsk->error_msg = "couldn't update homa_recvmsg_args argument to recvmsg: read-only?";
-		result = -EFAULT;
+			hsk->error_msg = "couldn't update homa_recvmsg_args argument to recvmsg: read-only?";
+			result = -EFAULT;
+		}
 	}
-
 #ifndef __STRIP__ /* See strip.py */
 	finish = homa_clock();
 #endif /* See strip.py */

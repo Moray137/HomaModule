@@ -362,6 +362,7 @@ struct homa_peer *homa_peer_alloc(struct homa_sock *hsk,
 
 	peer = kzalloc(sizeof(*peer), GFP_ATOMIC);
 	if (!peer) {
+		pr_err("you don't have enough memory for your peer.");
 		INC_METRIC(peer_kmalloc_errors, 1);
 		hsk->error_msg = "couldn't allocate memory for homa_peer";
 		return (struct homa_peer *)ERR_PTR(-ENOMEM);

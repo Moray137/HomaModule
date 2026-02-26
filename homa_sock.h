@@ -259,6 +259,28 @@ struct homa_sock {
 	 * the socket lock.
 	 */
 	struct homa_rpc_bucket server_rpc_buckets[HOMA_SERVER_RPC_BUCKETS];
+
+	/**
+	 * @connected: For NVMe/Homa. Tracks the connection state of a Homa
+	 * socket. Used to align with NVMe/TCP's connection semantics on the
+	 * host side.
+	 * Note that a target Homa socket is always CONNECTIONLESS.
+	 */
+	bool connected;
+
+	/**
+	 * @target_addr: For NVMe/Homa. Tracks the destination address of an NVMe
+	 * target.
+	 * Note that a target Homa socket should never access this struct, as it will
+	 * always be CONNECTIONLESS.
+	 */
+	union sockaddr_in_union target_addr;
+
+	/**
+	 * @in_kernel: For NVMe/Homa. Distinguishes a socket's origin, say whether it was
+	 * for in-kernel purposes or user space purposes.
+	 */
+	bool in_kernel;
 };
 
 /**

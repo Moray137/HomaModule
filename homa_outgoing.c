@@ -262,6 +262,12 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 	int bytes_left;
 	int gso_size;
 	int err;
+	// NVMe-oH debugfs
+	u64 tl_start = 0;
+	u64 tl_pkts = 0;
+
+	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+		tl_start = ktime_get_ns();
 
 	if (unlikely(iter->count > HOMA_MAX_MESSAGE_LENGTH ||
 		     iter->count == 0)) {
@@ -352,6 +358,10 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 			homa_rpc_lock(rpc);
 			goto error;
 		}
+		// NVMe-oH debugfs
+		if (tl_start)
+			tl_pkts++;
+
 		bytes_left -= skb_data_bytes;
 
 		homa_rpc_lock(rpc);
@@ -396,6 +406,10 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 #else /* See strip.py */
 		homa_xmit_data(rpc);
 #endif /* See strip.py */
+	// NVMe-oH debugfs
+	if (tl_start)
+		homa_tl_record(HOMA_TL_OUTFILL, tl_start,
+			       rpc->msgout.length, tl_pkts);
 	return 0;
 
 error:
@@ -671,6 +685,11 @@ void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc)
 	((struct homa_data_hdr *)skb_transport_header(skb))->cutoff_version =
 			rpc->peer->cutoff_version;
 #endif /* See strip.py */
+	// NVMe-oH debugfs
+	u64 tl_start = 0;
+
+	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+		tl_start = ktime_get_ns();
 
 	skb_dst_set(skb, homa_get_dst(rpc->peer, rpc->hsk));
 
@@ -701,6 +720,10 @@ void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc)
 		rpc->hsk->inet.tos =
 				rpc->hsk->homa->priority_map[priority] << 5;
 		err = ip_queue_xmit(&rpc->hsk->inet.sk, skb, &rpc->peer->flow);
+		// NVMe-oH debugfs
+		if (tl_start)
+		homa_tl_record(HOMA_TL_IP_XMIT, tl_start,
+			       homa_get_skb_info(skb)->data_bytes, 1);
 #else /* See strip.py */
 		ip_queue_xmit(&rpc->hsk->inet.sk, skb, &rpc->peer->flow);
 #endif /* See strip.py */

@@ -84,7 +84,7 @@ struct homa_pool {
 	 * memory). Divided into bpages. 0 means the pool hasn't yet been
 	 * initialized.
 	 */
-	char __user *region;
+	char *region;
 
 	/** @num_bpages: total number of bpages in the pool. */
 	int num_bpages;
@@ -132,6 +132,6 @@ void     homa_pool_get_rcvbuf(struct homa_pool *pool,
 int      homa_pool_release_buffers(struct homa_pool *pool,
 				   int num_buffers, u32 *buffers);
 int      homa_pool_set_region(struct homa_sock *hsk, void __user *region,
-			      u64 region_size);
+                              u64 region_size, bool from_kernel);
 
 #endif /* _HOMA_POOL_H */

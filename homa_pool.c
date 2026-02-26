@@ -67,10 +67,12 @@ struct homa_pool *homa_pool_alloc(struct homa_sock *hsk)
  * @region:       First byte of the memory region for the pool, allocated
  *                by the application; must be page-aligned.
  * @region_size:  Total number of bytes available at @buf_region.
+ *
+ * @from_kernel:  Tell the method whether this set is from kernel.
  * Return: Either zero (for success) or a negative errno for failure.
  */
-int homa_pool_set_region(struct homa_sock *hsk, void __user *region,
-			 u64 region_size)
+int homa_pool_set_region(struct homa_sock *hsk, void *region,
+                         u64 region_size, bool from_kernel)
 {
 	struct homa_pool_core __percpu *cores;
 	struct homa_bpage *descriptors;
@@ -104,7 +106,13 @@ int homa_pool_set_region(struct homa_sock *hsk, void __user *region,
 		goto error;
 	}
 
-	pool->region = (char __user *)region;
+	/* Set region depending on whether buffer is from kernel or user space */
+	if ((from_kernel)) {
+		pool->region = (char *) region;
+		// printk("pool_set_region found your region is from kernel.\n");
+	} else
+		pool->region = (char __user *) region;
+	hsk->in_kernel = from_kernel;
 	pool->num_bpages = num_bpages;
 	pool->descriptors = descriptors;
 	atomic_set(&pool->free_bpages, pool->num_bpages);
@@ -296,8 +304,10 @@ int homa_pool_alloc_msg(struct homa_rpc *rpc)
 	struct homa_bpage *bpage;
 	struct homa_rpc *other;
 
-	if (!pool->region)
+	if (!pool->region) {
+		pr_err("Your buffer pool has no proper region mate.\n");
 		return -ENOMEM;
+	}
 
 	/* First allocate any full bpages that are needed. */
 	full_pages = rpc->msgin.length >> HOMA_BPAGE_SHIFT;
@@ -421,7 +431,7 @@ queued:
  * Return:      The application's virtual address for buffer space corresponding
  *              to @offset in the incoming message for @rpc.
  */
-void __user *homa_pool_get_buffer(struct homa_rpc *rpc, int offset,
+void  *homa_pool_get_buffer(struct homa_rpc *rpc, int offset,
 				  int *available)
 {
 	int bpage_index, bpage_offset;
