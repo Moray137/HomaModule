@@ -22,4 +22,4 @@
 reports/
 traces/
 users/
-saved_traces/
+saved_traces/.vscode/
