@@ -159,6 +159,12 @@ void homa_add_packet(struct homa_rpc *rpc, struct sk_buff *skb)
 	struct homa_gap *gap, *dummy, *gap2;
 	int start = ntohl(h->seg.offset);
 	int length = homa_data_len(skb);
+	// NVMe-oH debugfs
+	u64 tl_start = 0;
+
+	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+		tl_start = ktime_get_ns();
+	
 	int end = start + length;
 
 	if ((start + length) > rpc->msgin.length) {
@@ -249,6 +255,9 @@ discard:
 #endif /* See strip.py */
 	tt_record4("homa_add_packet discarding packet for id %d, offset %d, length %d, retransmit %d",
 		   rpc->id, start, length, h->retransmit);
+	// NVMe-oH debugfs
+	if (tl_start)
+		homa_tl_record(rpc->hsk, HOMA_TL_ADD_PACKET, tl_start, length, 1);
 	kfree_skb(skb);
 	return;
 
@@ -257,6 +266,9 @@ keep:
 	if (h->retransmit)
 		INC_METRIC(resent_packets_used, 1);
 #endif /* See strip.py */
+	// NVMe-oH debugfs
+	if (tl_start)
+		homa_tl_record(rpc->hsk, HOMA_TL_ADD_PACKET, tl_start, length, 1);
 	__skb_queue_tail(&rpc->msgin.packets, skb);
 	rpc->msgin.bytes_remaining -= length;
 }
@@ -330,6 +342,12 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 		 */
 		homa_rpc_hold(rpc);
 		homa_rpc_unlock(rpc);
+		// NVMe-oH debugfs
+		u64 tl_copy_start = 0, tl_free_start = 0;
+		u64 tl_bytes = 0;
+
+		if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+			tl_copy_start = ktime_get_ns();
 
 		tt_record1("starting copy to buffer pool for id %d",
 			   rpc->id);
@@ -339,6 +357,9 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			struct homa_data_hdr *h = (struct homa_data_hdr *)
 					skbs[i]->data;
 			int pkt_length = homa_data_len(skbs[i]);
+			// NVMe-oH debugfs
+			if (tl_copy_start)
+				tl_bytes += pkt_length;
 			int offset = ntohl(h->seg.offset);
 			int buf_bytes, chunk_size;
 			struct iov_iter iter;
@@ -413,8 +434,22 @@ free_skbs:
 #ifndef __STRIP__ /* See strip.py */
 		start = homa_clock();
 #endif /* See strip.py */
+		
+		// NVMe-oH debugfs
+		if (tl_copy_start)
+			homa_tl_record(rpc->hsk, HOMA_TL_COPY_TO_POOL, tl_copy_start,
+				       tl_bytes, n);
+
+		if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
+			tl_free_start = ktime_get_ns();
+
 		for (i = 0; i < n; i++)
 			kfree_skb(skbs[i]);
+
+		// NVMe-oH debugfs
+		if (tl_free_start)
+			homa_tl_record(rpc->hsk, HOMA_TL_SKB_FREE, tl_free_start, 0, n);
+
 		INC_METRIC(skb_free_cycles, homa_clock() - start);
 		INC_METRIC(skb_frees, n);
 		tt_record2("finished freeing %d skbs for id %d",

@@ -912,6 +912,81 @@ static inline u64 homa_usecs_to_cycles(u64 usecs)
 #endif /* __UNIT_TEST__ */
 }
 
+/* ---------- Transport-layer stats (NVMe-over-Homa measurement) ---------- */
+#include <linux/percpu.h>
+#include <linux/ktime.h>
+
+enum homa_tl_stage {
+	HOMA_TL_OUTFILL = 0,        /* homa_message_out_fill */
+	HOMA_TL_IP_XMIT,            /* ip_queue_xmit/ip6_xmit call time */
+	HOMA_TL_ADD_PACKET,         /* homa_add_packet */
+	HOMA_TL_COPY_TO_POOL,       /* homa_copy_to_pool payload copy */
+	HOMA_TL_SKB_FREE,           /* free skbs after copy */
+	HOMA_TL_MAX
+};
+
+struct homa_tl_stat {
+	u64 count;
+	u64 ns_total;
+	u64 ns2_total;
+	u64 ns_max;
+	u64 bytes_total;
+	u64 chunks_total;
+};
+
+struct homa_tl_cpu_stats {
+	struct homa_tl_stat st[HOMA_TL_MAX];
+};
+
+DECLARE_PER_CPU(struct homa_tl_cpu_stats, homa_tl_stats);
+extern bool homa_tl_stats_enabled;
+
+/*
+ * Record one timing sample:
+ * - Only active when homa_tl_stats_enabled && hsk->in_kernel
+ * - start_ns must be from ktime_get_ns()
+ */
+static __always_inline void homa_tl_record(struct homa_sock *hsk,
+					   enum homa_tl_stage stage,
+					   u64 start_ns, u64 bytes, u64 chunks)
+{
+	struct homa_tl_cpu_stats *s;
+	u64 ns;
+
+	if (!READ_ONCE(homa_tl_stats_enabled))
+		return;
+	if (!hsk || !hsk->in_kernel)
+		return;
+
+	ns = ktime_get_ns() - start_ns;
+
+	preempt_disable();
+	s = this_cpu_ptr(&homa_tl_stats);
+
+	s->st[stage].count++;
+	s->st[stage].ns_total += ns;
+
+	/* saturating sum of ns^2 (avoid overflow explosions) */
+	{
+		__uint128_t sq = (__uint128_t)ns * ns;
+
+		if (sq > (~0ULL))
+			s->st[stage].ns2_total = ~0ULL;
+		else if (s->st[stage].ns2_total > (~0ULL) - (u64)sq)
+			s->st[stage].ns2_total = ~0ULL;
+		else
+			s->st[stage].ns2_total += (u64)sq;
+	}
+
+	if (ns > s->st[stage].ns_max)
+		s->st[stage].ns_max = ns;
+
+	s->st[stage].bytes_total += bytes;
+	s->st[stage].chunks_total += chunks;
+
+	preempt_enable();
+}
+
 /* Homa Locking Strategy:
  *
  * (Note: this documentation is referenced in several other places in the

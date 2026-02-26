@@ -13,6 +13,194 @@
 #include "homa_peer.h"
 #include "homa_pool.h"
 
+// NVMe-OH copy transport layer overhead stat analysis
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#include <linux/math64.h>
+
+//Transport-layer stats debugfs
+
+DEFINE_PER_CPU(struct homa_tl_cpu_stats, homa_tl_stats);
+bool homa_tl_stats_enabled __read_mostly;
+
+static struct dentry *homa_tl_dbg_dir;
+
+static const char * const homa_tl_name[HOMA_TL_MAX] = {
+	[HOMA_TL_OUTFILL]      = "outfill",
+	[HOMA_TL_IP_XMIT]      = "ip_queue_xmit",
+	[HOMA_TL_ADD_PACKET]   = "add_packet",
+	[HOMA_TL_COPY_TO_POOL] = "copy_to_pool",
+	[HOMA_TL_SKB_FREE]     = "skb_free",
+};
+
+static __always_inline u64 homa_tl_stddev_ns(u64 sum, u64 sum2, u64 n)
+{
+	u64 mean, ex2, var;
+	__uint128_t mean2;
+
+	if (!n)
+		return 0;
+
+	mean = div64_u64(sum, n);
+	ex2  = div64_u64(sum2, n);
+
+	mean2 = (__uint128_t)mean * mean;
+	if (mean2 > (~0ULL))
+		return 0;
+
+	if (ex2 <= (u64)mean2)
+		return 0;
+
+	var = ex2 - (u64)mean2;
+	return int_sqrt64(var);
+}
+
+/* ns/4KB = (ns_total * 4096) / bytes_total */
+static __always_inline u64 homa_tl_ns_per_4k(u64 ns_total, u64 bytes_total)
+{
+	u64 ns_per_4k = 0;
+
+	if (bytes_total) {
+		__uint128_t tmp = (__uint128_t)ns_total * 4096ULL;
+		if (tmp > (~0ULL))
+			ns_per_4k = div64_u64(~0ULL, bytes_total);
+		else
+			ns_per_4k = div64_u64((u64)tmp, bytes_total);
+	}
+	return ns_per_4k;
+}
+
+static void homa_tl_stats_reset_all(void)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct homa_tl_cpu_stats *s = per_cpu_ptr(&homa_tl_stats, cpu);
+		memset(s, 0, sizeof(*s));
+	}
+}
+
+static int homa_tl_stats_show(struct seq_file *m, void *v)
+{
+	struct homa_tl_stat sum[HOMA_TL_MAX];
+	u64 tx_cnt = 0, tx_ns = 0, tx_ns2 = 0, tx_bytes = 0, tx_chunks = 0, tx_max = 0;
+	u64 rx_cnt = 0, rx_ns = 0, rx_ns2 = 0, rx_bytes = 0, rx_chunks = 0, rx_max = 0;
+	int cpu, i;
+
+	memset(sum, 0, sizeof(sum));
+
+	for_each_possible_cpu(cpu) {
+		struct homa_tl_cpu_stats *s = per_cpu_ptr(&homa_tl_stats, cpu);
+
+		for (i = 0; i < HOMA_TL_MAX; i++) {
+			sum[i].count        += s->st[i].count;
+			sum[i].ns_total     += s->st[i].ns_total;
+			sum[i].ns2_total    += s->st[i].ns2_total;
+			sum[i].bytes_total  += s->st[i].bytes_total;
+			sum[i].chunks_total += s->st[i].chunks_total;
+			if (s->st[i].ns_max > sum[i].ns_max)
+				sum[i].ns_max = s->st[i].ns_max;
+		}
+	}
+
+	seq_printf(m, "enable=%d\n", READ_ONCE(homa_tl_stats_enabled) ? 1 : 0);
+	seq_puts(m, "stage\tcount\tavg_ns\tstddev_ns\tmax_ns\tbytes\tns/4KB\tavg_chunks\n");
+
+	for (i = 0; i < HOMA_TL_MAX; i++) {
+		u64 cnt = sum[i].count;
+		u64 avg = cnt ? div64_u64(sum[i].ns_total, cnt) : 0;
+		u64 std = cnt ? homa_tl_stddev_ns(sum[i].ns_total, sum[i].ns2_total, cnt) : 0;
+		u64 ns_per_4k = homa_tl_ns_per_4k(sum[i].ns_total, sum[i].bytes_total);
+		u64 avg_chunks = cnt ? div64_u64(sum[i].chunks_total, cnt) : 0;
+
+		if (!cnt)
+			continue;
+
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   homa_tl_name[i], cnt, avg, std, sum[i].ns_max,
+			   sum[i].bytes_total, ns_per_4k, avg_chunks);
+
+		/* group totals: treat OUTFILL+IP_XMIT as tx, others as rx */
+		if (i == HOMA_TL_OUTFILL || i == HOMA_TL_IP_XMIT) {
+			tx_cnt += cnt; tx_ns += sum[i].ns_total; tx_ns2 += sum[i].ns2_total;
+			tx_bytes += sum[i].bytes_total; tx_chunks += sum[i].chunks_total;
+			if (sum[i].ns_max > tx_max) tx_max = sum[i].ns_max;
+		} else {
+			rx_cnt += cnt; rx_ns += sum[i].ns_total; rx_ns2 += sum[i].ns2_total;
+			rx_bytes += sum[i].bytes_total; rx_chunks += sum[i].chunks_total;
+			if (sum[i].ns_max > rx_max) rx_max = sum[i].ns_max;
+		}
+	}
+
+	if (tx_cnt) {
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   "total_tx",
+			   tx_cnt,
+			   div64_u64(tx_ns, tx_cnt),
+			   homa_tl_stddev_ns(tx_ns, tx_ns2, tx_cnt),
+			   tx_max,
+			   tx_bytes,
+			   homa_tl_ns_per_4k(tx_ns, tx_bytes),
+			   div64_u64(tx_chunks, tx_cnt));
+	}
+	if (rx_cnt) {
+		seq_printf(m, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n",
+			   "total_rx",
+			   rx_cnt,
+			   div64_u64(rx_ns, rx_cnt),
+			   homa_tl_stddev_ns(rx_ns, rx_ns2, rx_cnt),
+			   rx_max,
+			   rx_bytes,
+			   homa_tl_ns_per_4k(rx_ns, rx_bytes),
+			   div64_u64(rx_chunks, rx_cnt));
+	}
+
+	return 0;
+}
+
+static int homa_tl_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, homa_tl_stats_show, inode->i_private);
+}
+
+static const struct file_operations homa_tl_stats_fops = {
+	.owner   = THIS_MODULE,
+	.open    = homa_tl_stats_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = single_release,
+};
+
+static ssize_t homa_tl_stats_reset_write(struct file *file,
+					const char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	homa_tl_stats_reset_all();
+	return count;
+}
+
+static const struct file_operations homa_tl_stats_reset_fops = {
+	.owner = THIS_MODULE,
+	.write = homa_tl_stats_reset_write,
+};
+
+static void homa_tl_stats_debugfs_init(void)
+{
+	homa_tl_dbg_dir = debugfs_create_dir("homa", NULL);
+	if (!homa_tl_dbg_dir)
+		return;
+
+	debugfs_create_bool("enable", 0644, homa_tl_dbg_dir, &homa_tl_stats_enabled);
+	debugfs_create_file("transport_stats", 0444, homa_tl_dbg_dir, NULL, &homa_tl_stats_fops);
+	debugfs_create_file("reset", 0200, homa_tl_dbg_dir, NULL, &homa_tl_stats_reset_fops);
+}
+
+static void homa_tl_stats_debugfs_exit(void)
+{
+	debugfs_remove_recursive(homa_tl_dbg_dir);
+	homa_tl_dbg_dir = NULL;
+}
+
 /* Identifier for retrieving Homa-specific data for a struct net. */
 unsigned int homa_net_id;
 
@@ -606,7 +794,8 @@ int __init homa_load(void)
 	tt_init("timetrace");
 	tt_set_temp(homa->temp);
 #endif /* See strip.py */
-
+	// NVMe-oH debugfs
+	homa_tl_stats_debugfs_init();
 	return 0;
 
 timer_err:
@@ -665,6 +854,8 @@ void __exit homa_unload(void)
 	inet6_unregister_protosw(&homav6_protosw);
 	proto_unregister(&homa_prot);
 	proto_unregister(&homav6_prot);
+	// NVMe-oH debugfs
+	homa_tl_stats_debugfs_exit();
 #ifndef __UPSTREAM__ /* See strip.py */
 	tt_destroy();
 #endif /* See strip.py */
@@ -1800,7 +1991,7 @@ done:
 				  __func__, msg->msg_control);
 #endif /* See strip.py */
 			result = -EFAULT;
-				  }
+		}
 	}
 #ifndef __STRIP__ /* See strip.py */
 	finish = homa_clock();
