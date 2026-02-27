@@ -180,8 +180,6 @@ int homa_sock_init(struct homa_sock *hsk)
 	hsk->homa = homa;
 	hsk->hnet = hnet;
 	hsk->buffer_pool = buffer_pool;
-	hsk->inet.inet_num = hsk->port;
-	hsk->inet.inet_sport = htons(hsk->port);
 
 	hsk->is_server = false;
 	hsk->shutdown = false;
@@ -238,6 +236,8 @@ int homa_sock_init(struct homa_sock *hsk)
 		spin_lock_bh(&socktab->write_lock);
 	}
 	hsk->port = hnet->prev_default_port;
+	hsk->inet.inet_num = hsk->port;
+	hsk->inet.inet_sport = htons(hsk->port);
 	hlist_add_head_rcu(&hsk->socktab_links,
 			   &socktab->buckets[homa_socktab_bucket(hnet,
 								 hsk->port)]);
