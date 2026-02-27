@@ -2009,14 +2009,13 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 {
 	struct homa_sock *hsk = homa_sk(sk);
 	struct homa_recvmsg_args control;
-	struct homa_rpc *rpc;
+	struct homa_rpc *rpc = NULL;
 	int nonblocking;
-#ifndef __STRIP__ /* See strip.py */
-	u64 start = homa_clock();
-	u64 finish;
-#endif /* See strip.py */
 	bool in_kernel = hsk->in_kernel;
 	int result;
+
+	IF_NO_STRIP(u64 start = homa_clock());
+	IF_NO_STRIP(u64 finish);
 
 	INC_METRIC(recv_calls, 1);
 #ifndef __STRIP__ /* See strip.py */
@@ -2026,47 +2025,62 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 		/* This test isn't strictly necessary, but it provides a
 		 * hook for testing kernel call times.
 		 */
+		hsk->error_msg = "no msg_control passed to recvmsg";
 		return -EINVAL;
 	}
-	if (msg->msg_controllen != sizeof(control))
+	if (msg->msg_controllen != sizeof(control)) {
+		hsk->error_msg = "invalid msg_controllen in recvmsg";
 		return -EINVAL;
+	}
 	if (in_kernel) {
-		memcpy(&control, msg->msg_control, sizeof(control));
-	}
+        memcpy(&control, msg->msg_control, sizeof(control));
+    }
 	else {
 		if (unlikely(copy_from_user(&control, (void __user *)msg->msg_control,
-					sizeof(control))))
+				    sizeof(control)))) {
+			hsk->error_msg = "invalid address for msg_control argument to recvmsg";
 			return -EFAULT;
+		}
 	}
 	control.completion_cookie = 0;
 	tt_record2("homa_recvmsg starting, port %d, pid %d",
 		   hsk->port, current->pid);
 
 	if (control.num_bpages > HOMA_MAX_BPAGES) {
+		hsk->error_msg = "num_pages exceeds HOMA_MAX_BPAGES";
+		result = -EINVAL;
+		goto done;
+	}
+	if (control.reserved != 0) {
+		hsk->error_msg = "reserved fields in homa_recvmsg_args must be zero";
 		result = -EINVAL;
 		goto done;
 	}
 	if (!hsk->buffer_pool) {
+		hsk->error_msg = "SO_HOMA_RECVBUF socket option has not been set";
 		result = -EINVAL;
 		goto done;
 	}
 	result = homa_pool_release_buffers(hsk->buffer_pool, control.num_bpages,
 					   control.bpage_offsets);
 	control.num_bpages = 0;
-	if (result != 0)
+	if (result != 0) {
+		hsk->error_msg = "error while releasing buffer pages";
 		goto done;
+	}
 
 	nonblocking = flags & MSG_DONTWAIT;
 	if (control.id != 0) {
 		rpc = homa_rpc_find_client(hsk, control.id); /* Locks RPC. */
 		if (!rpc) {
+			hsk->error_msg = "invalid RPC id passed to recvmsg";
 			result = -EINVAL;
 			goto done;
 		}
+		homa_rpc_hold(rpc);
 		result = homa_wait_private(rpc, nonblocking);
 		if (result != 0) {
-			pr_err("recvmsg had an issue when waiting privately, errno %d\n", result);
-			homa_rpc_unlock(rpc);
+			hsk->error_msg = "error while waiting for private RPC to complete";
 			control.id = 0;
 			goto done;
 		}
@@ -2077,9 +2091,17 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 			 * prevented us from finding an RPC to return. Errors
 			 * in the RPC itself are handled below.
 			 */
+			hsk->error_msg = "error while waiting for shared RPC to complete";
 			result = PTR_ERR(rpc);
+			rpc = NULL;
 			goto done;
 		}
+	}
+	if (rpc->error) {
+		hsk->error_msg = "RPC failed";
+		result = rpc->error;
+	} else {
+		result = rpc->msgin.length;
 	}
 	result = rpc->error ? rpc->error : rpc->msgin.length;
 
@@ -2162,14 +2184,16 @@ done:
 	}
 
 	if (in_kernel) {
-		memcpy(msg->msg_control, &control, sizeof(control));
-	} else {
+        memcpy(msg->msg_control, &control, sizeof(control));
+    }
+	else {
 		if (unlikely(copy_to_user((__force void __user *)msg->msg_control,
 				  &control, sizeof(control)))) {
 			hsk->error_msg = "couldn't update homa_recvmsg_args argument to recvmsg: read-only?";
 			result = -EFAULT;
 		}
 	}
+
 #ifndef __STRIP__ /* See strip.py */
 	finish = homa_clock();
 #endif /* See strip.py */
