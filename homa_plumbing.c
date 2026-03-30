@@ -969,6 +969,8 @@ int homa_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 			return -EINVAL;
 		}
 		port = ntohs(addr_in->in6.sin6_port);
+		hsk->inet.inet_saddr = addr_in->in4.sin_addr.s_addr;
+		hsk->inet.inet_rcv_saddr = addr_in->in4.sin_addr.s_addr;
 	}
 	return homa_sock_bind(hsk->hnet, hsk, port);
 }
