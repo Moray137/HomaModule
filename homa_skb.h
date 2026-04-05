@@ -96,6 +96,9 @@ struct homa_skb_core {
 DECLARE_PER_CPU(struct homa_skb_core, homa_skb_core);
 
 struct sk_buff *homa_skb_alloc_tx(int length);
+int      homa_skb_append_from_bvec_zerocopy(struct sk_buff *skb,
+					    struct iov_iter *iter,
+					    int length);
 int      homa_skb_append_from_iter(struct homa *homa,
 				   struct sk_buff *skb, struct iov_iter *iter,
 				   int length);

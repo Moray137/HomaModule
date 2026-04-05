@@ -400,6 +400,31 @@ struct homa_rpc {
 	u32 done_timer_ticks;
 
 	/**
+	 * @zc_bvec: If non-NULL, points to a bvec array describing the
+	 * final destination for incoming message data. When set,
+	 * homa_copy_to_pool() will copy directly from skbs into these
+	 * bvecs instead of going through the buffer pool. The bvec pages
+	 * must remain valid until the RPC is completed.
+	 */
+	struct bio_vec *zc_bvec;
+
+	/** @zc_nr_segs: Number of entries in @zc_bvec. */
+	int zc_nr_segs;
+
+	/** @zc_len: Total byte count across all @zc_bvec entries. */
+	int zc_len;
+
+	/**
+	 * @zc_data_offset: Byte offset within the Homa message where the
+	 * zero-copy data region starts. Bytes before this offset (e.g.
+	 * NVMe PDU headers) are NOT copied into zc_bvec and must be
+	 * handled separately by the caller after recvmsg returns.
+	 * Typically this equals the NVMe PDU header length.
+	 * 0 means the entire message goes into zc_bvec.
+	 */
+	int zc_data_offset;
+
+	/**
 	 * @magic: when the RPC is alive, this holds a distinct value that
 	 * is unlikely to occur naturally. The value is cleared when the
 	 * RPC is reaped, so we can detect accidental use of an RPC after

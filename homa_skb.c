@@ -368,6 +368,52 @@ int homa_skb_append_from_iter(struct homa *homa, struct sk_buff *skb,
 }
 
 /**
+ * homa_skb_append_from_bvec_zerocopy() - Append data to an sk_buff by
+ * directly referencing pages from a BVEC iov_iter, without copying.
+ * The caller must ensure the pages remain valid until the skb is freed.
+ * @skb:      Append to this sk_buff.
+ * @iter:     ITER_BVEC iterator; advanced by @length bytes on success.
+ * @length:   Number of bytes to append.
+ * Return: 0 or a negative errno.
+ */
+int homa_skb_append_from_bvec_zerocopy(struct sk_buff *skb,
+					struct iov_iter *iter, int length)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+	const struct bio_vec *bvec = iter->bvec;
+	unsigned int offset = iter->iov_offset;
+	int remaining = length;
+
+	/* Walk through the bvec entries referenced by the iterator. */
+	while (remaining > 0) {
+		struct page *page;
+		int chunk, bv_remaining;
+
+		if (shinfo->nr_frags >= HOMA_MAX_SKB_FRAGS)
+			return -EINVAL;
+
+		bv_remaining = bvec->bv_len - offset;
+		chunk = min_t(int, remaining, bv_remaining);
+		page = bvec->bv_page;
+
+		skb_fill_page_desc(skb, shinfo->nr_frags, page,
+				   bvec->bv_offset + offset, chunk);
+		get_page(page);
+		skb->len += chunk;
+		skb->data_len += chunk;
+
+		remaining -= chunk;
+		offset += chunk;
+		if (offset >= bvec->bv_len) {
+			bvec++;
+			offset = 0;
+		}
+	}
+	iov_iter_advance(iter, length);
+	return 0;
+}
+
+/**
  * homa_skb_append_from_skb() - Copy data from one skb to another. The
  * data is appended into new frags at the destination. The copies are done
  * virtually when possible.

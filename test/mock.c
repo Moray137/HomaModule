@@ -679,6 +679,63 @@ void iov_iter_init(struct iov_iter *i, unsigned int direction,
 	i->count = count;
 }
 
+void iov_iter_bvec(struct iov_iter *i, unsigned int direction,
+		   const struct bio_vec *bvec, unsigned long nr_segs,
+		   size_t count)
+{
+	direction &= READ | WRITE;
+	i->iter_type = ITER_BVEC | direction;
+	i->bvec = bvec;
+	i->nr_segs = nr_segs;
+	i->iov_offset = 0;
+	i->count = count;
+}
+
+void iov_iter_advance(struct iov_iter *i, size_t bytes)
+{
+	if (iov_iter_is_bvec(i)) {
+		const struct bio_vec *bvec = i->bvec;
+		unsigned int offset = i->iov_offset;
+
+		while (bytes > 0) {
+			unsigned int remaining = bvec->bv_len - offset;
+			unsigned int chunk = (bytes < remaining) ? bytes
+								 : remaining;
+
+			bytes -= chunk;
+			offset += chunk;
+			i->count -= chunk;
+			if (offset >= bvec->bv_len) {
+				bvec++;
+				i->nr_segs--;
+				offset = 0;
+			}
+		}
+		i->bvec = bvec;
+		i->iov_offset = offset;
+	} else {
+		/* ITER_IOVEC advance */
+		struct iovec *iov = (struct iovec *)iter_iov(i);
+
+		while (bytes > 0 && i->nr_segs > 0) {
+			u64 int_base = (u64)iov->iov_base;
+			size_t chunk = iov->iov_len;
+
+			if (chunk > bytes)
+				chunk = bytes;
+			bytes -= chunk;
+			i->count -= chunk;
+			iov->iov_base = (void *)(int_base + chunk);
+			iov->iov_len -= chunk;
+			if (iov->iov_len == 0) {
+				iov++;
+				i->__iov = iov;
+				i->nr_segs--;
+			}
+		}
+	}
+}
+
 void iov_iter_revert(struct iov_iter *i, size_t bytes)
 {
 	unit_log_printf("; ", "iov_iter_revert %lu", bytes);
@@ -1345,24 +1402,50 @@ int skb_copy_datagram_iter(const struct sk_buff *from, int offset,
 				__func__, bytes_left, iter->count);
 		return 0;
 	}
-	while (bytes_left > 0) {
-		struct iovec *iov = (struct iovec *) iter_iov(iter);
-		u64 int_base = (u64) iov->iov_base;
-		size_t chunk_bytes = iov->iov_len;
+	if (iov_iter_is_bvec(iter)) {
+		while (bytes_left > 0) {
+			struct bio_vec *bv = (struct bio_vec *)iter->bvec;
+			unsigned int bv_remaining = bv->bv_len - iter->iov_offset;
+			size_t chunk_bytes = (bytes_left < bv_remaining)
+					     ? bytes_left : bv_remaining;
+			char *dst = (char *)page_address(bv->bv_page)
+				    + bv->bv_offset + iter->iov_offset;
 
-		if (chunk_bytes > bytes_left)
-			chunk_bytes = bytes_left;
-		unit_log_printf("; ",
-				"%s: %lu bytes to 0x%llx: ", __func__,
-				chunk_bytes, int_base);
-		unit_log_data(NULL, from->data + offset + size - bytes_left,
-				chunk_bytes);
-		bytes_left -= chunk_bytes;
-		iter->count -= chunk_bytes;
-		iov->iov_base = (void *) (int_base + chunk_bytes);
-		iov->iov_len -= chunk_bytes;
-		if (iov->iov_len == 0)
-			iter->__iov++;
+			unit_log_printf("; ",
+					"skb_copy_datagram_iter bvec: %lu bytes at offset %d",
+					chunk_bytes, offset + size - (int)bytes_left);
+			memcpy(dst, from->data + offset + size - bytes_left,
+			       chunk_bytes);
+			bytes_left -= chunk_bytes;
+			iter->count -= chunk_bytes;
+			iter->iov_offset += chunk_bytes;
+			if (iter->iov_offset >= bv->bv_len) {
+				iter->bvec++;
+				iter->nr_segs--;
+				iter->iov_offset = 0;
+			}
+		}
+	} else {
+		while (bytes_left > 0) {
+			struct iovec *iov = (struct iovec *) iter_iov(iter);
+			u64 int_base = (u64) iov->iov_base;
+			size_t chunk_bytes = iov->iov_len;
+
+			if (chunk_bytes > bytes_left)
+				chunk_bytes = bytes_left;
+			unit_log_printf("; ",
+					"%s: %lu bytes to 0x%llx: ", __func__,
+					chunk_bytes, int_base);
+			unit_log_data(NULL,
+				      from->data + offset + size - bytes_left,
+				      chunk_bytes);
+			bytes_left -= chunk_bytes;
+			iter->count -= chunk_bytes;
+			iov->iov_base = (void *) (int_base + chunk_bytes);
+			iov->iov_len -= chunk_bytes;
+			if (iov->iov_len == 0)
+				iter->__iov++;
+		}
 	}
 	return 0;
 }

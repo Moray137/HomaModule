@@ -904,6 +904,118 @@ TEST_F(homa_incoming, homa_copy_to_user__timetrace_info)
 }
 #endif
 
+TEST_F(homa_incoming, homa_copy_to_user__zerocopy_rx_data_only)
+{
+	/* Test zero-copy RX: packet entirely in data region (after
+	 * zc_data_offset). Data should be copied directly to zc_bvec.
+	 */
+	struct homa_rpc *crpc;
+	struct page *page1 = alloc_pages(GFP_KERNEL, 0);
+	struct bio_vec bvecs[1];
+	char *page_data;
+
+	ASSERT_NE(NULL, page1);
+	bvecs[0].bv_page = page1;
+	bvecs[0].bv_offset = 0;
+	bvecs[0].bv_len = 4096;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	self->hsk.in_kernel = true;
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 2000);
+	ASSERT_NE(NULL, crpc);
+
+	/* Set up zero-copy RX: data starts at offset 0 */
+	crpc->zc_bvec = bvecs;
+	crpc->zc_nr_segs = 1;
+	crpc->zc_len = 4096;
+	crpc->zc_data_offset = 0;
+
+	self->data.message_length = htonl(2000);
+	self->data.seg.offset = htonl(1400);
+	homa_data_pkt(mock_skb_alloc(self->server_ip, &self->data.common,
+			600, 201800), crpc);
+
+	unit_log_clear();
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	/* Verify skb_copy_datagram_iter was called with bvec path */
+	EXPECT_TRUE(strstr(unit_log_get(), "skb_copy_datagram_iter bvec:") != NULL);
+
+	put_page(page1);
+}
+TEST_F(homa_incoming, homa_copy_to_user__zerocopy_rx_with_data_offset)
+{
+	/* Test zero-copy RX: packet straddles the boundary between
+	 * PDU header (pool) and data (zc_bvec).
+	 */
+	struct homa_rpc *crpc;
+	struct page *page1 = alloc_pages(GFP_KERNEL, 0);
+	struct bio_vec bvecs[1];
+
+	ASSERT_NE(NULL, page1);
+	bvecs[0].bv_page = page1;
+	bvecs[0].bv_offset = 0;
+	bvecs[0].bv_len = 4096;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	self->hsk.in_kernel = true;
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 2000);
+	ASSERT_NE(NULL, crpc);
+
+	/* Data starts at offset 100 (first 100 bytes are PDU header) */
+	crpc->zc_bvec = bvecs;
+	crpc->zc_nr_segs = 1;
+	crpc->zc_len = 4096;
+	crpc->zc_data_offset = 100;
+
+	/* The first packet (offset 0, length 1400) straddles the boundary:
+	 * bytes 0-99 go to pool, bytes 100-1399 go to zc_bvec.
+	 */
+	unit_log_clear();
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	/* Should see both pool copy and bvec copy */
+	EXPECT_TRUE(strstr(unit_log_get(), "skb_copy_datagram_iter bvec:") != NULL);
+
+	put_page(page1);
+}
+TEST_F(homa_incoming, homa_copy_to_user__zerocopy_null_bvec_uses_pool)
+{
+	/* When zc_bvec is NULL, should use the normal pool copy path
+	 * even for in-kernel sockets.
+	 */
+	struct homa_rpc *crpc;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	self->hsk.in_kernel = true;
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 2000);
+	ASSERT_NE(NULL, crpc);
+
+	/* zc_bvec is NULL (default) */
+	EXPECT_EQ(NULL, crpc->zc_bvec);
+
+	unit_log_clear();
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	/* Should NOT see bvec path in log */
+	EXPECT_TRUE(strstr(unit_log_get(), "skb_copy_datagram_iter bvec:") == NULL);
+}
+
 TEST_F(homa_incoming, homa_dispatch_pkts__unknown_socket_ipv4)
 {
 	struct sk_buff *skb;

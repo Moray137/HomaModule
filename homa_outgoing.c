@@ -203,8 +203,12 @@ struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 		err = homa_fill_data_interleaved(rpc, skb, iter);
 	} else {
 		gso_size = max_seg_data;
-		err = homa_skb_append_from_iter(rpc->hsk->homa, skb, iter,
-						length);
+		if (rpc->hsk->in_kernel && iov_iter_is_bvec(iter))
+			err = homa_skb_append_from_bvec_zerocopy(skb, iter,
+								 length);
+		else
+			err = homa_skb_append_from_iter(rpc->hsk->homa, skb,
+							iter, length);
 	}
 	if (err)
 		goto error;
@@ -332,7 +336,8 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 #ifndef __STRIP__ /* See strip.py */
 	rpc->msgout.granted = rpc->msgout.unscheduled;
 #endif /* See strip.py */
-	homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
+	if (!(rpc->hsk->in_kernel && iov_iter_is_bvec(iter)))
+		homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
 
 	/* Each iteration of the loop below creates one GSO packet. */
 #ifndef __STRIP__ /* See strip.py */

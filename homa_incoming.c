@@ -366,6 +366,70 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			int copied = 0;
 			char *dst;
 
+			if (in_kernel && rpc->zc_bvec) {
+				/* Zero-copy RX: copy directly from skb into
+				 * the pre-registered bvec destination, bypassing
+				 * the pool for data after zc_data_offset.
+				 */
+				int msg_offset = offset;
+
+				if (msg_offset >= rpc->zc_data_offset) {
+					/* Packet entirely in data region */
+					int bvec_offset = msg_offset
+							- rpc->zc_data_offset;
+					struct iov_iter dest;
+
+					iov_iter_bvec(&dest, ITER_DEST,
+						      rpc->zc_bvec,
+						      rpc->zc_nr_segs,
+						      rpc->zc_len);
+					iov_iter_advance(&dest, bvec_offset);
+					if (skb_copy_datagram_iter(skbs[i],
+							sizeof(*h),
+							&dest,
+							pkt_length)) {
+						error = -EFAULT;
+						goto free_skbs;
+					}
+				} else if (msg_offset + pkt_length
+						> rpc->zc_data_offset) {
+					/* Packet straddles boundary */
+					int pool_bytes = rpc->zc_data_offset
+							- msg_offset;
+					int zc_bytes = pkt_length - pool_bytes;
+					struct iov_iter dest;
+
+					dst = homa_pool_get_buffer(rpc,
+							msg_offset,
+							&buf_bytes);
+					if (!dst || buf_bytes < pool_bytes) {
+						error = -EFAULT;
+						goto free_skbs;
+					}
+					if (skb_copy_bits(skbs[i], sizeof(*h),
+							  dst, pool_bytes)) {
+						error = -EFAULT;
+						goto free_skbs;
+					}
+					iov_iter_bvec(&dest, ITER_DEST,
+						      rpc->zc_bvec,
+						      rpc->zc_nr_segs,
+						      rpc->zc_len);
+					if (skb_copy_datagram_iter(skbs[i],
+							sizeof(*h) + pool_bytes,
+							&dest, zc_bytes)) {
+						error = -EFAULT;
+						goto free_skbs;
+					}
+				} else {
+					/* Packet entirely before data region;
+					 * copy to pool as usual.
+					 */
+					goto copy_to_pool;
+				}
+				goto next_skb;
+			}
+copy_to_pool:
 			/* Each iteration of this loop copies to one
 			 * user buffer.
 			 */
@@ -389,7 +453,6 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 				}
 
 				if (in_kernel) {
-					// printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
 					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
 						error = -EFAULT;
 						pr_err("homa_incoming_copy_to_pool: bad address %d.\n", error);
@@ -411,6 +474,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 				}
 				copied += chunk_size;
 			}
+next_skb:
 #ifndef __UPSTREAM__ /* See strip.py */
 			if (end_offset == 0) {
 				start_offset = offset;

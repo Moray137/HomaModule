@@ -42,6 +42,9 @@ struct in6_addr
 void         unit_homa_destroy(struct homa *homa);
 struct iov_iter
 	    *unit_iov_iter(void *buffer, size_t length);
+struct iov_iter
+	    *unit_bvec_iter(struct bio_vec *bvecs, unsigned long nr_segs,
+			    size_t length);
 int          unit_list_length(struct list_head *head);
 void         unit_log_active_ids(struct homa_sock *hsk);
 void         unit_log_dead_peers(struct homa *homa);
