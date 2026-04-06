@@ -371,6 +371,7 @@ int homa_skb_append_from_iter(struct homa *homa, struct sk_buff *skb,
  * homa_skb_append_from_bvec_zerocopy() - Append data to an sk_buff by
  * directly referencing pages from a BVEC iov_iter, without copying.
  * The caller must ensure the pages remain valid until the skb is freed.
+ * This function relies on tcp_hijacking.
  * @skb:      Append to this sk_buff.
  * @iter:     ITER_BVEC iterator; advanced by @length bytes on success.
  * @length:   Number of bytes to append.
@@ -395,7 +396,7 @@ int homa_skb_append_from_bvec_zerocopy(struct sk_buff *skb,
 		bv_remaining = bvec->bv_len - offset;
 		chunk = min_t(int, remaining, bv_remaining);
 		page = bvec->bv_page;
-
+		// Fills the skb with reference of a page in bvec
 		skb_fill_page_desc(skb, shinfo->nr_frags, page,
 				   bvec->bv_offset + offset, chunk);
 		get_page(page);
