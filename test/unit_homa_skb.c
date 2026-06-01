@@ -458,19 +458,16 @@ TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__basics)
 
 	ASSERT_NE(NULL, page1);
 	ASSERT_NE(NULL, page2);
-
 	bvecs[0].bv_page = page1;
 	bvecs[0].bv_offset = 100;
 	bvecs[0].bv_len = 500;
 	bvecs[1].bv_page = page2;
 	bvecs[1].bv_offset = 0;
 	bvecs[1].bv_len = 1000;
-
 	iter = unit_bvec_iter(bvecs, 2, 1500);
 
+	/* Append 700 bytes: all 500 of bvec0 + 200 of bvec1. */
 	EXPECT_EQ(0, homa_skb_append_from_bvec_zerocopy(self->skb, iter, 700));
-
-	/* Should have created 2 frags: 500 from page1 + 200 from page2 */
 	EXPECT_EQ(2, shinfo->nr_frags);
 	EXPECT_EQ(page1, skb_frag_page(&shinfo->frags[0]));
 	EXPECT_EQ(100, shinfo->frags[0].offset);
@@ -480,14 +477,12 @@ TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__basics)
 	EXPECT_EQ(200, skb_frag_size(&shinfo->frags[1]));
 	EXPECT_EQ(700, self->skb->len);
 	EXPECT_EQ(700, self->skb->data_len);
-
-	/* Iterator should have advanced past the consumed bytes */
 	EXPECT_EQ(800, iter->count);
 
 	put_page(page1);
 	put_page(page2);
 }
-TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__single_bvec)
+TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__single_bvec_with_offset)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(self->skb);
 	struct page *page1 = alloc_pages(GFP_KERNEL, 0);
@@ -495,15 +490,12 @@ TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__single_bvec)
 	struct iov_iter *iter;
 
 	ASSERT_NE(NULL, page1);
-
 	bvecs[0].bv_page = page1;
 	bvecs[0].bv_offset = 200;
 	bvecs[0].bv_len = 400;
-
 	iter = unit_bvec_iter(bvecs, 1, 400);
 
 	EXPECT_EQ(0, homa_skb_append_from_bvec_zerocopy(self->skb, iter, 400));
-
 	EXPECT_EQ(1, shinfo->nr_frags);
 	EXPECT_EQ(page1, skb_frag_page(&shinfo->frags[0]));
 	EXPECT_EQ(200, shinfo->frags[0].offset);
@@ -520,25 +512,22 @@ TEST_F(homa_skb, homa_skb_append_from_bvec_zerocopy__too_many_frags)
 	struct iov_iter *iter;
 
 	ASSERT_NE(NULL, page1);
-
 	bvecs[0].bv_page = page1;
 	bvecs[0].bv_offset = 0;
 	bvecs[0].bv_len = 4096;
-
-	/* Fill frags to the max */
 	mock_max_skb_frags = 1;
+
+	/* First append fills the single available frag slot. */
 	iter = unit_bvec_iter(bvecs, 1, 4096);
-
-	/* First append should succeed (fills the one slot). */
 	EXPECT_EQ(0, homa_skb_append_from_bvec_zerocopy(self->skb, iter, 100));
-
-	/* Second append should fail (no more frag slots). */
-	iter = unit_bvec_iter(bvecs, 1, 3996);
+	/* Second append has no slot left. */
+	iter = unit_bvec_iter(bvecs, 1, 4096);
 	EXPECT_EQ(EINVAL, -homa_skb_append_from_bvec_zerocopy(self->skb,
 			iter, 100));
 
 	put_page(page1);
 }
+
 TEST_F(homa_skb, homa_skb_append_from_skb__header_only)
 {
 	struct sk_buff *src_skb = test_skb(&self->homa);

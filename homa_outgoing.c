@@ -203,10 +203,12 @@ struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 		err = homa_fill_data_interleaved(rpc, skb, iter);
 	} else {
 		gso_size = max_seg_data;
+#ifndef __STRIP__ /* See strip.py */
 		if (rpc->hsk->in_kernel && iov_iter_is_bvec(iter))
 			err = homa_skb_append_from_bvec_zerocopy(skb, iter,
 								 length);
 		else
+#endif /* See strip.py */
 			err = homa_skb_append_from_iter(rpc->hsk->homa, skb,
 							iter, length);
 	}

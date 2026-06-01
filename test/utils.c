@@ -464,10 +464,10 @@ struct iov_iter *unit_iov_iter(void *buffer, size_t length)
 }
 
 /**
- * unit_bvec_iter() - Return an iov_iter of type ITER_BVEC.
- * @bvecs:     Array of bio_vec entries.
+ * unit_bvec_iter() - Return an ITER_BVEC iov_iter for the given bvec array.
+ * @bvecs:     Array of bio_vec entries (must remain valid while iter is used).
  * @nr_segs:   Number of entries in @bvecs.
- * @length:    Total byte count.
+ * @length:    Total byte count across all entries.
  */
 struct iov_iter *unit_bvec_iter(struct bio_vec *bvecs, unsigned long nr_segs,
 				size_t length)

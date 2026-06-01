@@ -274,6 +274,145 @@ keep:
 }
 
 /**
+ * homa_deliver_skbs() - Zero-copy receive path for in-kernel sockets that have
+ * registered a read_sock-style actor (see homa_sock_set_rx_actor()). Instead of
+ * copying the message into the buffer pool, this hands each DATA skb of the
+ * message to the actor, in increasing message-offset order, so the in-kernel
+ * consumer can copy data straight into its final destination (one copy,
+ * skb->destination, bypassing the pool).
+ *
+ * Because the actor consumes the message as an in-order byte stream (it parses
+ * the embedded PDU header first, then routes the data), delivery only happens
+ * once the entire message has arrived. Until then this returns 0 without
+ * delivering, but still clears RPC_PKTS_READY so that the arrival of later
+ * packets re-arms the handoff (see homa_data_pkt()).
+ * @rpc:     RPC whose message should be delivered. Must be locked by caller;
+ *           the lock is released and reacquired around the actor invocations.
+ * Return:   Zero for success or a negative errno. Like homa_copy_to_pool(), the
+ *           RPC may be freed while the lock is dropped (-EINVAL, state RPC_DEAD).
+ */
+static int homa_deliver_skbs(struct homa_rpc *rpc)
+	__must_hold(rpc_bucket_lock)
+{
+	struct sk_buff_head sorted;
+	read_descriptor_t desc;
+	struct sk_buff *skb;
+	int error = 0;
+	int n = 0;
+#ifndef __STRIP__ /* See strip.py */
+	u64 start;
+#endif /* See strip.py */
+
+	if (rpc->state == RPC_DEAD)
+		return -EINVAL;
+
+	/* The actor needs the whole message in order; wait until it is fully
+	 * received. Clear RPC_PKTS_READY so the next arriving packet re-arms
+	 * the handoff and wakes us again (homa_data_pkt() only hands off on the
+	 * 0->1 transition of RPC_PKTS_READY).
+	 */
+	if (rpc->msgin.length < 0 || rpc->msgin.bytes_remaining != 0) {
+		atomic_andnot(RPC_PKTS_READY, &rpc->flags);
+		return 0;
+	}
+	if (skb_queue_len(&rpc->msgin.packets) == 0) {
+		/* Already delivered. */
+		atomic_andnot(RPC_PKTS_READY, &rpc->flags);
+		return 0;
+	}
+
+	/* Move all packets to a private queue sorted by message offset, so we
+	 * can present them to the actor as a contiguous, in-order byte stream
+	 * (packets may have arrived out of order).
+	 */
+	__skb_queue_head_init(&sorted);
+	while ((skb = __skb_dequeue(&rpc->msgin.packets))) {
+		struct homa_data_hdr *h = (struct homa_data_hdr *)skb->data;
+		int offset = ntohl(h->seg.offset);
+		struct sk_buff *cur;
+		bool inserted = false;
+
+		skb_queue_walk(&sorted, cur) {
+			struct homa_data_hdr *ch =
+				(struct homa_data_hdr *)cur->data;
+
+			if (ntohl(ch->seg.offset) > offset) {
+				__skb_insert(skb, cur->prev, cur, &sorted);
+				inserted = true;
+				break;
+			}
+		}
+		if (!inserted)
+			__skb_queue_tail(&sorted, skb);
+		n++;
+	}
+	atomic_andnot(RPC_PKTS_READY, &rpc->flags);
+
+	/* Drop the lock while invoking the actor: it copies (potentially a lot
+	 * of) data and may sleep (e.g. allocating destination buffers).
+	 */
+	homa_rpc_hold(rpc);
+	homa_rpc_unlock(rpc);
+
+	tt_record1("starting zero-copy delivery for id %d", rpc->id);
+
+	desc.arg.data = rpc->hsk->rx_actor_ctx;
+	desc.count = rpc->msgin.length;
+	desc.written = 0;
+	desc.error = 0;
+	skb_queue_walk(&sorted, skb) {
+		struct homa_data_hdr *h = (struct homa_data_hdr *)skb->data;
+		int pkt_length = homa_data_len(skb);
+		int used;
+
+		used = rpc->hsk->rx_actor(&desc, skb, sizeof(*h), pkt_length);
+		if (desc.error) {
+			error = desc.error;
+			break;
+		}
+		if (used <= 0) {
+			error = -EFAULT;
+			break;
+		}
+	}
+
+#ifndef __STRIP__ /* See strip.py */
+	start = homa_clock();
+#endif /* See strip.py */
+	while ((skb = __skb_dequeue(&sorted)))
+		kfree_skb(skb);
+	INC_METRIC(skb_free_cycles, homa_clock() - start);
+	INC_METRIC(skb_frees, n);
+	tt_record2("finished zero-copy delivery of %d skbs for id %d",
+		   n, rpc->id);
+
+	atomic_or(APP_NEEDS_LOCK, &rpc->flags);
+	homa_rpc_lock(rpc);
+	atomic_andnot(APP_NEEDS_LOCK, &rpc->flags);
+
+	/* The RPC may have been freed while the lock was dropped. */
+	if (rpc->state == RPC_DEAD) {
+		homa_rpc_put(rpc);
+		return error ? error : -EINVAL;
+	}
+
+	/* The data never went through the buffer pool, so release the bpages
+	 * that were allocated for this message (they are required earlier so
+	 * that grants are issued and packets aren't dropped) and report zero
+	 * bpages to the caller.
+	 */
+	if (rpc->msgin.num_bpages > 0) {
+		homa_pool_release_buffers(rpc->hsk->buffer_pool,
+					  rpc->msgin.num_bpages,
+					  rpc->msgin.bpage_offsets);
+		rpc->msgin.num_bpages = 0;
+	}
+
+	homa_rpc_put(rpc);
+	return error;
+}
+
+/**
  * homa_copy_to_user() - Copy as much data as possible from incoming
  * packet buffers to buffers in user space.
  * Edit: To support in-kernel operations, this method is renamed to homa_copy_to_pool.
@@ -307,6 +446,12 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 	int i;
 	/* If using kernel apps like NVMe-oF, we will need to copy to kernel */
 	bool in_kernel = rpc->hsk->in_kernel;
+
+	/* Zero-copy receive: if an in-kernel consumer registered a read_sock
+	 * style actor, hand skbs directly to it instead of staging in the pool.
+	 */
+	if (in_kernel && rpc->hsk->rx_actor)
+		return homa_deliver_skbs(rpc);
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -366,70 +511,6 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			int copied = 0;
 			char *dst;
 
-			if (in_kernel && rpc->zc_bvec) {
-				/* Zero-copy RX: copy directly from skb into
-				 * the pre-registered bvec destination, bypassing
-				 * the pool for data after zc_data_offset.
-				 */
-				int msg_offset = offset;
-
-				if (msg_offset >= rpc->zc_data_offset) {
-					/* Packet entirely in data region */
-					int bvec_offset = msg_offset
-							- rpc->zc_data_offset;
-					struct iov_iter dest;
-
-					iov_iter_bvec(&dest, ITER_DEST,
-						      rpc->zc_bvec,
-						      rpc->zc_nr_segs,
-						      rpc->zc_len);
-					iov_iter_advance(&dest, bvec_offset);
-					if (skb_copy_datagram_iter(skbs[i],
-							sizeof(*h),
-							&dest,
-							pkt_length)) {
-						error = -EFAULT;
-						goto free_skbs;
-					}
-				} else if (msg_offset + pkt_length
-						> rpc->zc_data_offset) {
-					/* Packet straddles boundary */
-					int pool_bytes = rpc->zc_data_offset
-							- msg_offset;
-					int zc_bytes = pkt_length - pool_bytes;
-					struct iov_iter dest;
-
-					dst = homa_pool_get_buffer(rpc,
-							msg_offset,
-							&buf_bytes);
-					if (!dst || buf_bytes < pool_bytes) {
-						error = -EFAULT;
-						goto free_skbs;
-					}
-					if (skb_copy_bits(skbs[i], sizeof(*h),
-							  dst, pool_bytes)) {
-						error = -EFAULT;
-						goto free_skbs;
-					}
-					iov_iter_bvec(&dest, ITER_DEST,
-						      rpc->zc_bvec,
-						      rpc->zc_nr_segs,
-						      rpc->zc_len);
-					if (skb_copy_datagram_iter(skbs[i],
-							sizeof(*h) + pool_bytes,
-							&dest, zc_bytes)) {
-						error = -EFAULT;
-						goto free_skbs;
-					}
-				} else {
-					/* Packet entirely before data region;
-					 * copy to pool as usual.
-					 */
-					goto copy_to_pool;
-				}
-				goto next_skb;
-			}
-copy_to_pool:
 			/* Each iteration of this loop copies to one
 			 * user buffer.
 			 */
@@ -453,6 +534,7 @@ copy_to_pool:
 				}
 
 				if (in_kernel) {
+					// printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
 					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
 						error = -EFAULT;
 						pr_err("homa_incoming_copy_to_pool: bad address %d.\n", error);
@@ -474,7 +556,6 @@ copy_to_pool:
 				}
 				copied += chunk_size;
 			}
-next_skb:
 #ifndef __UPSTREAM__ /* See strip.py */
 			if (end_offset == 0) {
 				start_offset = offset;

@@ -373,14 +373,12 @@ TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__zerocopy_bvec_in_kernel)
 
 	ASSERT_NE(NULL, page1);
 	ASSERT_NE(NULL, page2);
-
 	bvecs[0].bv_page = page1;
 	bvecs[0].bv_offset = 0;
 	bvecs[0].bv_len = 300;
 	bvecs[1].bv_page = page2;
 	bvecs[1].bv_offset = 0;
 	bvecs[1].bv_len = 200;
-
 	iter = unit_bvec_iter(bvecs, 2, 500);
 
 	self->homa.hijack_tcp = 1;
@@ -393,13 +391,13 @@ TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__zerocopy_bvec_in_kernel)
 	unit_log_clear();
 	skb = homa_tx_data_pkt_alloc(crpc, iter, 0, 500, 2000);
 	ASSERT_FALSE(IS_ERR(skb));
-
-	/* Should have used zero-copy: 2 frags referencing the bvec pages */
+	/* Zero-copy: 2 frags directly referencing the bvec pages, no copy. */
 	EXPECT_EQ(2, skb_shinfo(skb)->nr_frags);
 	EXPECT_EQ(page1, skb_frag_page(&skb_shinfo(skb)->frags[0]));
 	EXPECT_EQ(300, skb_frag_size(&skb_shinfo(skb)->frags[0]));
 	EXPECT_EQ(page2, skb_frag_page(&skb_shinfo(skb)->frags[1]));
 	EXPECT_EQ(200, skb_frag_size(&skb_shinfo(skb)->frags[1]));
+	EXPECT_STREQ("", unit_log_get());
 
 	kfree_skb(skb);
 	unit_sock_destroy(&hsk);
@@ -408,9 +406,6 @@ TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__zerocopy_bvec_in_kernel)
 }
 TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__non_bvec_in_kernel_falls_back)
 {
-	/* When in_kernel is true but iter is NOT bvec, should use normal
-	 * copy path (homa_skb_append_from_iter).
-	 */
 	struct iov_iter *iter = unit_iov_iter((void *)1000, 500);
 	struct homa_rpc *crpc;
 	struct homa_sock hsk;
@@ -426,6 +421,7 @@ TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__non_bvec_in_kernel_falls_back)
 	unit_log_clear();
 	skb = homa_tx_data_pkt_alloc(crpc, iter, 0, 500, 2000);
 	ASSERT_FALSE(IS_ERR(skb));
+	/* Not a bvec iter: falls back to the copy path. */
 	EXPECT_STREQ("_copy_from_iter 500 bytes at 1000", unit_log_get());
 
 	kfree_skb(skb);
