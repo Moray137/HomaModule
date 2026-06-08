@@ -51,7 +51,7 @@ struct homa_rpc *unit_client_rpc(struct homa_sock *hsk,
 	crpc = homa_rpc_alloc_client(hsk, &server_addr);
 	if (IS_ERR(crpc))
 		return NULL;
-	if (homa_message_out_fill(crpc, unit_iov_iter(NULL, req_length), 0)) {
+	if (homa_message_out_fill(crpc, unit_iov_iter(NULL, req_length), 0, 0)) {
 		homa_rpc_end(crpc);
 		return NULL;
 	}
@@ -427,7 +427,7 @@ struct homa_rpc *unit_server_rpc(struct homa_sock *hsk,
 		return srpc;
 	homa_rpc_lock(srpc);
 	status = homa_message_out_fill(srpc, unit_iov_iter((void *) 2000,
-				       resp_length), 0);
+				       resp_length), 0, 0);
 	homa_rpc_unlock(srpc);
 	if (status != 0)
 		goto error;
@@ -465,6 +465,22 @@ struct iov_iter *unit_iov_iter(void *buffer, size_t length)
 	iovec.iov_base = buffer;
 	iovec.iov_len = length;
 	iov_iter_init(&iter, WRITE, &iovec, 1, length);
+	return &iter;
+}
+
+/**
+ * unit_bvec_iter() - Return an ITER_BVEC iov_iter over the given bio_vec
+ * array (kernel-memory iterator, e.g. for zero-copy TX tests).
+ * @bvecs:      Array of bio_vec entries describing the data.
+ * @nr_segs:    Number of entries in @bvecs.
+ * @length:     Total number of bytes across all entries.
+ */
+struct iov_iter *unit_bvec_iter(struct bio_vec *bvecs, unsigned long nr_segs,
+				size_t length)
+{
+	static struct iov_iter iter;
+
+	iov_iter_bvec(&iter, WRITE, bvecs, nr_segs, length);
 	return &iter;
 }
 

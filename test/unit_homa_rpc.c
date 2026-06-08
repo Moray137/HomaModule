@@ -1071,7 +1071,7 @@ TEST_F(homa_rpc, homa_rpc_get_info__HOMA_RPC_RX_READY_and_HOMA_RPC_RX_COPY)
 
 	/* Third call: all bytes copied out. */
 	homa_rpc_lock(srpc);
-	homa_copy_to_user(srpc);
+	homa_copy_to_pool(srpc);
 	homa_rpc_unlock(srpc);
 	homa_rpc_get_info(srpc, &info);
 	EXPECT_EQ(0, skb_queue_len(&srpc->msgin.packets));

@@ -710,6 +710,44 @@ void iov_iter_revert(struct iov_iter *i, size_t bytes)
 	unit_log_printf("; ", "iov_iter_revert %lu", bytes);
 }
 
+/* Minimal mock of iov_iter_extract_pages for ITER_BVEC iterators: returns one
+ * page chunk per call (bounded by the current bvec segment, maxsize, and the
+ * page boundary), takes a reference on the page, and advances the iterator.
+ * Sufficient for homa_skb_append_from_iter_zerocopy unit tests.
+ */
+ssize_t iov_iter_extract_pages(struct iov_iter *i, struct page ***pages,
+			       size_t maxsize, unsigned int maxpages,
+			       iov_iter_extraction_t extraction_flags,
+			       size_t *offset0)
+{
+	const struct bio_vec *bvec;
+	size_t skip, start, n;
+	struct page *page;
+
+	if (!iov_iter_is_bvec(i) || maxpages == 0 || maxsize == 0)
+		return 0;
+	bvec = i->bvec;
+	skip = i->iov_offset;
+	start = bvec->bv_offset + skip;
+	page = bvec->bv_page;
+	*offset0 = start & (PAGE_SIZE - 1);
+	n = bvec->bv_len - skip;
+	if (n > maxsize)
+		n = maxsize;
+	if (n > PAGE_SIZE - *offset0)
+		n = PAGE_SIZE - *offset0;
+	(*pages)[0] = page;
+	get_page(page);
+	i->iov_offset += n;
+	i->count -= n;
+	if (i->iov_offset >= bvec->bv_len) {
+		i->bvec++;
+		i->nr_segs--;
+		i->iov_offset = 0;
+	}
+	return n;
+}
+
 int ip6_datagram_connect(struct sock *sk, struct sockaddr *addr, int addr_len)
 {
 	return 0;

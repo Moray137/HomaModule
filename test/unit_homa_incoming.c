@@ -28,6 +28,38 @@ static int lock_delete_count;
 static int hook_count;
 static struct homa_sock *hook_shutdown_hsk;
 
+/* State recorded by test_rx_actor() for zero-copy RX delivery tests. */
+#define TEST_RX_MAX 16
+struct test_rx_state {
+	int n_calls;
+	unsigned int offsets[TEST_RX_MAX];    /* skb offset arg per call */
+	size_t lens[TEST_RX_MAX];             /* len arg per call */
+	int msg_offsets[TEST_RX_MAX];         /* ntohl(seg.offset) per skb */
+	int fail_at;                          /* 1-based call to fail at, or 0 */
+};
+
+/* A read_sock-style actor used to test homa_deliver_skbs(). Records its
+ * arguments and (optionally) signals an error on a chosen call.
+ */
+static int test_rx_actor(read_descriptor_t *desc, struct sk_buff *skb,
+			 unsigned int offset, size_t len)
+{
+	struct test_rx_state *st = desc->arg.data;
+	struct homa_data_hdr *h = (struct homa_data_hdr *)skb->data;
+
+	if (st->n_calls < TEST_RX_MAX) {
+		st->offsets[st->n_calls] = offset;
+		st->lens[st->n_calls] = len;
+		st->msg_offsets[st->n_calls] = ntohl(h->seg.offset);
+	}
+	st->n_calls++;
+	if (st->fail_at && st->n_calls == st->fail_at) {
+		desc->error = -EIO;
+		return 0;
+	}
+	return len;
+}
+
 static void wait_hook4(char *id)
 {
 	if (strcmp(id, "schedule") != 0 &&
@@ -759,7 +791,7 @@ TEST_F(homa_incoming, homa_copy_to_user__basics)
 	unit_log_clear();
 	mock_copy_to_user_dont_copy = -1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("skb_copy_datagram_iter: 1400 bytes to 0x1000000: 0-1399; "
 			"skb_copy_datagram_iter: 648 bytes to 0x1000578: 101000-101647; "
@@ -783,7 +815,7 @@ TEST_F(homa_incoming, homa_copy_to_user__rpc_freed)
 
 	unit_log_clear();
 	mock_copy_to_user_dont_copy = -1;
-	EXPECT_EQ(EINVAL, -homa_copy_to_user(crpc));
+	EXPECT_EQ(EINVAL, -homa_copy_to_pool(crpc));
 	EXPECT_STREQ("", unit_log_get());
 	EXPECT_EQ(1, skb_queue_len(&crpc->msgin.packets));
 }
@@ -807,7 +839,7 @@ TEST_F(homa_incoming, homa_copy_to_user__multiple_batches)
 	unit_log_clear();
 	mock_copy_to_user_dont_copy = -1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("skb_copy_datagram_iter: 1400 bytes to 0x1000000: 0-1399; "
 			"skb_copy_datagram_iter: 1400 bytes to 0x1000578: 1400-2799; "
@@ -834,7 +866,7 @@ TEST_F(homa_incoming, homa_copy_to_user__nothing_to_copy)
 	unit_log_clear();
 	mock_copy_to_user_dont_copy = -1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("skb_copy_datagram_iter: 1400 bytes to 0x1000000: 0-1399",
 			unit_log_get());
@@ -842,7 +874,7 @@ TEST_F(homa_incoming, homa_copy_to_user__nothing_to_copy)
 
 	/* Second call finds no packets. */
 	unit_log_clear();
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	EXPECT_STREQ("", unit_log_get());
 }
 TEST_F(homa_incoming, homa_copy_to_user__many_chunks_for_one_skb)
@@ -862,7 +894,7 @@ TEST_F(homa_incoming, homa_copy_to_user__many_chunks_for_one_skb)
 	unit_log_clear();
 	mock_copy_to_user_dont_copy = -1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("skb_copy_datagram_iter: 512 bytes to 0x1000000: 101000-101511; "
 			"skb_copy_datagram_iter: 512 bytes to 0x1000200: 101512-102023; "
@@ -890,7 +922,7 @@ TEST_F(homa_incoming, homa_copy_to_user__skb_data_extends_past_message_end)
 	h = (struct homa_data_hdr *)skb_peek(&crpc->msgin.packets)->data;
 	h->seg.offset = htonl(4000);
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("", unit_log_get());
 }
@@ -906,7 +938,7 @@ TEST_F(homa_incoming, homa_copy_to_user__error_in_import_ubuf)
 	unit_log_clear();
 	mock_import_ubuf_errors = 1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(13, -homa_copy_to_user(crpc));
+	EXPECT_EQ(13, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("", unit_log_get());
 	EXPECT_EQ(0, skb_queue_len(&crpc->msgin.packets));
@@ -923,7 +955,7 @@ TEST_F(homa_incoming, homa_copy_to_user__error_in_skb_copy_datagram_iter)
 	unit_log_clear();
 	mock_copy_data_errors = 1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(14, -homa_copy_to_user(crpc));
+	EXPECT_EQ(14, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	EXPECT_STREQ("", unit_log_get());
 	EXPECT_EQ(0, skb_queue_len(&crpc->msgin.packets));
@@ -951,7 +983,7 @@ TEST_F(homa_incoming, homa_copy_to_user__timetrace_info)
 	mock_copy_to_user_dont_copy = -1;
 	tt_init(NULL);
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_user(crpc));
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
 	homa_rpc_unlock(crpc);
 	tt_get_messages(traces, sizeof(traces));
 	EXPECT_STREQ("starting copy to user space for id 1234; "
@@ -968,6 +1000,119 @@ TEST_F(homa_incoming, homa_copy_to_user__timetrace_info)
 	tt_destroy();
 }
 #endif
+
+TEST_F(homa_incoming, homa_deliver_skbs__basics)
+{
+	struct test_rx_state st = {};
+	struct homa_rpc *crpc;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 4000);
+	ASSERT_NE(NULL, crpc);
+	ASSERT_EQ(0, crpc->msgin.bytes_remaining);
+
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	/* 4000 bytes => 3 packets at 1400/1400/1200. */
+	EXPECT_EQ(3, st.n_calls);
+	/* Each delivery skips the homa_data_hdr. */
+	EXPECT_EQ(sizeof(struct homa_data_hdr), st.offsets[0]);
+	EXPECT_EQ(sizeof(struct homa_data_hdr), st.offsets[1]);
+	EXPECT_EQ(sizeof(struct homa_data_hdr), st.offsets[2]);
+	/* Delivered in increasing message-offset order. */
+	EXPECT_EQ(0, st.msg_offsets[0]);
+	EXPECT_EQ(1400, st.msg_offsets[1]);
+	EXPECT_EQ(2800, st.msg_offsets[2]);
+	/* Pool was bypassed: bpages released, packets freed. */
+	EXPECT_EQ(0, crpc->msgin.num_bpages);
+	EXPECT_EQ(0, skb_queue_len(&crpc->msgin.packets));
+	EXPECT_EQ(0, test_bit(RPC_PKTS_READY, &crpc->flags));
+}
+TEST_F(homa_incoming, homa_deliver_skbs__out_of_order_packets_sorted)
+{
+	struct test_rx_state st = {};
+	struct sk_buff_head reversed;
+	struct homa_rpc *crpc;
+	struct sk_buff *skb;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 4000);
+	ASSERT_NE(NULL, crpc);
+	ASSERT_EQ(0, crpc->msgin.bytes_remaining);
+
+	/* Reverse the packet queue to simulate out-of-order arrival
+	 * (2800, 1400, 0 instead of 0, 1400, 2800).
+	 */
+	__skb_queue_head_init(&reversed);
+	while ((skb = __skb_dequeue(&crpc->msgin.packets)))
+		__skb_queue_head(&reversed, skb);
+	skb_queue_splice_init(&reversed, &crpc->msgin.packets);
+
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	EXPECT_EQ(3, st.n_calls);
+	/* Despite out-of-order arrival, delivered in ascending offset order. */
+	EXPECT_EQ(0, st.msg_offsets[0]);
+	EXPECT_EQ(1400, st.msg_offsets[1]);
+	EXPECT_EQ(2800, st.msg_offsets[2]);
+}
+TEST_F(homa_incoming, homa_deliver_skbs__incomplete_message_defers)
+{
+	struct test_rx_state st = {};
+	struct homa_rpc *crpc;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	/* Only the first packet of a 4000-byte message has arrived. */
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 4000);
+	ASSERT_NE(NULL, crpc);
+	ASSERT_NE(0, crpc->msgin.bytes_remaining);
+
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+
+	/* Incomplete: actor not invoked, packets retained, ready bit cleared
+	 * so a later packet re-arms the handoff.
+	 */
+	EXPECT_EQ(0, st.n_calls);
+	EXPECT_NE(0, skb_queue_len(&crpc->msgin.packets));
+	EXPECT_EQ(0, test_bit(RPC_PKTS_READY, &crpc->flags));
+}
+TEST_F(homa_incoming, homa_deliver_skbs__actor_error)
+{
+	struct test_rx_state st = {};
+	struct homa_rpc *crpc;
+
+	mock_bpage_size = 2048;
+	mock_bpage_shift = 11;
+	st.fail_at = 2;
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
+			self->server_ip, self->server_port, self->client_id,
+			1000, 4000);
+	ASSERT_NE(NULL, crpc);
+
+	homa_rpc_lock(crpc);
+	EXPECT_EQ(EIO, -homa_copy_to_pool(crpc));
+	homa_rpc_unlock(crpc);
+	EXPECT_EQ(2, st.n_calls);
+}
 
 TEST_F(homa_incoming, homa_dispatch_pkts__unknown_socket_ipv4)
 {
