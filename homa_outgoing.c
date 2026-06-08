@@ -122,12 +122,16 @@ int homa_fill_data_interleaved(struct homa_rpc *rpc, struct sk_buff *skb,
  *                much data.
  * @max_seg_data: Maximum number of bytes of message data that can go in
  *                a single segment of the GSO packet.
+ * @zerocopy:     True means reference the caller's pages directly (the iter
+ *                must describe kernel memory) instead of copying message data
+ *                into Homa-owned skb frags. See homa_message_out_fill().
  * Return:        A pointer to the new packet, or a negative errno. Sets
  *                rpc->hsk->error_msg on errors.
  */
 struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 				       struct iov_iter *iter, int offset,
-				       int length, int max_seg_data)
+				       int length, int max_seg_data,
+				       bool zerocopy)
 	__must_hold(rpc->bucket->lock)
 {
 	struct homa_skb_info *homa_info;
@@ -198,8 +202,12 @@ struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 		err = homa_fill_data_interleaved(rpc, skb, iter);
 	} else {
 		gso_size = max_seg_data;
-		err = homa_skb_append_from_iter(rpc->hsk->homa, skb, iter,
-						length);
+		if (zerocopy)
+			err = homa_skb_append_from_iter_zerocopy(skb, iter,
+								 length);
+		else
+			err = homa_skb_append_from_iter(rpc->hsk->homa, skb,
+							iter, length);
 	}
 	if (err) {
 		rpc->hsk->error_msg = "couldn't copy message body into packet buffers";
@@ -242,7 +250,8 @@ error:
  *           happens, copying will cease, -EINVAL will be returned, and
  *           rpc->state will be RPC_DEAD. Sets rpc->hsk->error_msg on errors.
  */
-int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
+int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
+			  int flags)
 	__must_hold(rpc->bucket->lock)
 {
 	/* Geometry information for packets:
@@ -262,6 +271,14 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 	int bytes_left;
 	int gso_size;
 	int err;
+
+	/* Zero-copy TX: reference the caller's pages directly rather than
+	 * copying. Requested per-send via MSG_SPLICE_PAGES and only possible
+	 * for kernel-mode iterators (user_backed_iter() is false). User-space
+	 * memory would need pinning + async completion (MSG_ZEROCOPY), which
+	 * is not supported here, so it falls back to copying.
+	 */
+	bool zerocopy = (flags & MSG_SPLICE_PAGES) && !user_backed_iter(iter);
 	// NVMe-oH debugfs
 	u64 tl_start = 0;
 	u64 tl_pkts = 0;
@@ -322,7 +339,8 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 #ifndef __STRIP__ /* See strip.py */
 	rpc->msgout.granted = rpc->msgout.unscheduled;
 #endif /* See strip.py */
-	homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
+	if (!zerocopy)
+		homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
 
 	/* Each iteration of the loop below creates one GSO packet. */
 #ifndef __STRIP__ /* See strip.py */
@@ -352,7 +370,7 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit)
 		if (skb_data_bytes > bytes_left)
 			skb_data_bytes = bytes_left;
 		skb = homa_tx_data_pkt_alloc(rpc, iter, offset, skb_data_bytes,
-					     max_seg_data);
+					     max_seg_data, zerocopy);
 		if (IS_ERR(skb)) {
 			err = PTR_ERR(skb);
 			homa_rpc_lock(rpc);

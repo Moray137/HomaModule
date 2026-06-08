@@ -1455,7 +1455,8 @@ static int homa_sendmsg_user_unconnected(struct sock *sk, struct msghdr *msg, si
 			   : tt_addr(addr->in6.sin6_addr),
 			   ntohs(addr->in6.sin6_port), rpc->id, length);
 		rpc->completion_cookie = args.completion_cookie;
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result)
 			goto error;
 		args.id = rpc->id;
@@ -1505,7 +1506,8 @@ static int homa_sendmsg_user_unconnected(struct sock *sk, struct msghdr *msg, si
 		}
 		rpc->state = RPC_OUTGOING;
 
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result && rpc->state != RPC_DEAD)
 			goto error;
 		homa_rpc_put(rpc);
@@ -1606,7 +1608,8 @@ static int homa_sendmsg_user_connected(struct sock *sk, struct msghdr *msg,
 			   : tt_addr(addr->in6.sin6_addr),
 			   ntohs(addr->in6.sin6_port), rpc->id, length);
 		rpc->completion_cookie = args.completion_cookie;
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result)
 			goto error;
 		args.id = rpc->id;
@@ -1655,7 +1658,8 @@ static int homa_sendmsg_user_connected(struct sock *sk, struct msghdr *msg,
 		}
 		rpc->state = RPC_OUTGOING;
 
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result && rpc->state != RPC_DEAD)
 			goto error;
 		homa_rpc_put(rpc);
@@ -1745,7 +1749,8 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 			   : tt_addr(addr->in6.sin6_addr),
 			   ntohs(addr->in6.sin6_port), rpc->id, length);
 		rpc->completion_cookie = args.completion_cookie;
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result)
 			goto error;
 		args.id = rpc->id;
@@ -1788,7 +1793,8 @@ static int homa_sendmsg_in_kernel_connected(struct sock *sk, struct msghdr *msg,
 		}
 		rpc->state = RPC_OUTGOING;
 
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result && rpc->state != RPC_DEAD)
 			goto error;
 		homa_rpc_put(rpc);
@@ -1892,7 +1898,8 @@ static int homa_sendmsg_in_kernel_unconnected(struct sock *sk,
 			   : tt_addr(addr->in6.sin6_addr),
 			   ntohs(addr->in6.sin6_port), rpc->id, length);
 		rpc->completion_cookie = args.completion_cookie;
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result)
 			goto error;
 		args.id = rpc->id;
@@ -1935,7 +1942,8 @@ static int homa_sendmsg_in_kernel_unconnected(struct sock *sk,
 		}
 		rpc->state = RPC_OUTGOING;
 
-		result = homa_message_out_fill(rpc, &msg->msg_iter, 1);
+		result = homa_message_out_fill(rpc, &msg->msg_iter, 1,
+					       msg->msg_flags);
 		if (result && rpc->state != RPC_DEAD)
 			goto error;
 		homa_rpc_put(rpc);

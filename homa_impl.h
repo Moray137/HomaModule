@@ -35,6 +35,17 @@
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/vmalloc.h>
+
+/* MSG_SPLICE_PAGES is a kernel-internal sendmsg() flag (not exported to user
+ * space) that asks the transport to reference the caller's pages directly
+ * instead of copying. In-kernel Homa consumers set it to request zero-copy TX.
+ * Provide a fallback for older kernels / unit-test header sets that lack it;
+ * the value is fixed in the kernel ABI.
+ */
+#ifndef MSG_SPLICE_PAGES
+#define MSG_SPLICE_PAGES 0x8000000
+#endif
+
 #include <net/icmp.h>
 #include <net/ip.h>
 #include <net/netns/generic.h>
@@ -728,7 +739,7 @@ int      homa_ioc_info(struct socket *sock, unsigned long arg);
 int      homa_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg);
 int      homa_load(void);
 int      homa_message_out_fill(struct homa_rpc *rpc,
-			       struct iov_iter *iter, int xmit);
+			       struct iov_iter *iter, int xmit, int flags);
 void     homa_message_out_init(struct homa_rpc *rpc, int length);
 void     homa_need_ack_pkt(struct sk_buff *skb, struct homa_sock *hsk,
 			   struct homa_rpc *rpc);
@@ -758,7 +769,8 @@ void     homa_timer_check_rpc(struct homa_rpc *rpc);
 int      homa_timer_main(void *transport);
 struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 				       struct iov_iter *iter, int offset,
-				       int length, int max_seg_data);
+				       int length, int max_seg_data,
+				       bool zerocopy);
 void     homa_unhash(struct sock *sk);
 void     homa_rpc_unknown_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
 void     homa_unload(void);

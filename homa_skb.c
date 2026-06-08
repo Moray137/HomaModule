@@ -365,6 +365,63 @@ int homa_skb_append_from_iter(struct homa *homa, struct sk_buff *skb,
 }
 
 /**
+ * homa_skb_append_from_iter_zerocopy() - Append data to an sk_buff by
+ * referencing the caller's pages directly (zero-copy) instead of copying.
+ * Works for any kernel-mode iov_iter (ITER_BVEC, ITER_KVEC, ITER_XARRAY) by
+ * extracting page references with iov_iter_extract_pages(). The caller must
+ * keep the underlying pages valid until the skb is freed; on free,
+ * homa_skb_free_many_tx() drops the references taken here via put_page()
+ * (foreign pages don't match the Homa page-pool reclaim test).
+ * @skb:      Append to this sk_buff.
+ * @iter:     Iterator describing the data; advanced by @length bytes on
+ *            success. Must not be user-backed (see homa_message_out_fill()).
+ * @length:   Number of bytes to append; iter must have at least this many.
+ * Return: 0 or a negative errno.
+ */
+int homa_skb_append_from_iter_zerocopy(struct sk_buff *skb,
+				       struct iov_iter *iter, int length)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+
+	while (length > 0) {
+		struct page *pages[16];
+		struct page **ppages = pages;
+		size_t offset;
+		ssize_t n;
+		int npages, i;
+
+		n = iov_iter_extract_pages(iter, &ppages, length,
+					   ARRAY_SIZE(pages), 0, &offset);
+		if (n < 0)
+			return n;
+		if (n == 0)
+			return -EFAULT;
+
+		npages = DIV_ROUND_UP(offset + n, PAGE_SIZE);
+		for (i = 0; i < npages; i++) {
+			int chunk = min_t(size_t, n, PAGE_SIZE - offset);
+
+			if (shinfo->nr_frags >= HOMA_MAX_SKB_FRAGS) {
+				/* Out of frag slots: release the refs for the
+				 * pages we haven't attached yet, then fail.
+				 */
+				for (; i < npages; i++)
+					put_page(ppages[i]);
+				return -EINVAL;
+			}
+			skb_fill_page_desc(skb, shinfo->nr_frags, ppages[i],
+					   offset, chunk);
+			skb->len += chunk;
+			skb->data_len += chunk;
+			length -= chunk;
+			n -= chunk;
+			offset = 0;
+		}
+	}
+	return 0;
+}
+
+/**
  * homa_skb_append_from_skb() - Copy data from one skb to another. The
  * data is appended into new frags at the destination. The copies are done
  * virtually when possible.
