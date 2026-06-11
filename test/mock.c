@@ -1141,22 +1141,6 @@ int netif_receive_skb(struct sk_buff *skb)
 void __netif_schedule(struct Qdisc *q)
 {}
 
-void preempt_count_add(int val)
-{
-	int i;
-
-	for (i = 0; i < val; i++)
-		preempt_disable();
-}
-
-void preempt_count_sub(int val)
-{
-	int i;
-
-	for (i = 0; i < val; i++)
-		preempt_enable();
-}
-
 long prepare_to_wait_event(struct wait_queue_head *wq_head,
 		struct wait_queue_entry *wq_entry, int state)
 {

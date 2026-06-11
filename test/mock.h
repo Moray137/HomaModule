@@ -80,6 +80,11 @@
 #undef preempt_enable
 #define preempt_enable() mock_preempt_enable()
 
+#undef preempt_count_add
+#define preempt_count_add(val) do { int _i; for (_i = 0; _i < (val); _i++) mock_preempt_disable(); } while (0)
+#undef preempt_count_sub
+#define preempt_count_sub(val) do { int _i; for (_i = 0; _i < (val); _i++) mock_preempt_enable(); } while (0)
+
 #define put_page mock_put_page
 
 #define rcu_read_lock mock_rcu_read_lock
