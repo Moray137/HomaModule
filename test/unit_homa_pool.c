@@ -110,7 +110,7 @@ TEST_F(homa_pool, homa_pool_set_region__region_not_page_aligned)
 
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk,
 			((char *) 0x1000000) + 10,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__region_too_small)
 {
@@ -118,7 +118,7 @@ TEST_F(homa_pool, homa_pool_set_region__region_too_small)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk, (void *) 0x1000000,
-			HOMA_BPAGE_SIZE));
+			HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__cant_allocate_descriptors)
 {
@@ -127,7 +127,7 @@ TEST_F(homa_pool, homa_pool_set_region__cant_allocate_descriptors)
 
 	mock_kmalloc_errors = 1;
 	EXPECT_EQ(ENOMEM, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__cant_allocate_core_info)
 {
@@ -136,12 +136,12 @@ TEST_F(homa_pool, homa_pool_set_region__cant_allocate_core_info)
 
 	mock_kmalloc_errors = 2;
 	EXPECT_EQ(ENOMEM, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__pool_already_has_region)
 {
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__success)
 {
@@ -149,7 +149,7 @@ TEST_F(homa_pool, homa_pool_set_region__success)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(0, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			78*HOMA_BPAGE_SIZE));
+			78*HOMA_BPAGE_SIZE, false));
 	EXPECT_EQ(78, self->hsk.buffer_pool->num_bpages);
 	EXPECT_EQ(-1, self->hsk.buffer_pool->descriptors[69].owner);
 }
@@ -162,7 +162,7 @@ TEST_F(homa_pool, homa_pool_get_rcvbuf)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(0, -homa_pool_set_region(&self->hsk, (void *)0x40000,
-		  10*HOMA_BPAGE_SIZE + 1000));
+		  10*HOMA_BPAGE_SIZE + 1000, false));
 	homa_pool_get_rcvbuf(self->hsk.buffer_pool, &args);
 	EXPECT_EQ(0x40000, args.start);
 	EXPECT_EQ(10*HOMA_BPAGE_SIZE, args.length);

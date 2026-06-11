@@ -2385,7 +2385,7 @@ int mock_sock_init(struct homa_sock *hsk, struct homa_net *hnet, int port)
 		+ sizeof(struct homa_data_hdr);
 	mock_devices[0].gso_max_size = mock_mtu;
 	err = homa_pool_set_region(hsk, (void *) 0x1000000,
-				   100*HOMA_BPAGE_SIZE);
+				   100*HOMA_BPAGE_SIZE, false);
 	return err;
 }
 
