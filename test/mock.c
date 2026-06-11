@@ -2598,6 +2598,6 @@ void *mock_vmalloc(size_t size)
  */
 #include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
-unsigned long random_kmalloc_seed[16];
+unsigned long random_kmalloc_seed;
 struct static_key_false hugetlb_optimize_vmemmap_key;
 #endif
