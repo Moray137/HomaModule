@@ -724,7 +724,8 @@ ssize_t iov_iter_extract_pages(struct iov_iter *i, struct page ***pages,
 	size_t skip, start, n;
 	struct page *page;
 
-	if (!iov_iter_is_bvec(i) || maxpages == 0 || maxsize == 0)
+	if ((i->iter_type & ~(READ|WRITE)) != ITER_BVEC ||
+	    maxpages == 0 || maxsize == 0)
 		return 0;
 	bvec = i->bvec;
 	skip = i->iov_offset;
