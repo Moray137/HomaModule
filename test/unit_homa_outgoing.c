@@ -240,6 +240,57 @@ TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__zerocopy_references_pages)
 	kfree_skb(skb);
 	put_page(page);
 }
+TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__zerocopy_multiple_bvecs)
+{
+	struct page *p0 = alloc_pages(GFP_KERNEL, 0);
+	struct page *p1 = alloc_pages(GFP_KERNEL, 0);
+	struct page *p2 = alloc_pages(GFP_KERNEL, 0);
+	struct homa_rpc *crpc = homa_rpc_alloc_client(&self->hsk,
+			&self->server_addr);
+	struct skb_shared_info *shinfo;
+	struct bio_vec bvecs[3];
+	struct iov_iter *iter;
+	struct sk_buff *skb;
+
+	ASSERT_NE(NULL, p0);
+	ASSERT_NE(NULL, p1);
+	ASSERT_NE(NULL, p2);
+	bvecs[0].bv_page = p0;
+	bvecs[0].bv_offset = 100;
+	bvecs[0].bv_len = 400;
+	bvecs[1].bv_page = p1;
+	bvecs[1].bv_offset = 0;
+	bvecs[1].bv_len = 600;
+	bvecs[2].bv_page = p2;
+	bvecs[2].bv_offset = 200;
+	bvecs[2].bv_len = 300;
+	iter = unit_bvec_iter(bvecs, 3, 1300);
+
+	homa_rpc_unlock(crpc);
+	homa_message_out_init(crpc, 1300);
+
+	unit_log_clear();
+	skb = homa_tx_data_pkt_alloc(crpc, iter, 0, 1300, 2000, true);
+	ASSERT_FALSE(IS_ERR(skb));
+	EXPECT_STREQ("", unit_log_get());
+	shinfo = skb_shinfo(skb);
+	EXPECT_EQ(3, shinfo->nr_frags);
+	EXPECT_EQ(p0, skb_frag_page(&shinfo->frags[0]));
+	EXPECT_EQ(100, shinfo->frags[0].offset);
+	EXPECT_EQ(400, skb_frag_size(&shinfo->frags[0]));
+	EXPECT_EQ(p1, skb_frag_page(&shinfo->frags[1]));
+	EXPECT_EQ(0, shinfo->frags[1].offset);
+	EXPECT_EQ(600, skb_frag_size(&shinfo->frags[1]));
+	EXPECT_EQ(p2, skb_frag_page(&shinfo->frags[2]));
+	EXPECT_EQ(200, shinfo->frags[2].offset);
+	EXPECT_EQ(300, skb_frag_size(&shinfo->frags[2]));
+	EXPECT_EQ(1300, skb->data_len);
+
+	kfree_skb(skb);
+	put_page(p0);
+	put_page(p1);
+	put_page(p2);
+}
 TEST_F(homa_outgoing, homa_tx_data_pkt_alloc__cant_allocate_skb)
 {
 	struct iov_iter *iter = unit_iov_iter((void *)1000, 5000);
