@@ -968,7 +968,7 @@ static __always_inline void homa_tl_record(
 	ns = ktime_get_ns() - start_ns;
 
 	preempt_disable();
-	s = this_cpu_ptr(&homa_tl_stats);
+	s = this_cpu_ptr(homa_tl_stats);
 
 	s->st[stage].count++;
 	s->st[stage].ns_total += ns;
