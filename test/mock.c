@@ -757,6 +757,7 @@ void iov_iter_bvec(struct iov_iter *i, unsigned int direction,
 		   const struct bio_vec *bvec, unsigned long nr_segs,
 		   size_t count)
 {
+	memset(i, 0, sizeof(*i));
 	direction &= READ | WRITE;
 	i->iter_type = ITER_BVEC | direction;
 	i->bvec = bvec;
@@ -2389,7 +2390,7 @@ int mock_sock_init(struct homa_sock *hsk, struct homa_net *hnet, int port)
 		+ sizeof(struct homa_data_hdr);
 	mock_devices[0].gso_max_size = mock_mtu;
 	err = homa_pool_set_region(hsk, (void *) 0x1000000,
-				   100*HOMA_BPAGE_SIZE, false);
+				   100*HOMA_BPAGE_SIZE, true);
 	return err;
 }
 
