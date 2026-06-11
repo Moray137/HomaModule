@@ -753,6 +753,18 @@ int ip6_datagram_connect(struct sock *sk, struct sockaddr *addr, int addr_len)
 	return 0;
 }
 
+void iov_iter_bvec(struct iov_iter *i, unsigned int direction,
+		   const struct bio_vec *bvec, unsigned long nr_segs,
+		   size_t count)
+{
+	direction &= READ | WRITE;
+	i->iter_type = ITER_BVEC | direction;
+	i->bvec = bvec;
+	i->nr_segs = nr_segs;
+	i->iov_offset = 0;
+	i->count = count;
+}
+
 struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
 {
 	if (mock_check_error(&mock_dst_check_errors))
@@ -1444,6 +1456,14 @@ void sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
 #else
 	__kfree_skb(skb);
 #endif
+}
+
+int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
+{
+	if (offset + len > skb->len)
+		return -EFAULT;
+	memcpy(to, skb->data + offset, len);
+	return 0;
 }
 
 int skb_copy_datagram_iter(const struct sk_buff *from, int offset,
@@ -2570,3 +2590,14 @@ void *mock_vmalloc(size_t size)
 	unit_hash_set(vmallocs_in_use, block, "used");
 	return block;
 }
+
+/* Linker stubs for kernel symbols referenced through inline functions in
+ * headers (e.g. slab.h, page alloc) but not actually called at runtime
+ * in the unit-test build. Without these, the test binary fails to link
+ * on kernel 6.13+.
+ */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+unsigned long random_kmalloc_seed[16];
+struct static_key_false hugetlb_optimize_vmemmap_key;
+#endif
