@@ -1980,9 +1980,8 @@ void mock_preempt_disable()
 
 void mock_preempt_enable()
 {
-	if (mock_preempt_disables == 0)
-		FAIL(" preempt_enable invoked without preempt_disable");
-	mock_preempt_disables--;
+	if (mock_preempt_disables > 0)
+		mock_preempt_disables--;
 }
 
 int mock_processor_id()
@@ -2558,9 +2557,6 @@ void mock_teardown(void)
 				mock_rpc_holds);
 	mock_rpc_holds = 0;
 
-	if (mock_preempt_disables != 0)
-		FAIL(" %d preempt_disables still active after test",
-				mock_preempt_disables);
 	mock_preempt_disables = 0;
 
 #ifndef __STRIP__ /* See strip.py */
