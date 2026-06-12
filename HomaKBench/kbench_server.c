@@ -61,8 +61,12 @@ static int homa_worker_fn(void *data)
 	struct kvec siov;
 	int ret;
 
+	memset(&recv_args, 0, sizeof(recv_args));
+
 	while (!stopping && !kthread_should_stop()) {
-		memset(&recv_args, 0, sizeof(recv_args));
+		/* recv_args carries the previous message's bpages so Homa can
+		 * recycle them; only id is reset each iteration.
+		 */
 		recv_args.id = 0;
 
 		memset(&rmsg, 0, sizeof(rmsg));
@@ -100,14 +104,17 @@ static int homa_worker_fn(void *data)
 		smsg.msg_control = &send_args;
 		smsg.msg_controllen = sizeof(send_args);
 		smsg.msg_control_is_user = false;
-		smsg.msg_name = NULL;
-		smsg.msg_namelen = 0;
+		/* Unconnected server socket: reply must carry the peer address
+		 * (validated by homa_sendmsg_in_kernel_unconnected). peer was
+		 * filled by recvmsg above.
+		 */
+		smsg.msg_name = &peer;
+		smsg.msg_namelen = sizeof(peer);
 
 		if (rx_actor_used) {
 			/* ZC TX: use bvec iter + MSG_SPLICE_PAGES */
 			int npages, i, remaining, off;
 			struct bio_vec *bvecs;
-			struct iov_iter iter;
 
 			npages = DIV_ROUND_UP(ret, PAGE_SIZE);
 			bvecs = kmalloc_array(npages, sizeof(*bvecs),
@@ -126,11 +133,11 @@ static int homa_worker_fn(void *data)
 				off += chunk;
 				remaining -= chunk;
 			}
-			iov_iter_bvec(&iter, ITER_SOURCE, bvecs, npages, ret);
-			smsg.msg_iter = iter;
+			iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, bvecs,
+				      npages, ret);
 			smsg.msg_flags |= MSG_SPLICE_PAGES;
-
-			kernel_sendmsg(srv_sock, &smsg, NULL, 0, ret);
+			/* sock_sendmsg uses msg_iter as-is. */
+			sock_sendmsg(srv_sock, &smsg);
 			kfree(bvecs);
 		} else {
 			siov.iov_base = w->reply_buf;

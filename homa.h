@@ -20,7 +20,7 @@
  * define HOMA_MAX_MESSAGE_LENGTH - Maximum bytes of payload in a Homa
  * request or response message.
  */
-#define HOMA_MAX_MESSAGE_LENGTH 1000000
+#define HOMA_MAX_MESSAGE_LENGTH 1400000
 
 /**
  * define HOMA_BPAGE_SIZE - Number of bytes in pages used for receive

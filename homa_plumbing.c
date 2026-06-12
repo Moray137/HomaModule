@@ -515,7 +515,7 @@ int __init homa_load(void)
 
 	/* Detect size changes in uAPI structs. */
 	BUILD_BUG_ON(sizeof(struct homa_sendmsg_args) != 24);
-	BUILD_BUG_ON(sizeof(struct homa_recvmsg_args) != 88);
+	BUILD_BUG_ON(sizeof(struct homa_recvmsg_args) != 112);
 #ifndef __STRIP__ /* See strip.py */
 	BUILD_BUG_ON(sizeof(struct homa_abort_args) != 32);
 #endif /* See strip.py */

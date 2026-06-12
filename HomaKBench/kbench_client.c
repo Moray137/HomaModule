@@ -190,11 +190,13 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	if (zc) {
 		struct iov_iter iter;
 
-		iov_iter_bvec(&iter, ITER_SOURCE, sc->tx_bvecs,
+		iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, sc->tx_bvecs,
 			      sc->nr_tx_bvecs, msg_size);
-		smsg.msg_iter = iter;
 		smsg.msg_flags |= MSG_SPLICE_PAGES;
-		ret = kernel_sendmsg(sc->sock, &smsg, NULL, 0, msg_size);
+		/* sock_sendmsg uses msg_iter as-is (kernel_sendmsg would
+		 * overwrite it with the kvec).
+		 */
+		ret = sock_sendmsg(sc->sock, &smsg);
 	} else {
 		struct kvec iov = { .iov_base = sc->tx_buf,
 				    .iov_len = msg_size };
@@ -204,12 +206,13 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	if (ret < 0)
 		return ret;
 
-	/* Stash the RPC id for the recvmsg. */
-	u64 rpc_id = send_args.id;
-
-	/* RX */
-	memset(&sc->recv_args, 0, sizeof(sc->recv_args));
-	sc->recv_args.id = rpc_id;
+	/* RX. The worker is serial (one outstanding RPC per socket), so we wait
+	 * for "any" reply (id=0). sc->recv_args persists across RPCs so its
+	 * num_bpages/bpage_offsets carry the previous reply's bpages for Homa to
+	 * recycle on this call.
+	 */
+	sc->recv_args.id = 0;
+	sc->recv_args.completion_cookie = 0;
 
 	if (zc)
 		sc->actor_ctx.bytes_received = 0;
@@ -249,7 +252,7 @@ static int do_homa_rpc(struct sock_ctx *sc)
 static int do_tcp_rpc(struct sock_ctx *sc)
 {
 	__be32 net_len;
-	int ret;
+	int ret, reply_len;
 
 	/* TX: length prefix + payload */
 	net_len = htonl(msg_size);
@@ -260,13 +263,11 @@ static int do_tcp_rpc(struct sock_ctx *sc)
 
 	if (zc) {
 		struct msghdr smsg = {};
-		struct iov_iter iter;
 
-		iov_iter_bvec(&iter, ITER_SOURCE, sc->tx_bvecs,
+		iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, sc->tx_bvecs,
 			      sc->nr_tx_bvecs, msg_size);
-		smsg.msg_iter = iter;
 		smsg.msg_flags = MSG_SPLICE_PAGES;
-		ret = kernel_sendmsg(sc->sock, &smsg, NULL, 0, msg_size);
+		ret = sock_sendmsg(sc->sock, &smsg);
 	} else {
 		ret = kbench_tcp_send_full(sc->sock, sc->tx_buf, msg_size, 0);
 	}
@@ -278,8 +279,7 @@ static int do_tcp_rpc(struct sock_ctx *sc)
 	if (ret < 0)
 		return ret;
 
-	int reply_len = ntohl(net_len);
-
+	reply_len = ntohl(net_len);
 	ret = kbench_tcp_recv_full(sc->sock, sc->rx_buf, reply_len);
 	return ret;
 }

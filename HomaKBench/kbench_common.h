@@ -7,13 +7,18 @@
 #include <linux/in.h>
 #include <linux/inet.h>
 #include <net/sock.h>
+#include <net/inet_sock.h>
 
-#include "homa.h"
+/* homa_sock.h depends on definitions provided by homa_impl.h (net headers,
+ * union sockaddr_in_union, timetrace). Homa's own .c files always include
+ * homa_impl.h first, so we do the same. homa_impl.h pulls in homa.h (uapi).
+ */
+#include "homa_impl.h"
 #include "homa_sock.h"
 
 #define KBENCH_DEFAULT_PORT	5000
 #define KBENCH_MAX_MSG_SIZE	1400000
-#define KBENCH_POOL_SIZE	(2 * 1024 * 1024)
+#define KBENCH_POOL_SIZE	(16 * 1024 * 1024)
 
 #define KBENCH_REQ_PATTERN	0x42
 #define KBENCH_REPLY_PATTERN	0x24
