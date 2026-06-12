@@ -188,8 +188,6 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	smsg.msg_namelen = 0;
 
 	if (zc) {
-		struct iov_iter iter;
-
 		iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, sc->tx_bvecs,
 			      sc->nr_tx_bvecs, msg_size);
 		smsg.msg_flags |= MSG_SPLICE_PAGES;
@@ -341,8 +339,12 @@ static int pacer_fn(void *data)
 		if (now < next_send) {
 			u64 wait_ns = next_send - now;
 
-			if (wait_ns > 1000)
+			if (wait_ns > 10000) {
+				unsigned long us = (unsigned long)(wait_ns / 1000);
+				usleep_range(us, us + 1);
+			} else if (wait_ns > 100) {
 				ndelay(wait_ns);
+			}
 			continue;
 		}
 
@@ -364,6 +366,14 @@ static int pacer_fn(void *data)
 	/* Wait a bit for outstanding RPCs, then compute results. */
 	msleep(2000);
 	compute_results();
+
+	/* Park until rmmod calls kthread_stop(); returning early would free
+	 * the task_struct, causing a use-after-free in kbench_client_exit.
+	 */
+	while (!kthread_should_stop()) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule();
+	}
 	return 0;
 }
 
