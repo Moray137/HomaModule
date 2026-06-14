@@ -43,6 +43,8 @@ static volatile bool stopping;
 struct server_worker {
 	int id;
 	char *reply_buf;
+	struct page **reply_pages;
+	int nr_reply_pages;
 	char *pool_region;
 	struct kbench_actor_ctx actor_ctx;
 };
@@ -92,10 +94,6 @@ static int homa_worker_fn(void *data)
 		if (rx_actor_used)
 			w->actor_ctx.bytes_received = 0;
 
-		/* Build reply: 0x24 pattern, same size as request. */
-		memset(w->reply_buf, KBENCH_REPLY_PATTERN,
-		       min_t(int, ret, KBENCH_MAX_MSG_SIZE));
-
 		/* Send response. */
 		memset(&send_args, 0, sizeof(send_args));
 		send_args.id = recv_args.id;
@@ -104,45 +102,48 @@ static int homa_worker_fn(void *data)
 		smsg.msg_control = &send_args;
 		smsg.msg_controllen = sizeof(send_args);
 		smsg.msg_control_is_user = false;
-		/* Unconnected server socket: reply must carry the peer address
-		 * (validated by homa_sendmsg_in_kernel_unconnected). peer was
-		 * filled by recvmsg above.
-		 */
 		smsg.msg_name = &peer;
 		smsg.msg_namelen = sizeof(peer);
 
 		if (rx_actor_used) {
-			/* ZC TX: use bvec iter + MSG_SPLICE_PAGES */
-			int npages, i, remaining, off;
+			/* ZC TX: use pre-allocated alloc_page() pages with
+			 * bvec_set_page + MSG_SPLICE_PAGES. Slab pages
+			 * (kvmalloc) are invalid for MSG_SPLICE_PAGES because
+			 * put_page() on a slab page corrupts page state.
+			 */
+			int npages, i, remaining, reply_sz;
 			struct bio_vec *bvecs;
 
-			npages = DIV_ROUND_UP(ret, PAGE_SIZE);
+			reply_sz = min_t(int, ret, KBENCH_MAX_MSG_SIZE);
+			npages = DIV_ROUND_UP(reply_sz, PAGE_SIZE);
 			bvecs = kmalloc_array(npages, sizeof(*bvecs),
 					      GFP_KERNEL);
 			if (!bvecs) {
 				pr_warn("kbench_server: bvec alloc failed\n");
 				continue;
 			}
-			remaining = ret;
-			off = 0;
+			remaining = reply_sz;
 			for (i = 0; i < npages; i++) {
 				int chunk = min_t(int, remaining, PAGE_SIZE);
 
-				bvec_set_virt(&bvecs[i], w->reply_buf + off,
-					      chunk);
-				off += chunk;
+				memset(page_address(w->reply_pages[i]),
+				       KBENCH_REPLY_PATTERN, chunk);
+				bvec_set_page(&bvecs[i], w->reply_pages[i],
+					      chunk, 0);
 				remaining -= chunk;
 			}
 			iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, bvecs,
-				      npages, ret);
+				      npages, reply_sz);
 			smsg.msg_flags |= MSG_SPLICE_PAGES;
-			/* sock_sendmsg uses msg_iter as-is. */
 			sock_sendmsg(srv_sock, &smsg);
 			kfree(bvecs);
 		} else {
+			int reply_sz = min_t(int, ret, KBENCH_MAX_MSG_SIZE);
+
+			memset(w->reply_buf, KBENCH_REPLY_PATTERN, reply_sz);
 			siov.iov_base = w->reply_buf;
-			siov.iov_len = ret;
-			kernel_sendmsg(srv_sock, &smsg, &siov, 1, ret);
+			siov.iov_len = reply_sz;
+			kernel_sendmsg(srv_sock, &smsg, &siov, 1, reply_sz);
 		}
 	}
 	return 0;
@@ -377,13 +378,28 @@ static int __init kbench_server_init(void)
 
 	for (i = 0; i < nr_workers; i++) {
 		worker_state[i].id = i;
-		worker_state[i].reply_buf = kvmalloc(KBENCH_MAX_MSG_SIZE,
-						     GFP_KERNEL);
-		if (!worker_state[i].reply_buf) {
-			ret = -ENOMEM;
-			goto err_bufs;
-		}
 		if (rx_actor_used && is_homa) {
+			/* ZC TX: alloc_page() pages for MSG_SPLICE_PAGES. */
+			int npages = DIV_ROUND_UP(KBENCH_MAX_MSG_SIZE,
+						  PAGE_SIZE);
+			int j;
+
+			worker_state[i].reply_pages =
+				kmalloc_array(npages, sizeof(struct page *),
+					      GFP_KERNEL);
+			if (!worker_state[i].reply_pages) {
+				ret = -ENOMEM;
+				goto err_bufs;
+			}
+			worker_state[i].nr_reply_pages = npages;
+			for (j = 0; j < npages; j++) {
+				worker_state[i].reply_pages[j] =
+					alloc_page(GFP_KERNEL);
+				if (!worker_state[i].reply_pages[j]) {
+					ret = -ENOMEM;
+					goto err_bufs;
+				}
+			}
 			worker_state[i].actor_ctx.app_buf =
 				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
 			if (!worker_state[i].actor_ctx.app_buf) {
@@ -391,6 +407,13 @@ static int __init kbench_server_init(void)
 				goto err_bufs;
 			}
 			worker_state[i].actor_ctx.buf_size = KBENCH_MAX_MSG_SIZE;
+		} else {
+			worker_state[i].reply_buf =
+				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
+			if (!worker_state[i].reply_buf) {
+				ret = -ENOMEM;
+				goto err_bufs;
+			}
 		}
 	}
 
@@ -405,6 +428,15 @@ static int __init kbench_server_init(void)
 
 err_bufs:
 	for (i = 0; i < nr_workers; i++) {
+		int j;
+
+		if (worker_state[i].reply_pages) {
+			for (j = 0; j < worker_state[i].nr_reply_pages; j++) {
+				if (worker_state[i].reply_pages[j])
+					__free_page(worker_state[i].reply_pages[j]);
+			}
+			kfree(worker_state[i].reply_pages);
+		}
 		kvfree(worker_state[i].reply_buf);
 		kvfree(worker_state[i].actor_ctx.app_buf);
 	}
@@ -438,6 +470,15 @@ static void __exit kbench_server_exit(void)
 		sock_release(srv_sock);
 
 	for (i = 0; i < nr_workers; i++) {
+		int j;
+
+		if (worker_state[i].reply_pages) {
+			for (j = 0; j < worker_state[i].nr_reply_pages; j++) {
+				if (worker_state[i].reply_pages[j])
+					__free_page(worker_state[i].reply_pages[j]);
+			}
+			kfree(worker_state[i].reply_pages);
+		}
 		kvfree(worker_state[i].reply_buf);
 		kvfree(worker_state[i].actor_ctx.app_buf);
 		kvfree(worker_state[i].pool_region);

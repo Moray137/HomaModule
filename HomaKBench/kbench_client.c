@@ -73,6 +73,8 @@ struct sock_ctx {
 	char *app_copy_scratch;
 	struct bio_vec *tx_bvecs;
 	int nr_tx_bvecs;
+	struct page **tx_pages;
+	int nr_tx_pages;
 
 	/* Homa-specific. */
 	struct homa_recvmsg_args recv_args;
@@ -517,35 +519,54 @@ static int __init kbench_client_init(void)
 		init_waitqueue_head(&sc->wq);
 		atomic_set(&sc->pending, 0);
 
-		sc->tx_buf = kvmalloc(msg_size, GFP_KERNEL);
 		sc->rx_buf = kvmalloc(msg_size, GFP_KERNEL);
-		if (!sc->tx_buf || !sc->rx_buf) {
+		if (!sc->rx_buf) {
 			ret = -ENOMEM;
 			goto err_socks;
 		}
-		memset(sc->tx_buf, KBENCH_REQ_PATTERN, msg_size);
 
-		/* Prepare bvec array for ZC TX. */
 		if (zc) {
+			/* ZC TX: pages must come from alloc_page(), not slab.
+			 * MSG_SPLICE_PAGES takes page refs via get_page();
+			 * when Homa later frees TX skbs it calls put_page(),
+			 * which is invalid on slab pages (kvmalloc/kmalloc).
+			 */
 			int npages = DIV_ROUND_UP(msg_size, PAGE_SIZE);
-			int remaining = msg_size, off = 0, j;
+			int remaining = msg_size, j;
 
+			sc->tx_pages = kmalloc_array(npages,
+						     sizeof(struct page *),
+						     GFP_KERNEL);
 			sc->tx_bvecs = kmalloc_array(npages,
 						     sizeof(struct bio_vec),
 						     GFP_KERNEL);
-			if (!sc->tx_bvecs) {
+			if (!sc->tx_pages || !sc->tx_bvecs) {
 				ret = -ENOMEM;
 				goto err_socks;
 			}
+			sc->nr_tx_pages = npages;
 			sc->nr_tx_bvecs = npages;
 			for (j = 0; j < npages; j++) {
 				int chunk = min_t(int, remaining, PAGE_SIZE);
 
-				bvec_set_virt(&sc->tx_bvecs[j],
-					      sc->tx_buf + off, chunk);
-				off += chunk;
+				sc->tx_pages[j] = alloc_page(GFP_KERNEL);
+				if (!sc->tx_pages[j]) {
+					ret = -ENOMEM;
+					goto err_socks;
+				}
+				memset(page_address(sc->tx_pages[j]),
+				       KBENCH_REQ_PATTERN, chunk);
+				bvec_set_page(&sc->tx_bvecs[j],
+					      sc->tx_pages[j], chunk, 0);
 				remaining -= chunk;
 			}
+		} else {
+			sc->tx_buf = kvmalloc(msg_size, GFP_KERNEL);
+			if (!sc->tx_buf) {
+				ret = -ENOMEM;
+				goto err_socks;
+			}
+			memset(sc->tx_buf, KBENCH_REQ_PATTERN, msg_size);
 		}
 
 		/* Actor buffer for ZC RX. */
@@ -617,9 +638,17 @@ err_threads:
 err_socks:
 	for (i = 0; i < num_sockets; i++) {
 		struct sock_ctx *sc = &sockets[i];
+		int j;
 
 		if (sc->sock)
 			sock_release(sc->sock);
+		if (sc->tx_pages) {
+			for (j = 0; j < sc->nr_tx_pages; j++) {
+				if (sc->tx_pages[j])
+					__free_page(sc->tx_pages[j]);
+			}
+			kfree(sc->tx_pages);
+		}
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
@@ -652,9 +681,17 @@ static void __exit kbench_client_exit(void)
 
 	for (i = 0; i < num_sockets; i++) {
 		struct sock_ctx *sc = &sockets[i];
+		int j;
 
 		if (sc->sock)
 			sock_release(sc->sock);
+		if (sc->tx_pages) {
+			for (j = 0; j < sc->nr_tx_pages; j++) {
+				if (sc->tx_pages[j])
+					__free_page(sc->tx_pages[j]);
+			}
+			kfree(sc->tx_pages);
+		}
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
