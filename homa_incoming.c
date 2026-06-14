@@ -301,7 +301,7 @@ keep:
  * Return:   Zero for success or a negative errno. Like homa_copy_to_pool(), the
  *           RPC may be freed while the lock is dropped (-EINVAL, state RPC_DEAD).
  */
-static int homa_deliver_skbs(struct homa_rpc *rpc)
+int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	__must_hold(rpc->bucket->lock)
 {
 	struct sk_buff_head sorted;
@@ -392,7 +392,7 @@ static int homa_deliver_skbs(struct homa_rpc *rpc)
 
 	tt_record1("starting zero-copy delivery for id %d", rpc->id);
 
-	desc.arg.data = rpc->hsk->rx_actor_ctx;
+	desc.arg.data = caller_ctx;
 	desc.count = rpc->msgin.length;
 	desc.written = 0;
 	desc.error = 0;
@@ -478,14 +478,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 	u64 start;
 #endif /* See strip.py */
 	int i;
-	/* If using kernel apps like NVMe-oF, we will need to copy to kernel */
 	bool in_kernel = rpc->hsk->in_kernel;
-
-	/* Zero-copy receive: if an in-kernel consumer registered a read_sock
-	 * style actor, hand skbs directly to it instead of staging in the pool.
-	 */
-	if (in_kernel && rpc->hsk->rx_actor)
-		return homa_deliver_skbs(rpc);
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -1254,7 +1247,8 @@ void homa_ack_pkt(struct sk_buff *skb, struct homa_sock *hsk,
  *                for attention; in this case the return value is a negative
  *                errno.
  */
-int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
+int homa_wait_private(struct homa_rpc *rpc, int nonblocking,
+		      void *caller_ctx)
 	__must_hold(rpc->bucket->lock)
 {
 	struct homa_interest interest;
@@ -1275,8 +1269,13 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
 	 */
 	while (1) {
 		result = 0;
-		if (!rpc->error)
-			rpc->error = homa_copy_to_pool(rpc);
+		if (!rpc->error) {
+			if (rpc->hsk->in_kernel && rpc->hsk->rx_actor)
+				rpc->error = homa_deliver_skbs(rpc,
+							       caller_ctx);
+			else
+				rpc->error = homa_copy_to_pool(rpc);
+		}
 		if (rpc->error) {
 			pr_err("copy_to_pool is not happy, incoming line 1101, errno %d.", rpc->error);
 			IF_NO_STRIP(avail_immediately = 0);
@@ -1345,7 +1344,8 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
  *            is returned it will be locked and referenced; the caller
  *            must release the lock and the reference.
  */
-struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking)
+struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking,
+				 void *caller_ctx)
 	__cond_acquires(rpc->bucket->lock)
 {
 	struct homa_interest interest;
@@ -1433,8 +1433,13 @@ struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking)
 		}
 
 		homa_rpc_lock_preempt(rpc);
-		if (!rpc->error)
-			rpc->error = homa_copy_to_pool(rpc);
+		if (!rpc->error) {
+			if (rpc->hsk->in_kernel && rpc->hsk->rx_actor)
+				rpc->error = homa_deliver_skbs(rpc,
+							       caller_ctx);
+			else
+				rpc->error = homa_copy_to_pool(rpc);
+		}
 		if (rpc->error) {
 			if (rpc->state != RPC_DEAD)
 				break;

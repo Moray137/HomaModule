@@ -1008,7 +1008,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__basics)
 
 	mock_bpage_size = 2048;
 	mock_bpage_shift = 11;
-	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor);
 	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
 			self->server_ip, self->server_port, self->client_id,
 			1000, 4000);
@@ -1016,7 +1016,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__basics)
 	ASSERT_EQ(0, crpc->msgin.bytes_remaining);
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	EXPECT_EQ(0, -homa_deliver_skbs(crpc, &st));
 	homa_rpc_unlock(crpc);
 
 	/* 4000 bytes => 3 packets at 1400/1400/1200. */
@@ -1043,7 +1043,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__out_of_order_packets_sorted)
 
 	mock_bpage_size = 2048;
 	mock_bpage_shift = 11;
-	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor);
 	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
 			self->server_ip, self->server_port, self->client_id,
 			1000, 4000);
@@ -1059,7 +1059,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__out_of_order_packets_sorted)
 	skb_queue_splice_init(&reversed, &crpc->msgin.packets);
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	EXPECT_EQ(0, -homa_deliver_skbs(crpc, &st));
 	homa_rpc_unlock(crpc);
 
 	EXPECT_EQ(3, st.n_calls);
@@ -1075,7 +1075,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__incomplete_message_defers)
 
 	mock_bpage_size = 2048;
 	mock_bpage_shift = 11;
-	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor);
 	/* Only the first packet of a 4000-byte message has arrived. */
 	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, self->client_ip,
 			self->server_ip, self->server_port, self->client_id,
@@ -1084,7 +1084,7 @@ TEST_F(homa_incoming, homa_deliver_skbs__incomplete_message_defers)
 	ASSERT_NE(0, crpc->msgin.bytes_remaining);
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_copy_to_pool(crpc));
+	EXPECT_EQ(0, -homa_deliver_skbs(crpc, &st));
 	homa_rpc_unlock(crpc);
 
 	/* Incomplete: actor not invoked, packets retained, ready bit cleared
@@ -1102,14 +1102,14 @@ TEST_F(homa_incoming, homa_deliver_skbs__actor_error)
 	mock_bpage_size = 2048;
 	mock_bpage_shift = 11;
 	st.fail_at = 2;
-	homa_sock_set_rx_actor(&self->hsk, test_rx_actor, &st);
+	homa_sock_set_rx_actor(&self->hsk, test_rx_actor);
 	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_MSG, self->client_ip,
 			self->server_ip, self->server_port, self->client_id,
 			1000, 4000);
 	ASSERT_NE(NULL, crpc);
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(EIO, -homa_copy_to_pool(crpc));
+	EXPECT_EQ(EIO, -homa_deliver_skbs(crpc, &st));
 	homa_rpc_unlock(crpc);
 	EXPECT_EQ(2, st.n_calls);
 }
@@ -2537,7 +2537,7 @@ TEST_F(homa_incoming, homa_wait_private__rpc_not_private)
 			self->server_port, self->client_id, 20000, 1600);
 
 	ASSERT_NE(NULL, crpc);
-	EXPECT_EQ(EINVAL, -homa_wait_private(crpc, 0));
+	EXPECT_EQ(EINVAL, -homa_wait_private(crpc, 0, NULL));
 }
 TEST_F(homa_incoming, homa_wait_private__rpc_has_error)
 {
@@ -2550,7 +2550,7 @@ TEST_F(homa_incoming, homa_wait_private__rpc_has_error)
 	set_bit(RPC_PRIVATE, &crpc->flags);
 	crpc->error = -ENOENT;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_wait_private(crpc, 0));
+	EXPECT_EQ(0, -homa_wait_private(crpc, 0, NULL));
 	homa_rpc_unlock(crpc);
 	EXPECT_EQ(1, test_bit(RPC_PKTS_READY, &crpc->flags));
 	IF_NO_STRIP(EXPECT_EQ(0, homa_metrics_per_cpu()->wait_none));
@@ -2568,7 +2568,7 @@ TEST_F(homa_incoming, homa_wait_private__copy_to_user_fails)
 	set_bit(RPC_PRIVATE, &crpc->flags);
 	mock_copy_data_errors = 1;
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_wait_private(crpc, 0));
+	EXPECT_EQ(0, -homa_wait_private(crpc, 0, NULL));
 	EXPECT_EQ(-EFAULT, crpc->error);
 	homa_rpc_unlock(crpc);
 }
@@ -2582,7 +2582,7 @@ TEST_F(homa_incoming, homa_wait_private__available_immediately)
 	ASSERT_EQ(1, test_bit(RPC_PKTS_READY, &crpc->flags));
 	set_bit(RPC_PRIVATE, &crpc->flags);
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, homa_wait_private(crpc, 0));
+	EXPECT_EQ(0, homa_wait_private(crpc, 0, NULL));
 	homa_rpc_unlock(crpc);
 	EXPECT_EQ(1, test_bit(RPC_PRIVATE, &crpc->flags));
 	IF_NO_STRIP(EXPECT_EQ(1, homa_metrics_per_cpu()->wait_none));
@@ -2597,7 +2597,7 @@ TEST_F(homa_incoming, homa_wait_private__nonblocking)
 	set_bit(RPC_PRIVATE, &crpc->flags);
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(EAGAIN, -homa_wait_private(crpc, 1));
+	EXPECT_EQ(EAGAIN, -homa_wait_private(crpc, 1, NULL));
 	homa_rpc_unlock(crpc);
 	IF_NO_STRIP(EXPECT_EQ(0, homa_metrics_per_cpu()->wait_none));
 	IF_NO_STRIP(EXPECT_EQ(0, homa_metrics_per_cpu()->wait_block));
@@ -2618,7 +2618,7 @@ TEST_F(homa_incoming, homa_wait_private__signal_notify_race)
 	mock_prepare_to_wait_errors = 1;
 
 	homa_rpc_lock(crpc);
-	EXPECT_EQ(0, -homa_wait_private(crpc, 0));
+	EXPECT_EQ(0, -homa_wait_private(crpc, 0, NULL));
 	homa_rpc_unlock(crpc);
 	IF_NO_STRIP(EXPECT_EQ(0, homa_metrics_per_cpu()->wait_none));
 	IF_NO_STRIP(EXPECT_EQ(1, homa_metrics_per_cpu()->wait_block));
@@ -2632,7 +2632,7 @@ TEST_F(homa_incoming, homa_wait_shared__socket_already_shutdown)
 
 	self->hsk.shutdown = 1;
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_TRUE(IS_ERR(rpc));
 	EXPECT_EQ(ESHUTDOWN, -PTR_ERR(rpc));
 	self->hsk.shutdown = 0;
@@ -2647,7 +2647,7 @@ TEST_F(homa_incoming, homa_wait_shared__rpc_already_ready)
 	ASSERT_NE(NULL, crpc);
 	ASSERT_EQ(1, test_bit(RPC_PKTS_READY, &crpc->flags));
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	ASSERT_FALSE(IS_ERR(rpc));
 	EXPECT_EQ(crpc, rpc);
 	EXPECT_EQ(0, crpc->msgin.packets.qlen);
@@ -2669,7 +2669,7 @@ TEST_F(homa_incoming, homa_wait_shared__multiple_rpcs_already_ready)
 	ASSERT_NE(NULL, crpc2);
 
 	unit_log_clear();
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	ASSERT_FALSE(IS_ERR(rpc));
 	EXPECT_EQ(crpc, rpc);
 	homa_rpc_put(rpc);
@@ -2680,7 +2680,7 @@ TEST_F(homa_incoming, homa_wait_shared__nonblocking)
 {
 	struct homa_rpc *rpc;
 
-	rpc = homa_wait_shared(&self->hsk, 1);
+	rpc = homa_wait_shared(&self->hsk, 1, NULL);
 	EXPECT_TRUE(IS_ERR(rpc));
 	EXPECT_EQ(EAGAIN, -PTR_ERR(rpc));
 	IF_NO_STRIP(EXPECT_EQ(0, homa_metrics_per_cpu()->wait_none));
@@ -2699,7 +2699,7 @@ TEST_F(homa_incoming, homa_wait_shared__reap_when_nonblocking)
 	homa_rpc_end(crpc);
 	EXPECT_EQ(15, self->hsk.dead_skbs);
 
-	rpc = homa_wait_shared(&self->hsk, 1);
+	rpc = homa_wait_shared(&self->hsk, 1, NULL);
 	EXPECT_TRUE(IS_ERR(rpc));
 	EXPECT_EQ(EAGAIN, -PTR_ERR(rpc));
 	EXPECT_EQ(5, self->hsk.dead_skbs);
@@ -2718,7 +2718,7 @@ TEST_F(homa_incoming, homa_wait_shared__signal_race_with_handoff)
 	hook_count = 2;
 	mock_prepare_to_wait_errors = 1;
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_EQ(crpc, rpc);
 	EXPECT_EQ(ENOENT, -rpc->error);
 	IF_NO_STRIP(EXPECT_EQ(1, homa_metrics_per_cpu()->wait_block));
@@ -2733,7 +2733,7 @@ TEST_F(homa_incoming, homa_wait_shared__socket_shutdown_while_blocked)
 	hook_shutdown_hsk = &self->hsk;
 	hook_count = 4;
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_TRUE(IS_ERR(rpc));
 	EXPECT_EQ(ESHUTDOWN, -PTR_ERR(rpc));
 	EXPECT_EQ(1, self->hsk.shutdown);
@@ -2753,7 +2753,7 @@ TEST_F(homa_incoming, homa_wait_shared__copy_to_user_fails)
 	ASSERT_EQ(1, test_bit(RPC_PKTS_READY, &crpc->flags));
 	mock_copy_data_errors = 1;
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_EQ(crpc, rpc);
 	EXPECT_EQ(EFAULT, -rpc->error);
 	homa_rpc_put(rpc);
@@ -2770,7 +2770,7 @@ TEST_F(homa_incoming, homa_wait_shared__rpc_has_error)
 	EXPECT_EQ(2, crpc->msgin.packets.qlen);
 	crpc->error = -ENOENT;
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_EQ(crpc, rpc);
 	EXPECT_EQ(2, crpc->msgin.packets.qlen);
 	homa_rpc_put(rpc);
@@ -2790,7 +2790,7 @@ TEST_F(homa_incoming, homa_wait_shared__rpc_dead)
 	ASSERT_NE(NULL, crpc2);
 	homa_rpc_end(crpc);
 
-	rpc = homa_wait_shared(&self->hsk, 0);
+	rpc = homa_wait_shared(&self->hsk, 0, NULL);
 	EXPECT_EQ(crpc2, rpc);
 	homa_rpc_put(rpc);
 	homa_rpc_unlock(rpc);

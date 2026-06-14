@@ -287,17 +287,11 @@ struct homa_sock {
 	 * @in_kernel is true), homa_recvmsg() delivers each DATA skb of the
 	 * received message to this read_sock-style actor, in increasing
 	 * message-offset order, instead of copying the message into the buffer
-	 * pool. The actor copies data directly into its final destination
-	 * (e.g. req->iter / cmd->req.sg), eliminating the pool round-trip.
+	 * pool. The per-call actor context is supplied via
+	 * homa_recvmsg_args.rx_actor_ctx, not stored on the socket, so
+	 * multiple workers sharing one socket can each use their own buffer.
 	 */
 	sk_read_actor_t rx_actor;
-
-	/**
-	 * @rx_actor_ctx: Opaque context for @rx_actor. Homa stores this in
-	 * read_descriptor_t.arg.data before invoking @rx_actor, mirroring how
-	 * tcp_read_sock() passes per-connection state to its actor.
-	 */
-	void *rx_actor_ctx;
 };
 
 /**
@@ -323,7 +317,7 @@ void               homa_sock_destroy(struct sock *sk);
 struct homa_sock  *homa_sock_find(struct homa_net *hnet, u16 port);
 int                homa_sock_init(struct homa_sock *hsk);
 void               homa_sock_set_rx_actor(struct homa_sock *hsk,
-					  sk_read_actor_t actor, void *ctx);
+					  sk_read_actor_t actor);
 void               homa_sock_shutdown(struct homa_sock *hsk);
 void               homa_sock_unlink(struct homa_sock *hsk);
 int                homa_sock_wait_wmem(struct homa_sock *hsk, int nonblocking);

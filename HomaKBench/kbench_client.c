@@ -214,8 +214,11 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	sc->recv_args.id = 0;
 	sc->recv_args.completion_cookie = 0;
 
-	if (zc)
+	if (zc) {
 		sc->actor_ctx.bytes_received = 0;
+		sc->recv_args.rx_actor_ctx =
+			(__u64)(uintptr_t)&sc->actor_ctx;
+	}
 
 	memset(&rmsg, 0, sizeof(rmsg));
 	rmsg.msg_control = &sc->recv_args;
@@ -432,7 +435,7 @@ static int setup_homa_socket(struct sock_ctx *sc, int idx)
 	if (zc) {
 		struct homa_sock *hsk = homa_sk(sc->sock->sk);
 
-		homa_sock_set_rx_actor(hsk, kbench_rx_actor, &sc->actor_ctx);
+		homa_sock_set_rx_actor(hsk, kbench_rx_actor);
 	}
 
 	return 0;

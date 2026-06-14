@@ -186,7 +186,6 @@ int homa_sock_init(struct homa_sock *hsk)
 	// Hard-coded for now,will see how this works or not
 	hsk->in_kernel = true;
 	hsk->rx_actor = NULL;
-	hsk->rx_actor_ctx = NULL;
 	hsk->ip_header_length = (hsk->inet.sk.sk_family == AF_INET) ?
 				sizeof(struct iphdr) : sizeof(struct ipv6hdr);
 	spin_lock_init(&hsk->lock);
@@ -257,17 +256,15 @@ error:
  * homa_sock_set_rx_actor() - Register (or clear) a read_sock-style actor for
  * zero-copy receive on an in-kernel socket. When an actor is registered,
  * homa_recvmsg() delivers each DATA skb of a received message to @actor
- * instead of copying the message into the buffer pool, letting the in-kernel
- * consumer place data directly into its final destination.
+ * instead of copying the message into the buffer pool. The per-call actor
+ * context is supplied via homa_recvmsg_args.rx_actor_ctx by each recvmsg
+ * caller, not stored on the socket.
  * @hsk:    Socket to configure; must be an in-kernel socket.
  * @actor:  Callback invoked per skb (NULL to disable and revert to the pool).
- * @ctx:    Opaque context passed to @actor via read_descriptor_t.arg.data.
  */
-void homa_sock_set_rx_actor(struct homa_sock *hsk, sk_read_actor_t actor,
-			    void *ctx)
+void homa_sock_set_rx_actor(struct homa_sock *hsk, sk_read_actor_t actor)
 {
 	hsk->rx_actor = actor;
-	hsk->rx_actor_ctx = ctx;
 }
 EXPORT_SYMBOL_GPL(homa_sock_set_rx_actor);
 

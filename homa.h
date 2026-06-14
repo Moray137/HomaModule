@@ -119,6 +119,17 @@ struct homa_recvmsg_args {
 	 * bpage_offsets in a future recvmsg invocation.
 	 */
 	__u32 bpage_offsets[HOMA_MAX_BPAGES];
+
+	/**
+	 * @rx_actor_ctx: (in) Per-call actor context for zero-copy RX.
+	 * When the socket has an rx_actor registered, this is passed to the
+	 * actor as desc->arg.data instead of a socket-level context. Each
+	 * concurrent recvmsg caller can supply its own buffer/state, so
+	 * multiple workers sharing one socket don't corrupt each other.
+	 * Must be a valid kernel pointer cast to __u64 when rx_actor is
+	 * registered; ignored (should be 0) otherwise.
+	 */
+	__u64 rx_actor_ctx;
 };
 
 #ifndef __STRIP__ /* See strip.py */

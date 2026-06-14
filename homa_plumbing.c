@@ -515,7 +515,7 @@ int __init homa_load(void)
 
 	/* Detect size changes in uAPI structs. */
 	BUILD_BUG_ON(sizeof(struct homa_sendmsg_args) != 24);
-	BUILD_BUG_ON(sizeof(struct homa_recvmsg_args) != 112);
+	BUILD_BUG_ON(sizeof(struct homa_recvmsg_args) != 120);
 #ifndef __STRIP__ /* See strip.py */
 	BUILD_BUG_ON(sizeof(struct homa_abort_args) != 32);
 #endif /* See strip.py */
@@ -1879,31 +1879,36 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
 	}
 
 	nonblocking = flags & MSG_DONTWAIT;
-	if (control.id != 0) {
-		rpc = homa_rpc_find_client(hsk, control.id); /* Locks RPC. */
-		if (!rpc) {
-			hsk->error_msg = "invalid RPC id passed to recvmsg";
-			result = -EINVAL;
-			goto done;
-		}
-		homa_rpc_hold(rpc);
-		result = homa_wait_private(rpc, nonblocking);
-		if (result != 0) {
-			hsk->error_msg = "error while waiting for private RPC to complete";
-			control.id = 0;
-			goto done;
-		}
-	} else {
-		rpc = homa_wait_shared(hsk, nonblocking);
-		if (IS_ERR(rpc)) {
-			/* If we get here, it means there was an error that
-			 * prevented us from finding an RPC to return. Errors
-			 * in the RPC itself are handled below.
-			 */
-			hsk->error_msg = "error while waiting for shared RPC to complete";
-			result = PTR_ERR(rpc);
-			rpc = NULL;
-			goto done;
+	{
+		void *caller_ctx = NULL;
+
+		if (in_kernel && control.rx_actor_ctx)
+			caller_ctx = (void *)(uintptr_t)control.rx_actor_ctx;
+
+		if (control.id != 0) {
+			rpc = homa_rpc_find_client(hsk, control.id);
+			if (!rpc) {
+				hsk->error_msg = "invalid RPC id passed to recvmsg";
+				result = -EINVAL;
+				goto done;
+			}
+			homa_rpc_hold(rpc);
+			result = homa_wait_private(rpc, nonblocking,
+						   caller_ctx);
+			if (result != 0) {
+				hsk->error_msg = "error while waiting for private RPC to complete";
+				control.id = 0;
+				goto done;
+			}
+		} else {
+			rpc = homa_wait_shared(hsk, nonblocking,
+					       caller_ctx);
+			if (IS_ERR(rpc)) {
+				hsk->error_msg = "error while waiting for shared RPC to complete";
+				result = PTR_ERR(rpc);
+				rpc = NULL;
+				goto done;
+			}
 		}
 	}
 	if (rpc->error) {

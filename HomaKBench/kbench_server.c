@@ -66,10 +66,12 @@ static int homa_worker_fn(void *data)
 	memset(&recv_args, 0, sizeof(recv_args));
 
 	while (!stopping && !kthread_should_stop()) {
-		/* recv_args carries the previous message's bpages so Homa can
-		 * recycle them; only id is reset each iteration.
-		 */
 		recv_args.id = 0;
+		if (rx_actor_used) {
+			w->actor_ctx.bytes_received = 0;
+			recv_args.rx_actor_ctx =
+				(__u64)(uintptr_t)&w->actor_ctx;
+		}
 
 		memset(&rmsg, 0, sizeof(rmsg));
 		rmsg.msg_control = &recv_args;
@@ -86,10 +88,6 @@ static int homa_worker_fn(void *data)
 				pr_warn("kbench_server: recvmsg err %d\n", ret);
 			continue;
 		}
-
-		/* Reset actor ctx for next message. */
-		if (rx_actor_used)
-			w->actor_ctx.bytes_received = 0;
 
 		/* Send response. */
 		memset(&send_args, 0, sizeof(send_args));
@@ -184,14 +182,11 @@ static int start_homa_server(void)
 		goto err_pool;
 	}
 
-	/* Note: we do NOT register an rx_actor on the server socket. The
-	 * rx_actor_ctx is per-socket but multiple workers share this socket
-	 * concurrently. With a single ctx, concurrent homa_deliver_skbs()
-	 * calls would corrupt each other's bytes_received counter, and the
-	 * actor would return 0 (buffer full) → EFAULT. The server RX is
-	 * small requests — pool-based copy is fine. ZC on the server side
-	 * is TX-only (MSG_SPLICE_PAGES for replies).
-	 */
+	if (rx_actor_used) {
+		struct homa_sock *hsk = homa_sk(srv_sock->sk);
+
+		homa_sock_set_rx_actor(hsk, kbench_rx_actor);
+	}
 
 	/* Spawn worker kthreads. */
 	for (i = 0; i < nr_workers; i++) {
