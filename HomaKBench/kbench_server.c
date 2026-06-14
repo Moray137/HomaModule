@@ -184,13 +184,14 @@ static int start_homa_server(void)
 		goto err_pool;
 	}
 
-	/* Register actor if ZC. */
-	if (rx_actor_used) {
-		struct homa_sock *hsk = homa_sk(srv_sock->sk);
-
-		homa_sock_set_rx_actor(hsk, kbench_rx_actor,
-				       &worker_state[0].actor_ctx);
-	}
+	/* Note: we do NOT register an rx_actor on the server socket. The
+	 * rx_actor_ctx is per-socket but multiple workers share this socket
+	 * concurrently. With a single ctx, concurrent homa_deliver_skbs()
+	 * calls would corrupt each other's bytes_received counter, and the
+	 * actor would return 0 (buffer full) → EFAULT. The server RX is
+	 * small requests — pool-based copy is fine. ZC on the server side
+	 * is TX-only (MSG_SPLICE_PAGES for replies).
+	 */
 
 	/* Spawn worker kthreads. */
 	for (i = 0; i < nr_workers; i++) {
