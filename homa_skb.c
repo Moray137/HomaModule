@@ -398,6 +398,22 @@ int homa_skb_append_from_iter_zerocopy(struct sk_buff *skb,
 			return -EFAULT;
 
 		npages = DIV_ROUND_UP(offset + n, PAGE_SIZE);
+
+		/* iov_iter_extract_pages() only pins (takes a reference on)
+		 * pages for user-backed iterators; for kernel-mode iters
+		 * (ITER_BVEC/ITER_KVEC/ITER_XARRAY) it returns the pages with
+		 * NO additional reference. homa_skb_free_many_tx(), however,
+		 * unconditionally put_page()s every foreign frag page, so take
+		 * a matching reference here. Without this the page refcount
+		 * underflows by one per transmit, eventually freeing a
+		 * still-in-use page (manifests as "BUG: Bad page state" with a
+		 * negative refcount, often discovered on an unrelated RX path).
+		 */
+		if (!user_backed_iter(iter)) {
+			for (i = 0; i < npages; i++)
+				get_page(ppages[i]);
+		}
+
 		for (i = 0; i < npages; i++) {
 			int chunk = min_t(size_t, n, PAGE_SIZE - offset);
 
