@@ -78,14 +78,11 @@ static int homa_worker_fn(void *data)
 		rmsg.msg_namelen = sizeof(peer);
 		rmsg.msg_control_is_user = false;
 
-		ret = kernel_recvmsg(srv_sock, &rmsg, NULL, 0, 0,
-				     MSG_DONTWAIT);
-		if (ret == -EAGAIN) {
-			schedule_timeout_interruptible(1);
-			continue;
-		}
+		ret = kernel_recvmsg(srv_sock, &rmsg, NULL, 0, 0, 0);
 		if (ret < 0) {
-			if (!stopping)
+			if (stopping || kthread_should_stop())
+				break;
+			if (ret != -EINTR)
 				pr_warn("kbench_server: recvmsg err %d\n", ret);
 			continue;
 		}
@@ -451,13 +448,29 @@ static void __exit kbench_server_exit(void)
 
 	stopping = true;
 
-	/* Stop worker threads. */
+	/* Shut down the listening socket first so that workers blocked in
+	 * recvmsg/accept get woken with an error.
+	 */
+	if (srv_sock)
+		kernel_sock_shutdown(srv_sock, SHUT_RDWR);
+
+	/* Close TCP connections so TCP workers unblock. */
+	if (tcp_conns) {
+		for (i = 0; i < nr_tcp_conns; i++) {
+			if (tcp_conns[i])
+				kernel_sock_shutdown(tcp_conns[i], SHUT_RDWR);
+		}
+	}
+
+	/* Now stop worker threads (they will see stopping==true or the
+	 * socket error and exit).
+	 */
 	for (i = 0; i < nr_workers; i++) {
 		if (workers[i])
 			kthread_stop(workers[i]);
 	}
 
-	/* Close TCP connections. */
+	/* Release TCP connections. */
 	if (tcp_conns) {
 		for (i = 0; i < nr_tcp_conns; i++) {
 			if (tcp_conns[i])
