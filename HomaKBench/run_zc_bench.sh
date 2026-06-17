@@ -46,6 +46,7 @@ run_one() {
     fi
     insmod "$HOMA_DIR/homa.ko"
     sleep 1
+    sysctl -w net.homa.hijack_tcp=1 > /dev/null
 
     # Reset tx_lat counter
     cat /proc/net/homa_tx_lat > /dev/null 2>&1 || true
