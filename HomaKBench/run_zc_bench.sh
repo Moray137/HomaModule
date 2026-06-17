@@ -137,11 +137,11 @@ echo ""
 echo "=============================================================================="
 echo " SUMMARY"
 echo "=============================================================================="
-printf "%-8s %-6s %7s %9s %9s %9s %8s %8s %8s %8s\n" \
-    "Size" "Mode" "Tput" "P50(us)" "P90(us)" "P99(us)" \
+printf "%-8s %-6s %7s %10s %10s %10s %8s %8s %8s %8s\n" \
+    "Size" "Mode" "Tput" "txP50(us)" "txP90(us)" "txP99(us)" \
     "fill" "alloc" "xmit" "stash"
-printf "%-8s %-6s %7s %9s %9s %9s %8s %8s %8s %8s\n" \
-    "----" "----" "-------" "---------" "---------" "---------" \
+printf "%-8s %-6s %7s %10s %10s %10s %8s %8s %8s %8s\n" \
+    "----" "----" "-------" "----------" "----------" "----------" \
     "--------" "--------" "--------" "--------"
 
 for i in "${!SIZES[@]}"; do
@@ -150,15 +150,20 @@ for i in "${!SIZES[@]}"; do
     for zc in 0 1; do
         key="${size}_${zc}"
         if [ "$zc" -eq 0 ]; then mode="copy"; else mode="ZC"; fi
-        printf "%-8s %-6s %5s/s %7s us %7s us %7s us %6s ns %6s ns %6s ns %6s ns\n" \
+        local_p50=${R_TXLAT_P50[$key]:-0}
+        local_p90=${R_TXLAT_P90[$key]:-0}
+        local_p99=${R_TXLAT_P99[$key]:-0}
+        printf "%-8s %-6s %5s/s %7s.%s us %7s.%s us %7s.%s us %6s ns %6s ns %6s ns %6s ns\n" \
             "$name" "$mode" \
             "${R_TPUT[$key]:-?}" \
-            "${R_P50[$key]:-?}" "${R_P90[$key]:-?}" "${R_P99[$key]:-?}" \
+            "$((local_p50 / 1000))" "$(( (local_p50 % 1000) / 100 ))" \
+            "$((local_p90 / 1000))" "$(( (local_p90 % 1000) / 100 ))" \
+            "$((local_p99 / 1000))" "$(( (local_p99 % 1000) / 100 ))" \
             "${R_FILL[$key]:-?}" "${R_ALLOC[$key]:-?}" "${R_XMIT[$key]:-?}" "${R_STASH[$key]:-?}"
     done
 done
 
 echo ""
+echo "  txP50/P90/P99 = TX-only latency: fill start to last pkt departure (homa_tx_lat)"
 echo "  fill/alloc/xmit/stash = avg ns/call from temp[] (homa_message_out_fill breakdown)"
-echo "  P50/P90/P99 = end-to-end RPC latency from kbench_client"
 echo "=============================================================================="
