@@ -742,6 +742,8 @@ int      homa_load(void);
 int      homa_message_out_fill(struct homa_rpc *rpc,
 			       struct iov_iter *iter, int xmit, int flags);
 void     homa_message_out_init(struct homa_rpc *rpc, int length);
+int      homa_tx_lat_init(void);
+void     homa_tx_lat_end(void);
 void     homa_need_ack_pkt(struct sk_buff *skb, struct homa_sock *hsk,
 			   struct homa_rpc *rpc);
 void     homa_net_destroy(struct homa_net *hnet);

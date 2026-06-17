@@ -8,6 +8,139 @@
 #include "homa_peer.h"
 #include "homa_rpc.h"
 #include "homa_wire.h"
+#include <linux/sort.h>
+
+#define TX_LAT_MAX_SAMPLES  (2 * 1024 * 1024)
+static u64 *homa_tx_lat_samples;
+static atomic_t homa_tx_lat_count = ATOMIC_INIT(0);
+
+static void homa_tx_lat_record(u64 start_ns)
+{
+	int idx = atomic_fetch_add(1, &homa_tx_lat_count);
+
+	if (idx < TX_LAT_MAX_SAMPLES)
+		homa_tx_lat_samples[idx] = ktime_get_ns() - start_ns;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+	u64 va = *(const u64 *)a;
+	u64 vb = *(const u64 *)b;
+
+	if (va < vb)
+		return -1;
+	if (va > vb)
+		return 1;
+	return 0;
+}
+
+struct homa_tx_lat_output {
+	struct mutex mutex;
+	char *buf;
+	int len;
+	struct proc_dir_entry *dir_entry;
+};
+
+static struct homa_tx_lat_output homa_tx_lat_out;
+
+static int homa_tx_lat_open(struct inode *inode, struct file *file)
+{
+	int n, i;
+	u64 p50, p90, p99, min_val, max_val, sum;
+
+	mutex_lock(&homa_tx_lat_out.mutex);
+	if (!homa_tx_lat_out.buf) {
+		homa_tx_lat_out.buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+		if (!homa_tx_lat_out.buf) {
+			mutex_unlock(&homa_tx_lat_out.mutex);
+			return -ENOMEM;
+		}
+	}
+
+	n = min_t(int, atomic_read(&homa_tx_lat_count), TX_LAT_MAX_SAMPLES);
+	atomic_set(&homa_tx_lat_count, 0);
+
+	if (n == 0) {
+		homa_tx_lat_out.len = scnprintf(homa_tx_lat_out.buf,
+						PAGE_SIZE,
+						"samples 0\n");
+		mutex_unlock(&homa_tx_lat_out.mutex);
+		return 0;
+	}
+
+	sort(homa_tx_lat_samples, n, sizeof(u64), cmp_u64, NULL);
+
+	p50 = homa_tx_lat_samples[n / 2];
+	p90 = homa_tx_lat_samples[(n * 90) / 100];
+	p99 = homa_tx_lat_samples[(n * 99) / 100];
+	min_val = homa_tx_lat_samples[0];
+	max_val = homa_tx_lat_samples[n - 1];
+
+	sum = 0;
+	for (i = 0; i < n; i++)
+		sum += homa_tx_lat_samples[i];
+
+	homa_tx_lat_out.len = scnprintf(homa_tx_lat_out.buf, PAGE_SIZE,
+			"samples %d\n"
+			"avg %llu\n"
+			"p50 %llu\n"
+			"p90 %llu\n"
+			"p99 %llu\n"
+			"min %llu\n"
+			"max %llu\n",
+			n, sum / n, p50, p90, p99, min_val, max_val);
+	mutex_unlock(&homa_tx_lat_out.mutex);
+	return 0;
+}
+
+static ssize_t homa_tx_lat_read(struct file *file, char __user *buffer,
+				size_t length, loff_t *offset)
+{
+	return simple_read_from_buffer(buffer, length, offset,
+				       homa_tx_lat_out.buf,
+				       homa_tx_lat_out.len);
+}
+
+static int homa_tx_lat_release(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+
+static const struct proc_ops homa_tx_lat_ops = {
+	.proc_open    = homa_tx_lat_open,
+	.proc_read    = homa_tx_lat_read,
+	.proc_release = homa_tx_lat_release,
+};
+
+int homa_tx_lat_init(void)
+{
+	mutex_init(&homa_tx_lat_out.mutex);
+	homa_tx_lat_out.buf = NULL;
+	homa_tx_lat_samples = kvmalloc_array(TX_LAT_MAX_SAMPLES, sizeof(u64),
+					     GFP_KERNEL);
+	if (!homa_tx_lat_samples)
+		return -ENOMEM;
+	homa_tx_lat_out.dir_entry = proc_create("homa_tx_lat", 0444,
+						init_net.proc_net,
+						&homa_tx_lat_ops);
+	if (!homa_tx_lat_out.dir_entry) {
+		kvfree(homa_tx_lat_samples);
+		homa_tx_lat_samples = NULL;
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+void homa_tx_lat_end(void)
+{
+	if (homa_tx_lat_out.dir_entry)
+		proc_remove(homa_tx_lat_out.dir_entry);
+	homa_tx_lat_out.dir_entry = NULL;
+	kfree(homa_tx_lat_out.buf);
+	homa_tx_lat_out.buf = NULL;
+	kvfree(homa_tx_lat_samples);
+	homa_tx_lat_samples = NULL;
+}
 
 #ifndef __STRIP__ /* See strip.py */
 #include "homa_pacer.h"
@@ -279,6 +412,7 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 	 * is not supported here, so it falls back to copying.
 	 */
 	bool zerocopy = (flags & MSG_SPLICE_PAGES) && !user_backed_iter(iter);
+	u64 fill_start_ns = ktime_get_ns();
 
 	if (unlikely(iter->count > HOMA_MAX_MESSAGE_LENGTH ||
 		     iter->count == 0)) {
@@ -287,6 +421,7 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 		goto error;
 	}
 	homa_message_out_init(rpc, iter->count);
+	rpc->msgout.fill_start_ns = fill_start_ns;
 
 	/* Compute the geometry of packets. */
 	dst = homa_get_dst(rpc->peer, rpc->hsk);
@@ -333,8 +468,12 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 #ifndef __STRIP__ /* See strip.py */
 	rpc->msgout.granted = rpc->msgout.unscheduled;
 #endif /* See strip.py */
-	if (!zerocopy)
+	if (!zerocopy) {
+		u64 stash_t = ktime_get_ns();
+
 		homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
+		INC_METRIC(temp[3], ktime_get_ns() - stash_t);
+	}
 
 	/* Each iteration of the loop below creates one GSO packet. */
 #ifndef __STRIP__ /* See strip.py */
@@ -363,8 +502,14 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 #endif /* See strip.py */
 		if (skb_data_bytes > bytes_left)
 			skb_data_bytes = bytes_left;
-		skb = homa_tx_data_pkt_alloc(rpc, iter, offset, skb_data_bytes,
-					     max_seg_data, zerocopy);
+		{
+			u64 alloc_t = ktime_get_ns();
+
+			skb = homa_tx_data_pkt_alloc(rpc, iter, offset,
+						     skb_data_bytes,
+						     max_seg_data, zerocopy);
+			INC_METRIC(temp[1], ktime_get_ns() - alloc_t);
+		}
 		if (IS_ERR(skb)) {
 			err = PTR_ERR(skb);
 			homa_rpc_lock(rpc);
@@ -400,23 +545,35 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 		 * this allows us to use two cores: this core copying data
 		 * and the SoftIRQ core sending packets.
 		 */
-		if (offset < rpc->msgout.unscheduled && xmit)
+		if (offset < rpc->msgout.unscheduled && xmit) {
+			u64 xmit_t = ktime_get_ns();
+
 			homa_xmit_data(rpc, false);
+			INC_METRIC(temp[2], ktime_get_ns() - xmit_t);
+		}
 #endif /* See strip.py */
 	}
 	tt_record2("finished copy from user space for id %d, length %d",
 		   rpc->id, rpc->msgout.length);
 	INC_METRIC(sent_msg_bytes, rpc->msgout.length);
+	INC_METRIC(temp[0], ktime_get_ns() - fill_start_ns);
+	INC_METRIC(temp[4], 1);
 	refcount_add(rpc->msgout.skb_memory, &rpc->hsk->sock.sk_wmem_alloc);
-	if (xmit)
+	if (xmit) {
+		u64 xmit_t = ktime_get_ns();
+
 #ifndef __STRIP__ /* See strip.py */
 		homa_xmit_data(rpc, false);
 #else /* See strip.py */
 		homa_xmit_data(rpc);
 #endif /* See strip.py */
+		INC_METRIC(temp[2], ktime_get_ns() - xmit_t);
+	}
 	return 0;
 
 error:
+	INC_METRIC(temp[0], ktime_get_ns() - fill_start_ns);
+	INC_METRIC(temp[4], 1);
 	refcount_add(rpc->msgout.skb_memory, &rpc->hsk->sock.sk_wmem_alloc);
 	return err;
 }
@@ -642,20 +799,30 @@ void homa_xmit_data(struct homa_rpc *rpc)
 		}
 #endif /* See strip.py */
 
-		homa_rpc_unlock(rpc);
-		skb_get(skb);
+		{
+			bool is_last_pkt = (rpc->msgout.next_xmit_offset ==
+					    rpc->msgout.length);
+			u64 msg_fill_start_ns = rpc->msgout.fill_start_ns;
+
+			homa_rpc_unlock(rpc);
+			skb_get(skb);
 #ifndef __STRIP__ /* See strip.py */
-		__homa_xmit_data(skb, rpc, priority);
-		txq = netdev_get_tx_queue(skb->dev, skb->queue_mapping);
-		if (netif_tx_queue_stopped(txq))
-			tt_record4("homa_xmit_data found stopped txq for id %d, qid %d, num_queued %d, limit %d",
-				   rpc->id, skb->queue_mapping,
-				   txq->dql.num_queued, txq->dql.adj_limit);
-		force = false;
+			__homa_xmit_data(skb, rpc, priority);
+			txq = netdev_get_tx_queue(skb->dev,
+						  skb->queue_mapping);
+			if (netif_tx_queue_stopped(txq))
+				tt_record4("homa_xmit_data found stopped txq for id %d, qid %d, num_queued %d, limit %d",
+					   rpc->id, skb->queue_mapping,
+					   txq->dql.num_queued,
+					   txq->dql.adj_limit);
+			force = false;
 #else /* See strip.py */
-		__homa_xmit_data(skb, rpc);
+			__homa_xmit_data(skb, rpc);
 #endif /* See strip.py */
-		homa_rpc_lock(rpc);
+			if (is_last_pkt)
+				homa_tx_lat_record(msg_fill_start_ns);
+			homa_rpc_lock(rpc);
+		}
 	}
 }
 

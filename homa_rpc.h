@@ -116,6 +116,13 @@ struct homa_message_out {
 	 * Used to find the oldest outgoing message.
 	 */
 	u64 init_time;
+
+	/**
+	 * @fill_start_ns: ktime_get_ns() timestamp recorded at the start
+	 * of homa_message_out_fill(). Used together with the departure
+	 * timestamp in homa_xmit_data() to measure per-RPC TX latency.
+	 */
+	u64 fill_start_ns;
 };
 
 /**

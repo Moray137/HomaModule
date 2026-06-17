@@ -478,6 +478,7 @@ int __init homa_load(void)
 	IF_NO_STRIP(bool init_offload = false);
 	IF_NO_STRIP(bool init_sysctl = false);
 	IF_NO_STRIP(bool init_qdisc = false);
+	bool init_tx_lat = false;
 
 	/* Compile-time validations that no packet header is longer
 	 * than HOMA_MAX_HEADER.
@@ -600,6 +601,11 @@ int __init homa_load(void)
 		goto error;
 	init_metrics = true;
 
+	status = homa_tx_lat_init();
+	if (status != 0)
+		goto error;
+	init_tx_lat = true;
+
 	homa_ctl_header = register_net_sysctl(&init_net, "net/homa",
 					      homa_ctl_table);
 	if (!homa_ctl_header) {
@@ -665,6 +671,8 @@ error:
 	if (init_metrics)
 		homa_metrics_end();
 #endif /* See strip.py */
+	if (init_tx_lat)
+		homa_tx_lat_end();
 	if (init_net_ops)
 		unregister_pernet_subsys(&homa_net_ops);
 	if (init_homa)
@@ -706,6 +714,7 @@ void __exit homa_unload(void)
 	unregister_net_sysctl_table(homa_ctl_header);
 	homa_metrics_end();
 #endif /* See strip.py */
+	homa_tx_lat_end();
 	unregister_pernet_subsys(&homa_net_ops);
 	inet_del_protocol(&homa_protocol, IPPROTO_HOMA);
 	inet_unregister_protosw(&homa_protosw);
