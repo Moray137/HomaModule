@@ -847,6 +847,7 @@ void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc, int priority)
 void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc)
 #endif /* See strip.py */
 {
+	u64 xmit_start = ktime_get_ns();
 #ifndef __STRIP__ /* See strip.py */
 	int err;
 
@@ -899,6 +900,8 @@ void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc)
 	INC_METRIC(packets_sent[0], 1);
 	INC_METRIC(priority_bytes[priority], skb->len);
 	INC_METRIC(priority_packets[priority], 1);
+	INC_METRIC(temp[5], ktime_get_ns() - xmit_start);
+	INC_METRIC(temp[6], 1);
 }
 
 #ifndef __STRIP__ /* See strip.py */
