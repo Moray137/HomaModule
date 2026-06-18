@@ -30,7 +30,17 @@ SIZE_NAMES=("4KB" "128KB" "1280KB")
 declare -A R_TPUT R_P50 R_P90 R_P99
 declare -A R_FILL R_ALLOC R_XMIT R_STASH R_COUNT
 declare -A R_TXLAT_P50 R_TXLAT_P90 R_TXLAT_P99
-declare -A R_IQXMIT R_NPKTS
+declare -A R_IQXMIT R_NPKTS R_SKBFREE
+
+# Format ns with auto unit: >=10000ns → X.Xus, otherwise Xns
+fmt_ns() {
+    local v=$1
+    if [ "$v" -ge 10000 ]; then
+        printf "%s.%sus" "$((v / 1000))" "$(( (v % 1000) / 100 ))"
+    else
+        printf "%sns" "$v"
+    fi
+}
 
 run_one() {
     local msg_size=$1
@@ -91,8 +101,9 @@ run_one() {
     R_TXLAT_P90[$key]=$(echo "$txlat" | grep -oP '^p90 \K[0-9]+' || echo "0")
     R_TXLAT_P99[$key]=$(echo "$txlat" | grep -oP '^p99 \K[0-9]+' || echo "0")
 
-    # Sum temp[] across all cores
+    # Sum temp[] across all cores + collect skb_free metrics
     local t0=0 t1=0 t2=0 t3=0 t4=0 t5=0 t6=0
+    local skb_free_cyc=0 skb_free_cnt=0 cpu_khz=0
     while IFS=' ' read -r name val _; do
         case "$name" in
             temp0) t0=$((t0 + val)) ;;
@@ -102,24 +113,32 @@ run_one() {
             temp4) t4=$((t4 + val)) ;;
             temp5) t5=$((t5 + val)) ;;
             temp6) t6=$((t6 + val)) ;;
+            skb_free_cycles) skb_free_cyc=$((skb_free_cyc + val)) ;;
+            skb_frees) skb_free_cnt=$((skb_free_cnt + val)) ;;
+            cpu_khz) [ "$cpu_khz" -eq 0 ] && cpu_khz=$val ;;
         esac
-    done < <(grep '^temp[0-6] ' /proc/net/homa_metrics)
+    done < /proc/net/homa_metrics
 
     R_COUNT[$key]=$t4
-    if [ "$t4" -gt 0 ]; then
+    if [ "$t4" -gt 0 ] && [ "$cpu_khz" -gt 0 ]; then
         R_FILL[$key]=$((t0 / t4))
         R_ALLOC[$key]=$((t1 / t4))
         R_XMIT[$key]=$((t2 / t4))
         R_STASH[$key]=$((t3 / t4))
         R_IQXMIT[$key]=$((t5 / t4))
         R_NPKTS[$key]=$((t6 / t4))
+        # cycles → ns: ns = cycles * 1000000 / cpu_khz
+        local skb_free_ns
+        skb_free_ns=$(echo "$skb_free_cyc * 1000000 / $cpu_khz / $t4" | bc)
+        R_SKBFREE[$key]=$skb_free_ns
         echo ""
         echo "  temp[] avg (ns/call, $t4 RPCs, $t6 pkts):"
         echo "    fill=${R_FILL[$key]}  alloc=${R_ALLOC[$key]}  xmit_in_fill=${R_XMIT[$key]}  stash=${R_STASH[$key]}"
         echo "    iq_xmit/rpc=${R_IQXMIT[$key]}  pkts/rpc=${R_NPKTS[$key]}  iq_xmit/pkt=$((t5 / t6))"
+        echo "    skb_free/rpc=$(fmt_ns "$skb_free_ns") ($skb_free_cnt skbs freed)"
     else
         R_FILL[$key]=0; R_ALLOC[$key]=0; R_XMIT[$key]=0; R_STASH[$key]=0
-        R_IQXMIT[$key]=0; R_NPKTS[$key]=0
+        R_IQXMIT[$key]=0; R_NPKTS[$key]=0; R_SKBFREE[$key]=0
         echo "  temp[]: (no samples)"
     fi
 
@@ -145,12 +164,12 @@ echo ""
 echo "=============================================================================="
 echo " SUMMARY"
 echo "=============================================================================="
-printf "%-8s %-5s %7s %9s %9s %9s %7s %7s %7s %7s %9s %5s %7s\n" \
+printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
     "Size" "Mode" "Tput" "txP50us" "txP90us" "txP99us" \
-    "fill" "alloc" "xmit" "stash" "iq_xmit" "pkts" "iq/pkt"
-printf "%-8s %-5s %7s %9s %9s %9s %7s %7s %7s %7s %9s %5s %7s\n" \
+    "fill" "alloc" "xmit" "stash" "iq_xmit" "pkts" "iq/pkt" "skb_free"
+printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
     "----" "----" "------" "-------" "-------" "-------" \
-    "------" "------" "------" "------" "--------" "----" "------"
+    "------" "------" "------" "------" "--------" "----" "------" "--------"
 
 for i in "${!SIZES[@]}"; do
     size=${SIZES[$i]}
@@ -163,24 +182,28 @@ for i in "${!SIZES[@]}"; do
         local_p99=${R_TXLAT_P99[$key]:-0}
         npkts=${R_NPKTS[$key]:-0}
         iqxmit=${R_IQXMIT[$key]:-0}
+        skbfree=${R_SKBFREE[$key]:-0}
         if [ "$npkts" -gt 0 ]; then
             iq_per_pkt=$((iqxmit / npkts))
         else
             iq_per_pkt=0
         fi
-        printf "%-8s %-5s %5s/s %6s.%sus %6s.%sus %6s.%sus %5sns %5sns %5sns %5sns %7sns %5s %5sns\n" \
+        printf "%-8s %-5s %5s/s %6s.%sus %6s.%sus %6s.%sus %9s %9s %9s %9s %9s %5s %9s %9s\n" \
             "$name" "$mode" \
             "${R_TPUT[$key]:-?}" \
             "$((local_p50 / 1000))" "$(( (local_p50 % 1000) / 100 ))" \
             "$((local_p90 / 1000))" "$(( (local_p90 % 1000) / 100 ))" \
             "$((local_p99 / 1000))" "$(( (local_p99 % 1000) / 100 ))" \
-            "${R_FILL[$key]:-?}" "${R_ALLOC[$key]:-?}" "${R_XMIT[$key]:-?}" "${R_STASH[$key]:-?}" \
-            "$iqxmit" "$npkts" "$iq_per_pkt"
+            "$(fmt_ns "${R_FILL[$key]:-0}")" "$(fmt_ns "${R_ALLOC[$key]:-0}")" \
+            "$(fmt_ns "${R_XMIT[$key]:-0}")" "$(fmt_ns "${R_STASH[$key]:-0}")" \
+            "$(fmt_ns "$iqxmit")" "$npkts" "$(fmt_ns "$iq_per_pkt")" \
+            "$(fmt_ns "$skbfree")"
     done
 done
 
 echo ""
 echo "  txP50/P90/P99 = TX-only fill-to-last-departure (homa_tx_lat)"
-echo "  fill/alloc/xmit/stash = per-RPC avg ns (homa_message_out_fill breakdown)"
-echo "  iq_xmit = per-RPC total ip_queue_xmit time | pkts = GSO pkts/RPC | iq/pkt = per-pkt ip_queue_xmit"
+echo "  fill/alloc/xmit/stash = per-RPC avg (homa_message_out_fill breakdown)"
+echo "  iq_xmit = per-RPC total ip_queue_xmit | pkts = GSO pkts/RPC | iq/pkt = per-pkt ip_queue_xmit"
+echo "  skb_free = per-RPC skb free time (incl. put_page on all frags)"
 echo "=============================================================================="
