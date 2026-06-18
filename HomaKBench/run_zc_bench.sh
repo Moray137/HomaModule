@@ -164,12 +164,10 @@ echo ""
 echo "=============================================================================="
 echo " SUMMARY"
 echo "=============================================================================="
-printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
+printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s %9s\n" \
     "Size" "Mode" "Tput" "txP50us" "txP90us" "txP99us" \
-    "fill" "alloc" "xmit" "stash" "iq_xmit" "pkts" "iq/pkt" "skb_free"
-printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
-    "----" "----" "------" "-------" "-------" "-------" \
-    "------" "------" "------" "------" "--------" "----" "------" "--------"
+    "fill" "alloc" "stash" "iq_xmit" "pkts" "iq/pkt" "skb_free" "free/pkt"
+printf "%s\n" "----------------------------------------------------------------------------------------------------------------------"
 
 for i in "${!SIZES[@]}"; do
     size=${SIZES[$i]}
@@ -185,25 +183,27 @@ for i in "${!SIZES[@]}"; do
         skbfree=${R_SKBFREE[$key]:-0}
         if [ "$npkts" -gt 0 ]; then
             iq_per_pkt=$((iqxmit / npkts))
+            free_per_pkt=$((skbfree / npkts))
         else
             iq_per_pkt=0
+            free_per_pkt=0
         fi
-        printf "%-8s %-5s %5s/s %6s.%sus %6s.%sus %6s.%sus %9s %9s %9s %9s %9s %5s %9s %9s\n" \
+        printf "%-8s %-5s %5s/s %6s.%sus %6s.%sus %6s.%sus %9s %9s %9s %9s %5s %9s %9s %9s\n" \
             "$name" "$mode" \
             "${R_TPUT[$key]:-?}" \
             "$((local_p50 / 1000))" "$(( (local_p50 % 1000) / 100 ))" \
             "$((local_p90 / 1000))" "$(( (local_p90 % 1000) / 100 ))" \
             "$((local_p99 / 1000))" "$(( (local_p99 % 1000) / 100 ))" \
             "$(fmt_ns "${R_FILL[$key]:-0}")" "$(fmt_ns "${R_ALLOC[$key]:-0}")" \
-            "$(fmt_ns "${R_XMIT[$key]:-0}")" "$(fmt_ns "${R_STASH[$key]:-0}")" \
+            "$(fmt_ns "${R_STASH[$key]:-0}")" \
             "$(fmt_ns "$iqxmit")" "$npkts" "$(fmt_ns "$iq_per_pkt")" \
-            "$(fmt_ns "$skbfree")"
+            "$(fmt_ns "$skbfree")" "$(fmt_ns "$free_per_pkt")"
     done
 done
 
 echo ""
 echo "  txP50/P90/P99 = TX-only fill-to-last-departure (homa_tx_lat)"
-echo "  fill/alloc/xmit/stash = per-RPC avg (homa_message_out_fill breakdown)"
-echo "  iq_xmit = per-RPC total ip_queue_xmit | pkts = GSO pkts/RPC | iq/pkt = per-pkt ip_queue_xmit"
-echo "  skb_free = per-RPC skb free time (incl. put_page on all frags)"
+echo "  fill/alloc/stash = per-RPC avg (homa_message_out_fill breakdown)"
+echo "  iq_xmit = per-RPC total ip_queue_xmit (all paths) | iq/pkt = per-GSO-pkt"
+echo "  skb_free = per-RPC SKB release cost (put_page + consume_skb) | free/pkt = per-GSO-pkt"
 echo "=============================================================================="
