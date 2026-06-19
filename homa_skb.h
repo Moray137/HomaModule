@@ -14,7 +14,7 @@
  * many pages to allocate in a high-order page for skb pages (e.g.,
  * 2 means allocate in units of 4 pages).
  */
-#define HOMA_SKB_PAGE_ORDER 4
+#define HOMA_SKB_PAGE_ORDER 0
 
 /**
  * define HOMA_SKB_PAGE_SIZE - number of bytes corresponding to HOMA_PAGE_ORDER.
