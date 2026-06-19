@@ -104,7 +104,13 @@ run_one() {
     # Sum temp[] across all cores + collect skb_free metrics
     local t0=0 t1=0 t2=0 t3=0 t4=0 t5=0 t6=0
     local skb_free_cyc=0 skb_free_cnt=0 cpu_khz=0
-    while IFS=' ' read -r name val _; do
+
+    # Get cpu_khz first (appears once, not per-core)
+    cpu_khz=$(awk '/^cpu_khz /{print $2; exit}' /proc/net/homa_metrics)
+    cpu_khz=${cpu_khz:-1}
+
+    # Sum per-core metrics
+    while read -r name val _; do
         case "$name" in
             temp0) t0=$((t0 + val)) ;;
             temp1) t1=$((t1 + val)) ;;
@@ -115,9 +121,8 @@ run_one() {
             temp6) t6=$((t6 + val)) ;;
             skb_free_cycles) skb_free_cyc=$((skb_free_cyc + val)) ;;
             skb_frees) skb_free_cnt=$((skb_free_cnt + val)) ;;
-            cpu_khz) [ "$cpu_khz" -eq 0 ] && cpu_khz=$val ;;
         esac
-    done < /proc/net/homa_metrics
+    done < <(grep -E '^(temp[0-6]|skb_free_cycles|skb_frees) ' /proc/net/homa_metrics)
 
     R_COUNT[$key]=$t4
     if [ "$t4" -gt 0 ] && [ "$cpu_khz" -gt 0 ]; then
