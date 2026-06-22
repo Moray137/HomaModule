@@ -553,8 +553,9 @@ static int __init kbench_client_init(void)
 				int chunk = min_t(int, remaining,
 						  TX_PAGE_SIZE);
 
-				sc->tx_pages[j] = alloc_pages(GFP_KERNEL,
-							      TX_PAGE_ORDER);
+				sc->tx_pages[j] = alloc_pages(
+						GFP_KERNEL | __GFP_COMP,
+						TX_PAGE_ORDER);
 				if (!sc->tx_pages[j]) {
 					ret = -ENOMEM;
 					goto err_socks;
