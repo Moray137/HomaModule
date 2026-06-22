@@ -417,10 +417,31 @@ int homa_skb_append_from_iter_zerocopy(struct sk_buff *skb,
 		for (i = 0; i < npages; i++) {
 			int chunk = min_t(size_t, n, PAGE_SIZE - offset);
 
+			/* Coalesce with last frag if this page is
+			 * physically contiguous (e.g. compound page
+			 * sub-pages). This matches non-ZC's behavior
+			 * of extending frags within a compound page.
+			 */
+			if (shinfo->nr_frags > 0 && offset == 0) {
+				skb_frag_t *last =
+					&shinfo->frags[shinfo->nr_frags - 1];
+				unsigned int last_end = skb_frag_off(last) +
+							skb_frag_size(last);
+
+				if (!(last_end & (PAGE_SIZE - 1)) &&
+				    ppages[i] == skb_frag_page(last) +
+						(last_end >> PAGE_SHIFT)) {
+					skb_frag_size_add(last, chunk);
+					skb->len += chunk;
+					skb->data_len += chunk;
+					put_page(ppages[i]);
+					length -= chunk;
+					n -= chunk;
+					continue;
+				}
+			}
+
 			if (shinfo->nr_frags >= HOMA_MAX_SKB_FRAGS) {
-				/* Out of frag slots: release the refs for the
-				 * pages we haven't attached yet, then fail.
-				 */
 				for (; i < npages; i++)
 					put_page(ppages[i]);
 				return -EINVAL;
