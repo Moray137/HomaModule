@@ -526,30 +526,35 @@ static int __init kbench_client_init(void)
 		}
 
 		if (zc) {
-			/* ZC TX: pages must come from alloc_page(), not slab.
-			 * MSG_SPLICE_PAGES takes page refs via get_page();
-			 * when Homa later frees TX skbs it calls put_page(),
-			 * which is invalid on slab pages (kvmalloc/kmalloc).
+			/* ZC TX: use order-4 compound pages (64KB physically
+			 * contiguous) to match the frag layout of Homa's
+			 * non-ZC page pool (HOMA_SKB_PAGE_ORDER=4). This
+			 * isolates the copy-vs-pin difference from DMA
+			 * scatter-gather overhead.
 			 */
-			int npages = DIV_ROUND_UP(msg_size, PAGE_SIZE);
+#define TX_PAGE_ORDER 4
+#define TX_PAGE_SIZE (PAGE_SIZE << TX_PAGE_ORDER)
+			int ncompound = DIV_ROUND_UP(msg_size, TX_PAGE_SIZE);
 			int remaining = msg_size, j;
 
-			sc->tx_pages = kmalloc_array(npages,
+			sc->tx_pages = kmalloc_array(ncompound,
 						     sizeof(struct page *),
 						     GFP_KERNEL);
-			sc->tx_bvecs = kmalloc_array(npages,
+			sc->tx_bvecs = kmalloc_array(ncompound,
 						     sizeof(struct bio_vec),
 						     GFP_KERNEL);
 			if (!sc->tx_pages || !sc->tx_bvecs) {
 				ret = -ENOMEM;
 				goto err_socks;
 			}
-			sc->nr_tx_pages = npages;
-			sc->nr_tx_bvecs = npages;
-			for (j = 0; j < npages; j++) {
-				int chunk = min_t(int, remaining, PAGE_SIZE);
+			sc->nr_tx_pages = ncompound;
+			sc->nr_tx_bvecs = ncompound;
+			for (j = 0; j < ncompound; j++) {
+				int chunk = min_t(int, remaining,
+						  TX_PAGE_SIZE);
 
-				sc->tx_pages[j] = alloc_page(GFP_KERNEL);
+				sc->tx_pages[j] = alloc_pages(GFP_KERNEL,
+							      TX_PAGE_ORDER);
 				if (!sc->tx_pages[j]) {
 					ret = -ENOMEM;
 					goto err_socks;
@@ -645,7 +650,8 @@ err_socks:
 		if (sc->tx_pages) {
 			for (j = 0; j < sc->nr_tx_pages; j++) {
 				if (sc->tx_pages[j])
-					__free_page(sc->tx_pages[j]);
+					__free_pages(sc->tx_pages[j],
+						     TX_PAGE_ORDER);
 			}
 			kfree(sc->tx_pages);
 		}
@@ -688,7 +694,8 @@ static void __exit kbench_client_exit(void)
 		if (sc->tx_pages) {
 			for (j = 0; j < sc->nr_tx_pages; j++) {
 				if (sc->tx_pages[j])
-					__free_page(sc->tx_pages[j]);
+					__free_pages(sc->tx_pages[j],
+						     TX_PAGE_ORDER);
 			}
 			kfree(sc->tx_pages);
 		}
