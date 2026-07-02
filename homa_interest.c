@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file contains functions for managing homa_interest structs. */
 
@@ -12,14 +12,15 @@
 #endif /* See strip.py */
 
 /**
- * homa_interest_init_shared() - Initialize an interest and queue it up on a socket.
+ * homa_interest_init_shared() - Initialize an interest and queue it up on
+ * a socket.
  * @interest:  Interest to initialize
  * @hsk:       Socket on which the interests should be queued. Must be locked
  *             by caller.
  */
 void homa_interest_init_shared(struct homa_interest *interest,
 			       struct homa_sock *hsk)
-	__must_hold(&hsk->lock)
+	__must_hold(hsk->lock)
 {
 	interest->rpc = NULL;
 	atomic_set(&interest->ready, 0);
@@ -41,7 +42,7 @@ void homa_interest_init_shared(struct homa_interest *interest,
  */
 int homa_interest_init_private(struct homa_interest *interest,
 			       struct homa_rpc *rpc)
-	__must_hold(&rpc->bucket->lock)
+	__must_hold(rpc->bucket->lock)
 {
 	if (rpc->private_interest)
 		return -EINVAL;
@@ -63,13 +64,11 @@ int homa_interest_init_private(struct homa_interest *interest,
  *                and linked to a socket or RPC. On return, the interest
  *                will have been unlinked if its ready flag is set; otherwise
  *                it may still be linked.
- * @nonblocking:  Nonzero means return without blocking if the interest
- *                doesn't become ready immediately.
  *
- * Return: 0 for success (there is an actionable RPC in the interest), or
- * a negative errno.
+ * Return: 0 for success (the ready flag is set in the interest), or -EINTR
+ * if the thread received an interrupt.
  */
-int homa_interest_wait(struct homa_interest *interest, int nonblocking)
+int homa_interest_wait(struct homa_interest *interest)
 {
 	struct homa_sock *hsk = interest->hsk;
 	int result = 0;
@@ -96,11 +95,6 @@ int homa_interest_wait(struct homa_interest *interest, int nonblocking)
 		/* See if we can cleanup dead RPCs while waiting. */
 		if (homa_rpc_reap(hsk, false) != 0)
 			continue;
-
-		if (nonblocking) {
-			result = -EAGAIN;
-			goto done;
-		}
 
 #ifndef __STRIP__ /* See strip.py */
 		now = homa_clock();
@@ -137,7 +131,7 @@ done:
  *            locked by the caller.
  */
 void homa_interest_notify_private(struct homa_rpc *rpc)
-	__must_hold(&rpc->bucket->lock)
+	__must_hold(rpc->bucket->lock)
 {
 	if (rpc->private_interest) {
 		atomic_set_release(&rpc->private_interest->ready, 1);
@@ -156,7 +150,7 @@ void homa_interest_notify_private(struct homa_rpc *rpc)
  *               currently busy doing Homa transport work.
  */
 struct homa_interest *homa_choose_interest(struct homa_sock *hsk)
-	__must_hold(&hsk->lock)
+	__must_hold(hsk->lock)
 {
 	u64 busy_time = homa_clock() - hsk->homa->busy_cycles;
 	struct homa_interest *interest, *first;

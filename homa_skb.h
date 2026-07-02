@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file contains definitions related to efficient management of
  * memory associated with transmit sk_buffs.
@@ -99,6 +99,9 @@ struct sk_buff *homa_skb_alloc_tx(int length);
 int      homa_skb_append_from_iter(struct homa *homa,
 				   struct sk_buff *skb, struct iov_iter *iter,
 				   int length);
+int      homa_skb_append_from_iter_zerocopy(struct sk_buff *skb,
+					    struct iov_iter *iter,
+					    int length);
 int      homa_skb_append_from_skb(struct homa *homa,
 				  struct sk_buff *dst_skb,
 				  struct sk_buff *src_skb, int offset,

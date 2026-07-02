@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines structs and functions related to the Homa pacer,
  * which implements SRPT for packet output. In order to do that, it
@@ -10,9 +10,7 @@
 #define _HOMA_PACER_H
 
 #include "homa_impl.h"
-#ifndef __STRIP__ /* See strip.py */
-#include "homa_metrics.h"
-#endif /* See strip.py */
+#include "homa_qdisc.h"
 
 /**
  * struct homa_pacer - Contains information that the pacer users to
@@ -36,12 +34,6 @@ struct homa_pacer {
 	int fifo_count;
 
 	/**
-	 * @wake_time: homa_clock() time when the pacer woke up (if the pacer
-	 * is running) or 0 if the pacer is sleeping.
-	 */
-	u64 wake_time;
-
-	/**
 	 * @throttle_lock: Used to synchronize access to @throttled_rpcs. Must
 	 * hold when inserting or removing an RPC from throttled_rpcs.
 	 */
@@ -54,40 +46,11 @@ struct homa_pacer {
 	 */
 	struct list_head throttled_rpcs;
 
-#ifndef __STRIP__ /* See strip.py */
 	/**
 	 * @throttle_add: The most recent homa_clock() time when an RPC was
 	 * added to @throttled_rpcs.
 	 */
 	u64 throttle_add;
-#endif /* See strip.py */
-
-	/**
-	 * @fifo_fraction: Out of every 1000 packets transmitted by the
-	 * pacer, this number will be transmitted from the oldest message
-	 * rather than the highest-priority message. Set externally via
-	 * sysctl.
-	 */
-	int fifo_fraction;
-
-	/**
-	 * @max_nic_queue_ns: Limits the NIC queue length: we won't queue
-	 * up a packet for transmission if link_idle_time is this many
-	 * nanoseconds in the future (or more). Set externally via sysctl.
-	 */
-	int max_nic_queue_ns;
-
-	/**
-	 * @max_nic_queue_cycles: Same as max_nic_queue_ns except in
-	 * homa_clock() units.
-	 */
-	int max_nic_queue_cycles;
-
-	/**
-	 * @link_mbps: The raw bandwidth of the network uplink, in
-	 * units of 1e06 bits per second.  Set externally via sysctl.
-	 */
-	int link_mbps;
 
 	/**
 	 * @cycles_per_mbyte: the number of homa_clock() cycles that it takes to
@@ -96,31 +59,6 @@ struct homa_pacer {
 	 * NIC queue length and queue too many packets.
 	 */
 	u32 cycles_per_mbyte;
-
-	/**
-	 * @throttle_min_bytes: If a packet has fewer bytes than this, then it
-	 * bypasses the throttle mechanism and is transmitted immediately.
-	 * We have this limit because for very small packets CPU overheads
-	 * make it impossible to keep up with the NIC so (a) the NIC queue
-	 * can't grow and (b) using the pacer would serialize all of these
-	 * packets through a single core, which makes things even worse.
-	 * Set externally via sysctl.
-	 */
-	int throttle_min_bytes;
-
-#ifndef __STRIP__ /* See strip.py */
-	/**
-	 * @sysctl_header: Used to remove sysctl values when this structure
-	 * is destroyed.
-	 */
-	struct ctl_table_header *sysctl_header;
-#endif /* See strip.py */
-
-	/**
-	 * @exit: true means that the pacer thread should exit as
-	 * soon as possible.
-	 */
-	bool exit;
 
 	/**
 	 * @wait_queue: Used to block the pacer thread when there
@@ -134,11 +72,6 @@ struct homa_pacer {
 	 * NIC.
 	 */
 	struct task_struct *kthread;
-
-	/**
-	 * @kthread_done: Used to wait for @kthread to exit.
-	 */
-	struct completion kthread_done;
 
 	/**
 	 * @link_idle_time: The homa_clock() time at which we estimate
@@ -180,44 +113,31 @@ static inline void homa_pacer_check(struct homa_pacer *pacer)
 	 * to queue new packets; if the NIC queue becomes more than half
 	 * empty, then we will help out here.
 	 */
-	if ((homa_clock() + (pacer->max_nic_queue_cycles >> 1)) <
+	if ((homa_clock() + (pacer->homa->qshared->max_nic_queue_cycles >> 1)) <
 			atomic64_read(&pacer->link_idle_time))
 		return;
 	tt_record("homa_check_pacer calling homa_pacer_xmit");
 	homa_pacer_xmit(pacer);
-	INC_METRIC(pacer_needed_help, 1);
 }
 
-#ifndef __STRIP__ /* See strip.py */
 /**
  * homa_pacer_throttle_lock() - Acquire the throttle lock. If the lock
  * isn't immediately available, record stats on the waiting time.
  * @pacer:    Pacer information for a Homa transport.
  */
 static inline void homa_pacer_throttle_lock(struct homa_pacer *pacer)
-	__acquires(&pacer->throttle_lock)
+	__acquires(pacer->throttle_lock)
 {
 	if (!spin_trylock_bh(&pacer->throttle_lock))
 		homa_pacer_throttle_lock_slow(pacer);
 }
-#else /* See strip.py */
-/**
- * homa_pacer_throttle_lock() - Acquire the throttle lock.
- * @pacer:    Pacer information for a Homa transport.
- */
-static inline void homa_pacer_throttle_lock(struct homa_pacer *pacer)
-	__acquires(&pacer->throttle_lock)
-{
-	spin_lock_bh(&pacer->throttle_lock);
-}
-#endif /* See strip.py */
 
 /**
  * homa_pacer_throttle_unlock() - Release the throttle lock.
  * @pacer:    Pacer information for a Homa transport.
  */
 static inline void homa_pacer_throttle_unlock(struct homa_pacer *pacer)
-	__releases(&pacer->throttle_lock)
+	__releases(pacer->throttle_lock)
 {
 	spin_unlock_bh(&pacer->throttle_lock);
 }

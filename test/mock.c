@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file provides simplified substitutes for many Linux variables and
  * functions in order to allow Homa unit tests to be run outside a Linux
@@ -8,6 +8,7 @@
 #include "homa_impl.h"
 #include "homa_pool.h"
 #ifndef __STRIP__ /* See strip.py */
+#include "homa_qdisc.h"
 #include "homa_skb.h"
 #endif /* See strip.py */
 #include "ccutils.h"
@@ -34,11 +35,13 @@ extern void      *memcpy(void *dest, const void *src, size_t n);
  */
 int mock_alloc_page_errors;
 int mock_alloc_skb_errors;
+int mock_cmpxchg_errors;
 int mock_copy_data_errors;
 int mock_copy_to_iter_errors;
 int mock_copy_to_user_errors;
 int mock_cpu_idle;
 int mock_dst_check_errors;
+int mock_ethtool_ksettings_errors;
 int mock_import_ubuf_errors;
 int mock_import_iovec_errors;
 int mock_ip6_xmit_errors;
@@ -47,6 +50,7 @@ int mock_kmalloc_errors;
 int mock_kthread_create_errors;
 int mock_prepare_to_wait_errors;
 int mock_register_protosw_errors;
+int mock_register_qdisc_errors;
 int mock_register_sysctl_errors;
 int mock_rht_init_errors;
 int mock_rht_insert_errors;
@@ -71,11 +75,6 @@ struct task_struct mock_task;
  * outgoing packets using the long format rather than short.
  */
 int mock_xmit_log_verbose;
-
-/* If a test sets this variable to nonzero, ip_queue_xmit will log
- * the contents of the homa_info from packets.
- */
-int mock_xmit_log_homa_info;
 
 /* If a test sets this variable to nonzero, calls to wake_up and
  * wake_up_all will be logged.
@@ -120,6 +119,14 @@ static struct unit_hash *proc_files_in_use;
  * a (char *) giving the reference count for the page. Reset for each test.
  */
 static struct unit_hash *pages_in_use;
+
+/* Number of qdiscs that have been registered but not yet unregistered
+ * during the current test. Reset for each test.
+ */
+static int registered_qdiscs;
+
+/* Registered by most recent call to register_qdisc. */
+static struct Qdisc_ops *qdisc_ops;
 
 /* Keeps track of all the results returned by ip_route_output_flow that
  * have not yet been freed. Reset for each test.
@@ -182,7 +189,14 @@ int mock_num_clock_vals = 0;
 /* Used as the return value for tt_get_cycles. */
 u64 mock_tt_cycles;
 
-/* Indicates whether we should be simulation IPv6 or IPv4 in the
+unsigned int tsc_khz = 1000000;
+
+/* True means that kthread_stop has been invoked for some thread,
+ * so kthread_should_stop should return true.
+ */
+bool mock_exit_thread;
+
+/* Indicates whether we should be simulating IPv6 or IPv4 in the
  * current test. Can be overridden by a test.
  */
 bool mock_ipv6 = true;
@@ -227,29 +241,36 @@ int mock_rht_num_walk_results;
 /* Used instead of HOMA_MIN_DEFAULT_PORT by homa_skb.c. */
 __u16 mock_min_default_port = 0x8000;
 
-/* Used as sk_socket for all sockets created by mock_sock_init. */
+/* Used as sk_socket for all sockets created by mock_sock_init.
+ * Its sk field points to the most recently created Homa socket. */
 static struct socket mock_socket;
 
+/* Each of the entries in mock_hnets below is associated with the
+ * corresonding entry in mock_nets.
+ */
 #define MOCK_MAX_NETS 10
-static struct net mock_nets[MOCK_MAX_NETS];
-static struct homa_net mock_hnets[MOCK_MAX_NETS];
-static int mock_num_hnets;
+struct net mock_nets[MOCK_MAX_NETS];
+struct homa_net *mock_hnets[MOCK_MAX_NETS];
+struct net_device mock_devices[MOCK_MAX_NETS];
 
 /* Nonzero means don't generate a unit test failure when freeing peers
  * if the reference count isn't zero (log a message instead).
  */
 int mock_peer_free_no_fail;
 
+/* Link speed to return from mock_get_link_ksettings. */
+int mock_link_mbps = 10000;
+
+struct ethtool_ops mock_ethtool_ops =
+		{.get_link_ksettings = mock_get_link_ksettings};
 struct dst_ops mock_dst_ops = {
 	.mtu = mock_get_mtu,
 	.check = mock_dst_check};
 struct netdev_queue mock_net_queue = {.state = 0};
-struct net_device mock_net_device = {
-		.gso_max_segs = 1000,
-		.gso_max_size = 0,
-		._tx = &mock_net_queue,
-		.nd_net = {.net = &mock_nets[0]}
-	};
+
+/* Number of invocations of netif_schedule_queue. */
+int mock_netif_schedule_calls;
+
 const struct net_offload *inet_offloads[MAX_INET_PROTOS];
 const struct net_offload *inet6_offloads[MAX_INET_PROTOS];
 struct net_offload tcp_offload;
@@ -320,7 +341,7 @@ struct sk_buff *__alloc_skb(unsigned int size, gfp_t priority, int flags,
 	skb->_skb_refdst = 0;
 	ip_hdr(skb)->saddr = 0;
 	skb->truesize = SKB_TRUESIZE(size);
-	skb->dev = &mock_net_device;
+	skb->dev = &mock_devices[0];
 	return skb;
 }
 
@@ -336,6 +357,7 @@ void BUG_func(void)
 void call_rcu(struct rcu_head *head, void free_func(struct rcu_head *head))
 {
 	unit_log_printf("; ", "call_rcu invoked");
+	free_func(head);
 }
 
 bool cancel_work_sync(struct work_struct *work)
@@ -344,6 +366,10 @@ bool cancel_work_sync(struct work_struct *work)
 }
 
 void __check_object_size(const void *ptr, unsigned long n, bool to_user) {}
+
+void consume_skb(struct sk_buff *skb) {
+	kfree_skb(skb);
+}
 
 size_t _copy_from_iter(void *addr, size_t bytes, struct iov_iter *iter)
 {
@@ -684,9 +710,68 @@ void iov_iter_revert(struct iov_iter *i, size_t bytes)
 	unit_log_printf("; ", "iov_iter_revert %lu", bytes);
 }
 
+/* Minimal mock of iov_iter_extract_pages for ITER_BVEC iterators: returns one
+ * page chunk per call (bounded by the current bvec segment, maxsize, and the
+ * page boundary), takes a reference on the page, and advances the iterator.
+ * Sufficient for homa_skb_append_from_iter_zerocopy unit tests.
+ */
+ssize_t iov_iter_extract_pages(struct iov_iter *i, struct page ***pages,
+			       size_t maxsize, unsigned int maxpages,
+			       iov_iter_extraction_t extraction_flags,
+			       size_t *offset0)
+{
+	const struct bio_vec *bvec;
+	size_t skip, start, n;
+	struct page *page;
+
+	if ((i->iter_type & ~(READ|WRITE)) != ITER_BVEC ||
+	    maxpages == 0 || maxsize == 0)
+		return 0;
+	bvec = i->bvec;
+	skip = i->iov_offset;
+	start = bvec->bv_offset + skip;
+	page = bvec->bv_page;
+	*offset0 = start & (PAGE_SIZE - 1);
+	n = bvec->bv_len - skip;
+	if (n > maxsize)
+		n = maxsize;
+	if (n > PAGE_SIZE - *offset0)
+		n = PAGE_SIZE - *offset0;
+	(*pages)[0] = page;
+	get_page(page);
+	i->iov_offset += n;
+	i->count -= n;
+	if (i->iov_offset >= bvec->bv_len) {
+		i->bvec++;
+		i->nr_segs--;
+		i->iov_offset = 0;
+	}
+	return n;
+}
+
 int ip6_datagram_connect(struct sock *sk, struct sockaddr *addr, int addr_len)
 {
 	return 0;
+}
+
+void iov_iter_bvec(struct iov_iter *i, unsigned int direction,
+		   const struct bio_vec *bvec, unsigned long nr_segs,
+		   size_t count)
+{
+	memset(i, 0, sizeof(*i));
+	direction &= READ | WRITE;
+	i->iter_type = ITER_BVEC | direction;
+	i->bvec = bvec;
+	i->nr_segs = nr_segs;
+	i->iov_offset = 0;
+	i->count = count;
+}
+
+struct dst_entry *ip6_dst_check(struct dst_entry *dst, u32 cookie)
+{
+	if (mock_check_error(&mock_dst_check_errors))
+		return NULL;
+	return dst;
 }
 
 struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk,
@@ -703,7 +788,7 @@ struct dst_entry *ip6_dst_lookup_flow(struct net *net, const struct sock *sk,
 	}
 	atomic_set(&route->dst.__rcuref.refcnt, 1);
 	route->dst.ops = &mock_dst_ops;
-	route->dst.dev = &mock_net_device;
+	route->dst.dev = &mock_devices[0];
 	route->dst.obsolete = 0;
 	if (!routes_in_use)
 		routes_in_use = unit_hash_new();
@@ -737,14 +822,6 @@ int ip6_xmit(const struct sock *sk, struct sk_buff *skb, struct flowi6 *fl6,
 	else
 		homa_print_packet_short(skb, buffer, sizeof(buffer));
 	unit_log_printf("; ", "xmit %s", buffer);
-	if (mock_xmit_log_homa_info) {
-		struct homa_skb_info *homa_info;
-
-		homa_info = homa_get_skb_info(skb);
-		unit_log_printf("; ", "homa_info: wire_bytes %d, data_bytes %d, seg_length %d, offset %d",
-				homa_info->wire_bytes, homa_info->data_bytes,
-				homa_info->seg_length, homa_info->offset);
-	}
 	kfree_skb(skb);
 	return 0;
 }
@@ -772,15 +849,15 @@ int ip_queue_xmit(struct sock *sk, struct sk_buff *skb, struct flowi *fl)
 	else
 		homa_print_packet_short(skb, buffer, sizeof(buffer));
 	unit_log_printf("; ", "xmit %s", buffer);
-	if (mock_xmit_log_homa_info) {
-		struct homa_skb_info *homa_info;
-
-		homa_info = homa_get_skb_info(skb);
-		unit_log_printf("; ", "homa_info: wire_bytes %d, data_bytes %d",
-				homa_info->wire_bytes, homa_info->data_bytes);
-	}
 	kfree_skb(skb);
 	return 0;
+}
+
+struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
+{
+	if (mock_check_error(&mock_dst_check_errors))
+		return NULL;
+	return dst;
 }
 
 unsigned int ipv4_mtu(const struct dst_entry *dst)
@@ -802,7 +879,7 @@ struct rtable *ip_route_output_flow(struct net *net, struct flowi4 *flp4,
 	}
 	atomic_set(&route->dst.__rcuref.refcnt, 1);
 	route->dst.ops = &mock_dst_ops;
-	route->dst.dev = &mock_net_device;
+	route->dst.dev = &mock_devices[0];
 	route->dst.obsolete = 0;
 	if (!routes_in_use)
 		routes_in_use = unit_hash_new();
@@ -899,6 +976,16 @@ void __kfree_skb(struct sk_buff *skb)
 	free(skb);
 }
 
+void kfree_skb_list_reason(struct sk_buff *segs, enum skb_drop_reason reason)
+{
+	while (segs) {
+		struct sk_buff *next = segs->next;
+
+		__kfree_skb(segs);
+		segs = next;
+	}
+}
+
 void *__kmalloc_cache_noprof(struct kmem_cache *s, gfp_t gfpflags, size_t size)
 {
 	return mock_kmalloc(size, gfpflags);
@@ -960,9 +1047,14 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),
 	return &mock_task;
 }
 
+bool kthread_should_stop(void) {
+	return mock_exit_thread;
+}
+
 int kthread_stop(struct task_struct *k)
 {
 	unit_log_printf("; ", "kthread_stop");
+	mock_exit_thread = true;
 	return 0;
 }
 
@@ -1028,9 +1120,7 @@ ssize_t __modver_version_show(struct module_attribute *a,
 
 void __mutex_init(struct mutex *lock, const char *name,
 			 struct lock_class_key *key)
-{
-
-}
+{}
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 void mutex_lock_nested(struct mutex *lock, unsigned int subclass)
@@ -1038,6 +1128,7 @@ void mutex_lock_nested(struct mutex *lock, unsigned int subclass)
 void mutex_lock(struct mutex *lock)
 #endif
 {
+	UNIT_HOOK("mutex_lock");
 	mock_active_locks++;
 }
 
@@ -1045,6 +1136,11 @@ void mutex_unlock(struct mutex *lock)
 {
 	UNIT_HOOK("unlock");
 	mock_active_locks--;
+}
+
+void netif_schedule_queue(struct netdev_queue *txq)
+{
+	mock_netif_schedule_calls++;
 }
 
 int netif_receive_skb(struct sk_buff *skb)
@@ -1056,21 +1152,8 @@ int netif_receive_skb(struct sk_buff *skb)
 	return 0;
 }
 
-void preempt_count_add(int val)
-{
-	int i;
-
-	for (i = 0; i < val; i++)
-		preempt_disable();
-}
-
-void preempt_count_sub(int val)
-{
-	int i;
-
-	for (i = 0; i < val; i++)
-		preempt_enable();
-}
+void __netif_schedule(struct Qdisc *q)
+{}
 
 long prepare_to_wait_event(struct wait_queue_head *wq_head,
 		struct wait_queue_entry *wq_entry, int state)
@@ -1191,6 +1274,13 @@ void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
 	mock_total_spin_locks++;
 }
 
+unsigned long _raw_spin_lock_irqsave(raw_spinlock_t *lock)
+{
+	UNIT_HOOK("spin_lock_irqsave");
+	mock_record_locked(lock);
+	return 1234;
+}
+
 void __raw_spin_lock_init(raw_spinlock_t *lock, const char *name,
 			  struct lock_class_key *key, short inner)
 {}
@@ -1219,6 +1309,15 @@ void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
 
 void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
 {
+	mock_record_unlocked(lock);
+}
+
+void _raw_spin_unlock_irqrestore(raw_spinlock_t *lock,
+					    unsigned long flags)
+{
+	if (flags != 1234)
+		FAIL("incorrect flags %ld returned to %sa (expected 1234)",
+		     flags, __func__);
 	mock_record_unlocked(lock);
 }
 
@@ -1271,6 +1370,15 @@ int register_pernet_subsys(struct pernet_operations *)
 	return 0;
 }
 
+int register_qdisc(struct Qdisc_ops *qops)
+{
+	if (mock_check_error(&mock_register_qdisc_errors))
+		return -EINVAL;
+	registered_qdiscs++;
+	qdisc_ops = qops;
+	return 0;
+}
+
 void release_sock(struct sock *sk)
 {
 	mock_active_locks--;
@@ -1280,6 +1388,25 @@ void release_sock(struct sock *sk)
 void remove_wait_queue(struct wait_queue_head *wq_head,
 		struct wait_queue_entry *wq_entry)
 {}
+
+int rtnl_is_locked(void) {
+	return 0;
+}
+
+void rtnl_kfree_skbs(struct sk_buff *head, struct sk_buff *tail)
+{
+	if (!head || !tail)
+		return;
+
+	while (true) {
+		struct sk_buff *next = head->next;
+
+		__kfree_skb(head);
+		if (head == tail)
+			break;
+		head = next;
+	}
+}
 
 void schedule(void)
 {
@@ -1331,6 +1458,14 @@ void sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb,
 #else
 	__kfree_skb(skb);
 #endif
+}
+
+int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
+{
+	if (offset + len > skb->len)
+		return -EFAULT;
+	memcpy(to, skb->data + offset, len);
+	return 0;
 }
 
 int skb_copy_datagram_iter(const struct sk_buff *from, int offset,
@@ -1475,6 +1610,9 @@ int sock_no_socketpair(struct socket *sock1, struct socket *sock2)
 	return 0;
 }
 
+void synchronize_rcu(void)
+{}
+
 void __tasklet_hi_schedule(struct tasklet_struct *t)
 {}
 
@@ -1492,6 +1630,12 @@ void unregister_net_sysctl_table(struct ctl_table_header *header)
 
 void unregister_pernet_subsys(struct pernet_operations *)
 {}
+
+void unregister_qdisc(struct Qdisc_ops *qops)
+{
+	registered_qdiscs--;
+	qdisc_ops = NULL;
+}
 
 void vfree(const void *block)
 {
@@ -1551,26 +1695,6 @@ int woken_wake_function(struct wait_queue_entry *wq_entry, unsigned int mode,
 }
 
 /**
- * mock_alloc_hnet: Allocate a new struct homa_net.
- * @homa:   struct homa that the homa_net will be associated with.
- * Return:  The new homa_net.
- */
-struct homa_net *mock_alloc_hnet(struct homa *homa)
-{
-	struct homa_net *hnet;
-
-	if (mock_num_hnets >= MOCK_MAX_NETS) {
-		FAIL("Max number of network namespaces (%d) exceeded",
-		     MOCK_MAX_NETS);
-		return &mock_hnets[0];
-	}
-	hnet = &mock_hnets[mock_num_hnets];
-	homa_net_init(hnet, &mock_nets[mock_num_hnets], homa);
-	mock_num_hnets++;
-	return hnet;
-}
-
-/**
  * mock_alloc_pages() - Called instead of alloc_pages when Homa is compiled
  * for unit testing.
  */
@@ -1587,6 +1711,27 @@ struct page *mock_alloc_pages(gfp_t gfp, unsigned int order)
 	return page;
 }
 
+#ifndef __STRIP__ /* See strip.py */
+/**
+ * mock_alloc_qdisc() - Allocate and initialize a new Qdisc suitable for
+ * use in unit tests as a homa qdisc.
+ * Return:  The new Qdisc. The memory is dynamically allocated and must
+ * be kfree-d by the caller. homa_qdisc_init has not been invoked on
+ * this Qdisc yet.
+ */
+struct Qdisc *mock_alloc_qdisc(struct netdev_queue *dev_queue)
+{
+	struct Qdisc *qdisc;
+
+	qdisc = kzalloc(sizeof(struct Qdisc) + sizeof(struct homa_qdisc),
+		      GFP_ATOMIC);
+	qdisc->dev_queue = dev_queue;
+	qdisc->ops = qdisc_ops;
+	spin_lock_init(&qdisc->q.lock);
+	return qdisc;
+}
+#endif /* See strip.py */
+
 /**
  * mock_check_error() - Determines whether a method should simulate an error
  * return.
@@ -1601,6 +1746,17 @@ int mock_check_error(int *errorMask)
 	int result = *errorMask & 1;
 	*errorMask = *errorMask >> 1;
 	return result;
+}
+
+/**
+ * mock_cmpxchg() - Replacement for atomic64_cmpxchg_relaxed.
+ */
+s64 mock_cmpxchg(atomic64_t *target, s64 old, s64 new)
+{
+	if (mock_check_error(&mock_cmpxchg_errors))
+		return old+1;
+	atomic64_set(target, new);
+	return old;
 }
 
 /**
@@ -1651,6 +1807,38 @@ void mock_data_ready(struct sock *sk)
 	unit_log_printf("; ", "sk->sk_data_ready invoked");
 }
 
+/**
+ * mock_dev() - Return a net_device suitable for use in unit tests.
+ * @index:  Index of the desired device among all those available; must
+ *          be < MOCK_MAX_NETS.
+ * @homa:   struct homa that the device will be associated with; may be
+ *          needed for hnet initialization.
+ * Return:  The specified net_device. If this is the first call for @index
+ *          in this unit test, the device will be initialized. It will be
+ *          associated with mock_hnet(index), which will also be initialized
+ *          if it wasn't already initialized.
+ */
+struct net_device *mock_dev(int index, struct homa *homa)
+{
+	struct net_device *dev;
+
+	if (index >= MOCK_MAX_NETS) {
+		FAIL("Index %d exceeds maximum number of network namespaces (%d)",
+		     index, MOCK_MAX_NETS);
+		index = 0;
+	}
+	dev = &mock_devices[index];
+	if (!dev->ethtool_ops) {
+		dev->gso_max_segs = 1000;
+		dev->gso_max_size = mock_mtu;
+		dev->_tx = &mock_net_queue;
+		dev->nd_net.net = &mock_nets[0];
+		dev->ethtool_ops = &mock_ethtool_ops;
+		mock_hnet(index, homa);
+	}
+	return dev;
+}
+
 struct dst_entry *mock_dst_check(struct dst_entry *dst, __u32 cookie)
 {
 	if (mock_check_error(&mock_dst_check_errors))
@@ -1692,17 +1880,71 @@ void mock_get_page(struct page *page)
 		unit_hash_set(pages_in_use, page, (void *) (ref_count+1));
 }
 
-void *mock_net_generic(const struct net *net, unsigned int id)
+int mock_get_link_ksettings(struct net_device *dev,
+			    struct ethtool_link_ksettings *settings)
+{
+	if (mock_check_error(&mock_ethtool_ksettings_errors))
+		return -EOPNOTSUPP;
+	memset(settings, 0, sizeof(*settings));
+	settings->base.speed = mock_link_mbps;
+	return 0;
+}
+
+/**
+ * mock_hnet() - Return a struct homa_net suitable for use in tests.
+ * @index:  Index of this homa_net among those available for unit tests (must
+ *          be < MOCK_MAX_NETS)
+ * @homa:   struct homa that the homa_net will be associated with.
+ * Return:  The requested homa_net. If this is the first time that @index
+ *          has been specified during this unit test, the hnet will be
+ *          initialized.
+ */
+struct homa_net *mock_hnet(int index, struct homa *homa)
 {
 	struct homa_net *hnet;
+
+	if (index >= MOCK_MAX_NETS) {
+		FAIL("Index %d exceeds maximum number of network namespaces (%d)",
+		     index, MOCK_MAX_NETS);
+		index = 0;
+	}
+	hnet = mock_hnets[index];
+	if (!hnet) {
+		hnet = malloc(sizeof(*hnet));
+		mock_hnets[index] = hnet;
+		homa_net_init(hnet, &mock_nets[index], homa);
+		if (index == 0)
+			mock_dev(0, homa);
+	}
+	return hnet;
+}
+
+/**
+ * mock_net_for_hnet() - Return the struct net associated with a struct
+ * homa_net, or NULL if the struct net can't be identified.
+ * @hnet:     Find the struct net associated with this.
+ * Return:    See above.
+ */
+struct net *mock_net_for_hnet(struct homa_net *hnet)
+{
+	int i;
+
+	for (i = 0; i <  MOCK_MAX_NETS; i++) {
+		if (hnet == mock_hnets[i])
+			return &mock_nets[i];
+	}
+	return NULL;
+}
+
+void *mock_net_generic(const struct net *net, unsigned int id)
+{
 	int i;
 
 	if (id != homa_net_id)
 		return NULL;
-	for (i = 0; i < MOCK_MAX_NETS; i++) {
-		hnet = &mock_hnets[i];
-		if (hnet->net == net)
-			return hnet;
+	for (i = 0; i <  MOCK_MAX_NETS; i++) {
+		if (net == &mock_nets[i])
+			return mock_hnets[i];
 	}
 	return NULL;
 }
@@ -1738,9 +1980,8 @@ void mock_preempt_disable()
 
 void mock_preempt_enable()
 {
-	if (mock_preempt_disables == 0)
-		FAIL(" preempt_enable invoked without preempt_disable");
-	mock_preempt_disables--;
+	if (mock_preempt_disables > 0)
+		mock_preempt_disables--;
 }
 
 int mock_processor_id()
@@ -1763,6 +2004,71 @@ void mock_put_page(struct page *page)
 			unit_hash_set(pages_in_use, page, (void *) ref_count);
 		}
 	}
+}
+
+/**
+ * mock_raw_skb() - Performs most of the work of mock_skb_alloc and
+ * mock_tcp_skb. Allocates and initializes an skb.
+ * @saddr:        IPv6 address to use as the sender of the packet, in
+ *                network byte order.
+ * @protocol:     Protocol to use in the IP header, such as IPPROTO_HOMA.
+ * @length:       How many bytes of space to allocated after the IP header.
+ * Return:        The new packet buffer, initialized as if the packet just
+ *                arrived from the network and is about to be processed at
+ *                transport level (e.g. there will be an IP header before
+ *                skb->tail). The skb has room for @length additional bytes,
+ *                but they have not yet been allocated with skb_put(). The
+ *                caller must eventually free the skb.
+ */
+struct sk_buff *mock_raw_skb(struct in6_addr *saddr, int protocol, int length)
+{
+	int ip_size, data_size, shinfo_size;
+	struct sk_buff *skb;
+
+	/* Don't let the IP header start at the beginning of the packet
+	 * buffer: that will confuse is_homa_pkt.
+	 */
+#define IP_HDR_OFFSET 4
+
+	skb = malloc(sizeof(struct sk_buff));
+	memset(skb, 0, sizeof(*skb));
+	if (!skbs_in_use)
+		skbs_in_use = unit_hash_new();
+	unit_hash_set(skbs_in_use, skb, "used");
+
+	ip_size = mock_ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
+	data_size = SKB_DATA_ALIGN(IP_HDR_OFFSET + ip_size + length);
+	shinfo_size = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	skb->head = malloc(data_size + shinfo_size);
+	memset(skb->head, 0, data_size + shinfo_size);
+	skb->data = skb->head;
+	skb_reset_tail_pointer(skb);
+	skb->end = skb->tail + data_size;
+
+	/* Don't want IP header starting at the beginning of the packet
+	 * buffer (will confuse is_homa_pkt).
+	 */
+	skb_reserve(skb, IP_HDR_OFFSET + ip_size);
+	skb_reset_transport_header(skb);
+	skb_reset_network_header(skb);
+	skb_set_network_header(skb, -ip_size);
+	if (mock_ipv6) {
+		ipv6_hdr(skb)->version = 6;
+		ipv6_hdr(skb)->saddr = *saddr;
+		ipv6_hdr(skb)->nexthdr = protocol;
+	} else {
+		ip_hdr(skb)->version = 4;
+		ip_hdr(skb)->saddr = saddr->in6_u.u6_addr32[3];
+		ip_hdr(skb)->protocol = protocol;
+		ip_hdr(skb)->check = 0;
+	}
+	skb->users.refs.counter = 1;
+	skb->_skb_refdst = 0;
+	skb->hash = 3;
+	skb->next = NULL;
+	skb->dev = &mock_devices[0];
+	qdisc_skb_cb(skb)->pkt_len = length + 100;
+	return skb;
 }
 
 /**
@@ -1850,15 +2156,15 @@ void *mock_rht_walk_next(struct rhashtable_iter *iter)
 void mock_rpc_hold(struct homa_rpc *rpc)
 {
 	mock_rpc_holds++;
-	atomic_inc(&rpc->refs);
+	refcount_inc(&rpc->refs);
 }
 
 void mock_rpc_put(struct homa_rpc *rpc)
 {
-	if (atomic_read(&rpc->refs) == 0)
+	if (refcount_read(&rpc->refs) < 2)
 		FAIL("homa_rpc_put invoked when RPC has no active holds");
 	mock_rpc_holds--;
-	atomic_dec(&rpc->refs);
+	refcount_dec(&rpc->refs);
 }
 
 /**
@@ -1910,7 +2216,7 @@ void mock_set_ipv6(struct homa_sock *hsk)
 }
 
 /**
- * mock_skb_alloc() - Allocate and return a packet buffer. The buffer is
+ * mock_skb_alloc() - Allocate and return a Homa packet buffer. The buffer is
  * initialized as if it just arrived from the network.
  * @saddr:        IPv6 address to use as the sender of the packet, in
  *                network byte order.
@@ -1926,12 +2232,18 @@ void mock_set_ipv6(struct homa_sock *hsk)
  * Return:        A packet buffer containing the information described above.
  *                The caller owns this buffer and is responsible for freeing it.
  */
-struct sk_buff *mock_skb_alloc(struct in6_addr *saddr, struct homa_common_hdr *h,
-		int extra_bytes, int first_value)
+struct sk_buff *mock_skb_alloc(struct in6_addr *saddr,
+			       struct homa_common_hdr *h, int extra_bytes,
+			       int first_value)
 {
-	int header_size, ip_size, data_size, shinfo_size;
 	struct sk_buff *skb;
 	unsigned char *p;
+	int header_size;
+
+	/* Don't let the IP header start at the beginning of the packet
+	 * buffer: that will confuse is_homa_pkt.
+	 */
+#define IP_HDR_OFFSET 4
 
 	if (h) {
 		switch (h->type) {
@@ -1973,51 +2285,45 @@ struct sk_buff *mock_skb_alloc(struct in6_addr *saddr, struct homa_common_hdr *h
 	} else {
 		header_size = 0;
 	}
-	skb = malloc(sizeof(struct sk_buff));
-	memset(skb, 0, sizeof(*skb));
-	if (!skbs_in_use)
-		skbs_in_use = unit_hash_new();
-	unit_hash_set(skbs_in_use, skb, "used");
-
-	ip_size = mock_ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
-	data_size = SKB_DATA_ALIGN(ip_size + header_size + extra_bytes);
-	shinfo_size = SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
-	if (h) {
-		skb->head = malloc(data_size + shinfo_size);
-		memset(skb->head, 0, data_size + shinfo_size);
-	} else {
-		skb->head = malloc(extra_bytes);
-		memset(skb->head, 0, extra_bytes);
-
-	}
-	skb->data = skb->head;
-	skb_reset_tail_pointer(skb);
-	skb->end = skb->tail + data_size;
-	skb_reserve(skb, ip_size);
-	skb_reset_transport_header(skb);
+	skb = mock_raw_skb(saddr, IPPROTO_HOMA, header_size + extra_bytes);
+	p = skb_transport_header(skb);
 	if (header_size != 0) {
 		p = skb_put(skb, header_size);
-		memcpy(skb->data, h, header_size);
+		memcpy(p, h, header_size);
 	}
 	if (h && extra_bytes != 0) {
 		p = skb_put(skb, extra_bytes);
 		unit_fill_data(p, extra_bytes, first_value);
 	}
-	skb->users.refs.counter = 1;
-	if (mock_ipv6) {
-		ipv6_hdr(skb)->version = 6;
-		ipv6_hdr(skb)->saddr = *saddr;
-		ipv6_hdr(skb)->nexthdr = IPPROTO_HOMA;
-	} else {
-		ip_hdr(skb)->version = 4;
-		ip_hdr(skb)->saddr = saddr->in6_u.u6_addr32[3];
-		ip_hdr(skb)->protocol = IPPROTO_HOMA;
-		ip_hdr(skb)->check = 0;
-	}
-	skb->_skb_refdst = 0;
-	skb->hash = 3;
-	skb->next = NULL;
-	skb->dev = &mock_net_device;
+	qdisc_skb_cb(skb)->pkt_len = extra_bytes + 100;
+	return skb;
+}
+
+/**
+ * mock_tcp_skb() - Allocate and return a TCP packet buffer. The buffer is
+ * initialized as if it just arrived from the network.
+ * @saddr:        IPv6 address to use as the sender of the packet, in
+ *                network byte order.
+ * @sequence:     Sequence number to store in the TCP header.
+ * @extra_bytes:  How much additional data to add to the buffer after
+ *                the TCP header.
+ *
+ * Return:        A packet buffer containing the information described above.
+ *                The caller owns this buffer and is responsible for freeing it.
+ */
+struct sk_buff *mock_tcp_skb(struct in6_addr *saddr, int sequence,
+			     int extra_bytes)
+{
+	struct sk_buff *skb;
+	struct tcphdr *tcp;
+
+	skb = mock_raw_skb(saddr, IPPROTO_TCP,
+			   sizeof(struct tcphdr) + extra_bytes);
+	tcp = (struct tcphdr *)skb_put(skb, sizeof(struct tcphdr));
+	tcp->seq = htonl(sequence);
+	tcp->doff = sizeof(struct tcphdr) / 4;
+	skb_put(skb, extra_bytes);
+	qdisc_skb_cb(skb)->pkt_len = extra_bytes + 100;
 	return skb;
 }
 
@@ -2062,8 +2368,9 @@ int mock_sock_init(struct homa_sock *hsk, struct homa_net *hnet, int port)
 	sk->sk_data_ready = mock_data_ready;
 	sk->sk_family = mock_ipv6 ? AF_INET6 : AF_INET;
 	sk->sk_socket = &mock_socket;
-	sk->sk_net.net = hnet->net;
 	memset(&mock_socket, 0, sizeof(mock_socket));
+	mock_socket.sk = sk;
+	sk->sk_net.net = mock_net_for_hnet(hnet);
 	refcount_set(&sk->sk_wmem_alloc, 1);
 	init_waitqueue_head(&mock_socket.wq.wait);
 	rcu_assign_pointer(sk->sk_wq, &mock_socket.wq);
@@ -2081,9 +2388,9 @@ int mock_sock_init(struct homa_sock *hsk, struct homa_net *hnet, int port)
 	hsk->inet.pinet6 = &hsk_pinfo;
 	mock_mtu = UNIT_TEST_DATA_PER_PACKET + hsk->ip_header_length
 		+ sizeof(struct homa_data_hdr);
-	mock_net_device.gso_max_size = mock_mtu;
+	mock_devices[0].gso_max_size = mock_mtu;
 	err = homa_pool_set_region(hsk, (void *) 0x1000000,
-				   100*HOMA_BPAGE_SIZE);
+				   100*HOMA_BPAGE_SIZE, true);
 	return err;
 }
 
@@ -2106,12 +2413,13 @@ void mock_spin_unlock(spinlock_t *lock)
  */
 void mock_teardown(void)
 {
-	int count;
+	int count, i;
 
 	pcpu_hot.cpu_number = 1;
 	pcpu_hot.current_task = &mock_task;
 	mock_alloc_page_errors = 0;
 	mock_alloc_skb_errors = 0;
+	mock_cmpxchg_errors = 0;
 	mock_copy_data_errors = 0;
 	mock_copy_to_iter_errors = 0;
 	mock_copy_to_user_errors = 0;
@@ -2122,6 +2430,8 @@ void mock_teardown(void)
 	mock_next_clock_val = 0;
 	mock_num_clock_vals = 0;
 	mock_tt_cycles = 0;
+	mock_ethtool_ksettings_errors = 0;
+	mock_exit_thread = false;
 	mock_ipv6 = mock_ipv6_default;
 	mock_dst_check_errors = 0;
 	mock_import_ubuf_errors = 0;
@@ -2132,6 +2442,7 @@ void mock_teardown(void)
 	mock_kthread_create_errors = 0;
 	mock_prepare_to_wait_errors = 0;
 	mock_register_protosw_errors = 0;
+	mock_register_qdisc_errors = 0;
 	mock_register_sysctl_errors = 0;
 	mock_rht_init_errors = 0;
 	mock_rht_insert_errors = 0;
@@ -2149,7 +2460,6 @@ void mock_teardown(void)
 	mock_prepare_to_wait_status = -ERESTARTSYS;
 	mock_signal_pending = 0;
 	mock_xmit_log_verbose = 0;
-	mock_xmit_log_homa_info = 0;
 	mock_log_wakeups = 0;
 	mock_mtu = 0;
 	mock_max_skb_frags = MAX_SKB_FRAGS;
@@ -2161,10 +2471,16 @@ void mock_teardown(void)
 	mock_rht_num_walk_results = 0;
 	mock_min_default_port = 0x8000;
 	homa_net_id = 0;
-	mock_num_hnets = 0;
+	for (i = 0; i < MOCK_MAX_NETS; i++) {
+		if (mock_hnets[i]) {
+			free(mock_hnets[i]);
+			mock_hnets[i] = NULL;
+		}
+	}
+	memset(mock_devices, 0, sizeof(mock_devices));
 	mock_peer_free_no_fail = 0;
-	mock_net_device.gso_max_size = 0;
-	mock_net_device.gso_max_segs = 1000;
+	mock_link_mbps = 10000;
+	mock_netif_schedule_calls = 0;
 	memset(inet_offloads, 0, sizeof(inet_offloads));
 	inet_offloads[IPPROTO_TCP] = (struct net_offload __rcu *) &tcp_offload;
 	memset(inet6_offloads, 0, sizeof(inet6_offloads));
@@ -2195,6 +2511,12 @@ void mock_teardown(void)
 		FAIL(" %u pages still allocated after test", count);
 	unit_hash_free(pages_in_use);
 	pages_in_use = NULL;
+
+	if (registered_qdiscs != 0)
+		FAIL(" %d qdiscs still registered after test",
+		     registered_qdiscs);
+	registered_qdiscs = 0;
+	qdisc_ops = NULL;
 
 	count = unit_hash_size(proc_files_in_use);
 	if (count > 0)
@@ -2235,9 +2557,6 @@ void mock_teardown(void)
 				mock_rpc_holds);
 	mock_rpc_holds = 0;
 
-	if (mock_preempt_disables != 0)
-		FAIL(" %d preempt_disables still active after test",
-				mock_preempt_disables);
 	mock_preempt_disables = 0;
 
 #ifndef __STRIP__ /* See strip.py */
@@ -2269,3 +2588,14 @@ void *mock_vmalloc(size_t size)
 	unit_hash_set(vmallocs_in_use, block, "used");
 	return block;
 }
+
+/* Linker stubs for kernel symbols referenced through inline functions in
+ * headers (e.g. slab.h, page alloc) but not actually called at runtime
+ * in the unit-test build. Without these, the test binary fails to link
+ * on kernel 6.13+.
+ */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+unsigned long random_kmalloc_seed;
+struct static_key_false hugetlb_optimize_vmemmap_key;
+#endif

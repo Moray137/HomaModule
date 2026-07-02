@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #ifndef __STRIP__ /* See strip.py */
@@ -89,7 +89,7 @@ int homa_pool_set_region(struct homa_sock *hsk, void *region,
 	if (num_bpages < MIN_POOL_SIZE)
 		return -EINVAL;
 	descriptors = kmalloc_array(num_bpages, sizeof(struct homa_bpage),
-				    __GFP_ZERO);
+				    GFP_KERNEL | __GFP_ZERO);
 	if (!descriptors)
 		return -ENOMEM;
 	cores = alloc_percpu_gfp(struct homa_pool_core, __GFP_ZERO);
@@ -295,12 +295,12 @@ int homa_pool_get_pages(struct homa_pool *pool, int num_pages, u32 *pages,
  * returned.
  */
 int homa_pool_alloc_msg(struct homa_rpc *rpc)
-	__must_hold(&rpc->bucket->lock)
+	__must_hold(rpc->bucket->lock)
 {
 	struct homa_pool *pool = rpc->hsk->buffer_pool;
 	int full_pages, partial, i, core_id;
-	u32 pages[HOMA_MAX_BPAGES];
 	struct homa_pool_core *core;
+	u32 pages[HOMA_MAX_BPAGES];
 	struct homa_bpage *bpage;
 	struct homa_rpc *other;
 
@@ -537,12 +537,46 @@ void homa_pool_check_waiting(struct homa_pool *pool)
 		homa_pool_alloc_msg(rpc);
 #ifndef __STRIP__ /* See strip.py */
 		if (rpc->msgin.num_bpages > 0) {
-			/* Allocation succeeded; "wake up" the RPC. */
-			rpc->msgin.resend_all = 1;
-			homa_grant_init_rpc(rpc, 0);
-			homa_grant_check_rpc(rpc);
+			struct homa_resend_hdr resend;
+
+			/* To "wake up" the RPC, request retransmission of
+			 * all the packets that were dropped. Use the
+			 * next-to-highest priority level to provide a priority
+			 * boost without interfering with the highest priority
+			 * traffic such as control packets.
+			 */
+			resend.offset = htonl(0);
+			resend.length = htonl(-1);
+			resend.priority = homa_high_priority(rpc->hsk->homa);
+			homa_xmit_control(RESEND, &resend, sizeof(resend), rpc);
+			if (rpc->msgin.granted < rpc->msgin.length)
+				homa_grant_manage_rpc(rpc);
 		}
 #endif /* See strip.py */
 		homa_rpc_unlock(rpc);
 	}
+}
+
+/**
+ * homa_pool_avail_bytes() - Return a count of the number of bytes currently
+ * unused and available for allocation in a pool.
+ * @pool:    Pool of interest.
+ * Return:    See above.
+ */
+u64 homa_pool_avail_bytes(struct homa_pool *pool)
+{
+	struct homa_pool_core *core;
+	u64 avail;
+	int cpu;
+
+	if (!pool->region)
+		return 0;
+	avail = atomic_read(&pool->free_bpages);
+	avail *= HOMA_BPAGE_SIZE;
+	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+		core = per_cpu_ptr(pool->cores, cpu);
+		if (pool->descriptors[core->page_hint].owner == cpu)
+			avail += HOMA_BPAGE_SIZE - core->allocated;
+	}
+	return avail;
 }

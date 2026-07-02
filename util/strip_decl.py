@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 
-# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ or GPL-2.0+
 
 """
 This script is used to make a copy of homa_impl.h that seletively omits
@@ -32,18 +32,17 @@ symbols = [
     ['peer',
         'int      homa_xmit_control('
     ],
-    ['pacer',
-        'void     homa_xmit_data('
-    ],
     ['rpc',
         'int      homa_message_in_init(',
         'void     homa_rpc_handoff(',
+        'void     homa_xmit_data('
     ],
     ['outgoing',
         'int      homa_fill_data_interleaved(',
         'int      homa_message_out_fill(',
         'void     homa_message_out_init(',
         'void     homa_resend_data(',
+        'int      homa_rpc_tx_end(',
         'struct sk_buff *homa_tx_data_pkt_alloc(',
         'int      __homa_xmit_control(',
         'void     __homa_xmit_data(',

@@ -1,5 +1,5 @@
 /* Copyright (c) 2019-2023 Homa Developers
- * SPDX-License-Identifier: BSD-1-Clause
+ * SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
  */
 
 /* This file defines the kernel contains information and supporting
@@ -79,6 +79,6 @@ class dist_point_gen {
 		{}
 	};
 
-	static struct weight w1[], w2[], w3[], w4[], w5[];
+	static struct weight w1[], w2[], w3[], w4[], w5[], starve[];
 };
 #endif /* _DIST_H */

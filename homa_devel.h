@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines functions that are useful during Homa development;
  * they are not present in the upstreamed version of Homa in Linux.
@@ -40,6 +40,38 @@ enum homa_freeze_type {
 	SLOW_RPC               = 3,
 	PACKET_LOST            = 4,
 	NEED_ACK_MISSING_DATA  = 5,
+};
+
+/**
+ * struct homa_rpc_snapshot - Captures the state of RPCs (both client and
+ * server) on a node at a given point in time.
+ */
+struct homa_rpc_snapshot {
+	/** @clock: homa_clock() value when data was gathered. */
+	u64 clock;
+
+	/* Each value below is the sum (across all cores) of the metric with
+	 * the same name.
+	 */
+	u64 client_requests_started;
+	u64 client_request_bytes_started;
+	u64 client_request_bytes_done;
+	u64 client_requests_done;
+
+	u64 client_responses_started;
+	u64 client_response_bytes_started;
+	u64 client_response_bytes_done;
+	u64 client_responses_done;
+
+	u64 server_requests_started;
+	u64 server_request_bytes_started;
+	u64 server_request_bytes_done;
+	u64 server_requests_done;
+
+	u64 server_responses_started;
+	u64 server_response_bytes_started;
+	u64 server_response_bytes_done;
+	u64 server_responses_done;
 };
 
 /**
@@ -94,11 +126,20 @@ void     homa_rpc_log(struct homa_rpc *rpc);
 void     homa_rpc_log_active(struct homa *homa, uint64_t id);
 void     homa_rpc_log_tt(struct homa_rpc *rpc);
 void     homa_rpc_log_active_tt(struct homa *homa, int freeze_count);
+void     homa_rpc_snapshot_log_tt(void);
+void     homa_rpc_stats_log(void);
+void     homa_snapshot_get_stats(struct homa_rpc_snapshot *snap);
+void     homa_snapshot_rpcs(void);
 int      homa_snprintf(char *buffer, int size, int used,
 		       const char *format, ...) __printf(4, 5);
 char    *homa_symbol_for_type(uint8_t type);
 char    *homa_symbol_for_state(struct homa_rpc *rpc);
 int      homa_validate_incoming(struct homa *homa, int verbose,
 				int *link_errors);
+
+#ifndef __STRIP__ /* See strip.py */
+bool     homa_rpcs_deferred(struct homa *homa);
+void     homa_validate_rbtree(struct rb_node *node, int depth, char *message);
+#endif /* See strip.py */
 
 #endif /* _HOMA_DEVEL_H */

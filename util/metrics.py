@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # Copyright (c) 2019-2023 Homa Developers
-# SPDX-License-Identifier: BSD-1-Clause
+# SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 """
 Reads Homa metrics from the kernel and prints out anything that is changed
@@ -123,7 +123,8 @@ for symbol in symbols:
         total_cur += core[symbol]
     total_prev = 0
     for core in prev:
-        total_prev += core[symbol]
+        if symbol in core:
+            total_prev += core[symbol]
     delta = total_cur - total_prev
     deltas[symbol] = delta
 
@@ -142,10 +143,10 @@ if len(prev) > 0:
     pad = pad.ljust(13)
     secs = "(%.1f s)" % (elapsed_secs)
     secs = secs.ljust(12)
-    print("%-28s %15d %s %s" % ("time_cycles", time_delta, secs,
+    print("%-30s %15d %s %s" % ("time_cycles", time_delta, secs,
             docs["time_cycles"]))
 else:
-    print("%-15s %28d %s%s" % ("time_cycles", cur[0]["time_cycles"],
+    print("%-17s %28d %s%s" % ("time_cycles", cur[0]["time_cycles"],
             "", docs["time_cycles"]))
 
 for symbol in symbols:
@@ -164,7 +165,7 @@ for symbol in symbols:
         if symbol.endswith("_cycles") and (time_delta != 0):
             percent = "(%.1f%%)" % (100.0*delta/time_delta)
             percent = percent.ljust(12)
-            print("%-28s %15d %s %s" % (symbol, delta, percent, doc))
+            print("%-30s %15d %s %s" % (symbol, delta, percent, doc))
         elif symbol.endswith("_queued") and (time_delta != 0):
             received = deltas[symbol[:-7] + "_received"]
             if received != 0:
@@ -172,35 +173,35 @@ for symbol in symbols:
             else:
                 percent = " "
             percent = percent.ljust(12)
-            print("%-28s %15d %s %s" % (symbol, delta, percent, doc))
+            print("%-30s %15d %s %s" % (symbol, delta, percent, doc))
         else:
-            print("%-28s %15d %s%s" % (symbol, delta, rate_info, doc))
+            print("%-30s %15d %s%s" % (symbol, delta, rate_info, doc))
             if symbol.startswith("packets_rcvd_"):
                 total_packets += delta
             if symbol == "softirq_calls":
                 gro_packets = delta
         if (symbol == "reaper_dead_skbs") and ("reaper_calls" in deltas):
-            print("%-28s          %6.1f %sAvg. hsk->dead_skbs in reaper" % (
+            print("%-30s          %6.1f %sAvg. hsk->dead_skbs in reaper" % (
                   "avg_dead_skbs", delta/deltas["reaper_calls"], pad))
         if symbol.endswith("_miss_cycles") and (time_delta != 0):
             prefix = symbol[:-12]
             if ((prefix + "_misses") in deltas) and (deltas[prefix + "_misses"] != 0):
                 ns = (delta/deltas[prefix + "_misses"])/(cpu_khz * 1e-06)
-                print("%-28s          %6.1f %sAvg. wait time per %s miss (ns)" % (
+                print("%-30s          %6.1f %sAvg. wait time per %s miss (ns)" % (
                     prefix + "_miss_delay", ns, pad, prefix))
     if (symbol == "large_msg_bytes") and (total_received_bytes != 0) \
             and (time_delta != 0):
         rate = float(total_received_bytes)/elapsed_secs
         rate_info = ("(%s/s) " % (scale_number(rate))).ljust(13)
-        print("%-28s %15d %s%s" % ("received_msg_bytes", total_received_bytes,
+        print("%-30s %15d %s%s" % ("received_msg_bytes", total_received_bytes,
                 rate_info, "Total bytes in all incoming messages"))
 if gro_packets != 0:
-    print("%-28s          %6.2f %sHoma packets per homa_softirq call" % (
+    print("%-30s          %6.2f %sHoma packets per homa_softirq call" % (
           "gro_benefit", float(total_packets)/float(gro_packets), pad))
 avg_grantable_rpcs = 0.0
 if ("grantable_rpcs_integral" in deltas) and (time_delta != 0):
     avg_grantable_rpcs = float(deltas["grantable_rpcs_integral"])/time_delta
-    print("%-28s          %6.2f %sAverage number of grantable incoming RPCs" % (
+    print("%-30s          %6.2f %sAverage number of grantable incoming RPCs" % (
           "avg_grantable_rpcs", avg_grantable_rpcs, pad))
 
 if elapsed_secs != 0:
@@ -221,8 +222,7 @@ if elapsed_secs != 0:
         for core in range(first_core, end_core):
             line += "  Core%-2d" % (core)
         print(line)
-        for where in ["napi", "softirq", "send", "recv", "reply",
-                "timer", "pacer"]:
+        for where in ["napi", "softirq", "send", "recv", "reply", "timer"]:
             if where == "softirq":
                 symbol = "linux_softirq_cycles"
             else:
@@ -332,7 +332,7 @@ if elapsed_secs != 0:
     if calls == 0:
         us_per = 0
     else:
-        us_per = (time/calls)/1000
+        us_per = (time/calls)/(cpu_khz*1e-3)
     print("")
     print("Polling in recv             %6.2f   %7.2f us/syscall" % (cores, us_per))
 
@@ -340,7 +340,7 @@ if elapsed_secs != 0:
     if calls == 0:
         us_per = 0
     else:
-        us_per = (deltas["skb_alloc_cycles"]/calls)/1000
+        us_per = (deltas["skb_alloc_cycles"]/calls)/(cpu_khz*1e-3)
     print("Skb allocation              %6.2f   %7.2f us/skb" % (
             deltas["skb_alloc_cycles"]/time_delta, us_per))
 
@@ -348,7 +348,7 @@ if elapsed_secs != 0:
     if calls == 0:
         us_per = 0
     else:
-        us_per = (deltas["skb_free_cycles"]/calls)/1000
+        us_per = (deltas["skb_free_cycles"]/calls)/(cpu_khz*1e-3)
     print("Skb freeing                 %6.2f   %7.2f us/skb" % (
             deltas["skb_free_cycles"]/time_delta, us_per))
 
@@ -402,36 +402,63 @@ if elapsed_secs != 0:
         print("GRO bypass for data packets:  %5.1f%%" % (data_bypass_percent))
         print("GRO bypass for grant packets: %5.1f%%" % (grant_bypass_percent))
 
+    pacer_bytes = deltas["pacer_homa_bytes"] + deltas["pacer_tcp_bytes"]
+    if pacer_bytes != 0:
+        print("\nPacer:")
+        print("--------")
+        if packets_sent > 0:
+            print("Homa packets sent:              %5.3f M/sec (%.1f %% of all Homa packets)" %
+                    (1e-6*deltas["pacer_homa_packets"]/elapsed_secs,
+                    100*deltas["pacer_homa_packets"]/packets_sent))
+        else:
+            print("Homa packets sent:              0.000 M/sec")
+        print("Homa throughput (inc. headers): %5.2f Gbps" %
+                (8e-9*deltas["pacer_homa_bytes"]/elapsed_secs))
+        qdisc_tcp_packets = deltas["qdisc_tcp_packets"]
+        if qdisc_tcp_packets != 0:
+            print("TCP packets sent:               %5.3f M/sec (%.1f %% of all TCP packets)" %
+                    (1e-6*deltas["pacer_tcp_packets"]/elapsed_secs,
+                    100*deltas["pacer_tcp_packets"]/qdisc_tcp_packets))
+        else:
+            print("TCP packets sent:               0.000 M/sec")
+        print("TCP throughput (inc. headers):  %5.2f Gbps" %
+                (8e-9*deltas["pacer_tcp_bytes"]/elapsed_secs))
+        print("Helper throughput (Homa + TCP): %5.2f Gbps  (%.1f%% of all pacer bytes)" %
+                (8e-9*deltas["pacer_help_bytes"]/elapsed_secs,
+                100*deltas["pacer_help_bytes"]/pacer_bytes))
+        backlog_secs = float(deltas["nic_backlog_cycles"])/(cpu_khz * 1000.0)
+        print("Active throughput:              %5.2f Gbps  (NIC backlogged %.1f%% of time)" % (
+                pacer_bytes*8e-09/backlog_secs, 100*backlog_secs/elapsed_secs))
+        xmit_secs = float(deltas["pacer_xmit_cycles"])/(cpu_khz * 1000.0)
+        print("Pacer thread duty cycle:        %5.1f %%" %
+                (100*deltas["pacer_cycles"]/time_delta))
+        print("Time xmitting packets:          %5.1f %%     (%.2f usec/packet)" %
+                (100*xmit_secs/elapsed_secs,
+                1e6*xmit_secs/(deltas["pacer_homa_packets"] +
+                deltas["pacer_tcp_packets"])))
+
     print("\nMiscellaneous:")
     print("--------------")
     if packets_received > 0:
-        print("Bytes/packet rcvd:    %6.0f" % (
+        print("Bytes/packet rcvd:      %6.0f" % (
                 total_received_bytes/packets_received))
-        print("Packets received:      %5.3f M/sec" % (
+        print("Packets received:        %5.3f M/sec" % (
                 1e-6*packets_received/elapsed_secs))
-        print("Packets sent:          %5.3f M/sec" % (
+        print("Packets sent:            %5.3f M/sec" % (
                 1e-6*packets_sent/elapsed_secs))
-        print("Core efficiency:       %5.3f M packets/sec/core "
+        print("Core efficiency:         %5.3f M packets/sec/core "
                 "(sent & received combined)" % (
                 1e-6*(packets_sent + packets_received)/elapsed_secs
                 /total_cores_used))
-        print("                      %5.2f  Gbps/core (goodput)" % (
+        print("                         %5.2f Gbps/core (goodput)" % (
                 8e-9*(total_received_bytes + float(deltas["sent_msg_bytes"]))
                 /(total_cores_used * elapsed_secs)))
-    if deltas["pacer_cycles"] != 0:
-        pacer_secs = float(deltas["pacer_cycles"])/(cpu_khz * 1000.0)
-        print("Pacer throughput:    %6.2f  Gbps (pacer output when pacer running)" % (
-                deltas["pacer_bytes"]*8e-09/pacer_secs))
-    if deltas["throttled_cycles"] != 0:
-        throttled_secs = float(deltas["throttled_cycles"])/(cpu_khz * 1000.0)
-        print("Throttled throughput: %5.2f  Gbps (pacer output when throttled)" % (
-                deltas["pacer_bytes"]*8e-09/throttled_secs))
     if deltas["skb_allocs"] != 0:
-        print("Skb alloc time:        %4.2f  usec/skb" % (
+        print("Skb alloc time:           %4.2f usec/skb" % (
                 float(deltas["skb_alloc_cycles"]) / (cpu_khz / 1000.0) /
                 deltas["skb_allocs"]))
     if deltas["skb_page_allocs"] != 0:
-        print("Skb page alloc time:  %5.2f  usec/skb" % (
+        print("Skb page alloc time:     %5.2f usec/page" % (
                 float(deltas["skb_page_alloc_cycles"]) / (cpu_khz / 1000.0) /
                 deltas["skb_page_allocs"]))
 
@@ -449,27 +476,27 @@ if elapsed_secs != 0:
             continue
         rate = float(deltas[symbol])/elapsed_secs
         rate_info = ("(%s/s) " % (scale_number(rate))).ljust(13)
-        print("%-28s %15d %s%s" % (symbol, deltas[symbol],
+        print("%-30s %15d %s%s" % (symbol, deltas[symbol],
                 rate_info, docs[symbol]))
-    for symbol in ["pacer_lost_cycles", "timer_reap_cycles",
-            "data_pkt_reap_cycles", "grant_lock_cycles"]:
+    for symbol in ["timer_reap_cycles", "data_pkt_reap_cycles",
+            "grant_lock_cycles"]:
         delta = deltas[symbol]
         if delta == 0 or time_delta == 0:
             continue
         percent = "(%.1f%%)" % (100.0*delta/time_delta)
         percent = percent.ljust(12)
-        print("%-28s %15d %s %s" % (symbol, delta, percent, docs[symbol]))
+        print("%-30s %15d %s %s" % (symbol, delta, percent, docs[symbol]))
 
     if deltas["throttle_list_adds"] > 0:
-        print("%-28s %15.1f              List traversals per throttle "
+        print("%-30s %15.1f              List traversals per throttle "
                 "list insert" % ("checks_per_throttle_insert",
                 deltas["throttle_list_checks"]/deltas["throttle_list_adds"]))
 
     if deltas["responses_received"] > 0:
-        print("%-28s %15.1f              ACK packets sent per 1000 client RPCs"
+        print("%-30s %15.1f              ACK packets sent per 1000 client RPCs"
                 % ("acks_per_krpc", 1000.0 * deltas["packets_sent_ACK"]
                 / deltas["responses_received"]))
 
     if avg_grantable_rpcs > 1.0:
-        print("%-28s          %6.2f %sAverage number of grantable incoming RPCs" % (
+        print("%-30s          %6.2f %sAverage number of grantable incoming RPCs" % (
               "avg_grantable_rpcs", avg_grantable_rpcs, pad))

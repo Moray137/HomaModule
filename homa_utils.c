@@ -1,19 +1,19 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file contains miscellaneous utility functions for Homa, such
  * as initializing and destroying homa structs.
  */
 
 #include "homa_impl.h"
-#include "homa_pacer.h"
 #include "homa_peer.h"
 #include "homa_rpc.h"
+
 #ifndef __STRIP__ /* See strip.py */
 #include "homa_grant.h"
+#include "homa_pacer.h"
+#include "homa_qdisc.h"
 #include "homa_skb.h"
-#endif /* See strip.py */
-
-#ifdef __STRIP__ /* See strip.py */
+#else /* See strip.py */
 #include "homa_stub.h"
 #endif /* See strip.py */
 
@@ -28,25 +28,33 @@
 int homa_init(struct homa *homa)
 {
 	int err;
+
 	IF_NO_STRIP(int i);
 
 	memset(homa, 0, sizeof(*homa));
 
 	atomic64_set(&homa->next_outgoing_id, 2);
+	homa->link_mbps = 25000;
 #ifndef __STRIP__ /* See strip.py */
-	homa->grant = homa_grant_alloc();
-	if (IS_ERR(homa->grant)) {
-		err = PTR_ERR(homa->grant);
-		homa->grant = NULL;
+	homa->qshared = homa_qdisc_shared_alloc();
+	if (IS_ERR(homa->qshared)) {
+		err = PTR_ERR(homa->qshared);
+		homa->qshared = NULL;
 		return err;
 	}
-#endif /* See strip.py */
 	homa->pacer = homa_pacer_alloc(homa);
 	if (IS_ERR(homa->pacer)) {
 		err = PTR_ERR(homa->pacer);
 		homa->pacer = NULL;
 		return err;
 	}
+	homa->grant = homa_grant_alloc(homa);
+	if (IS_ERR(homa->grant)) {
+		err = PTR_ERR(homa->grant);
+		homa->grant = NULL;
+		return err;
+	}
+#endif /* See strip.py */
 	homa->peertab = homa_peer_alloc_peertab();
 	if (IS_ERR(homa->peertab)) {
 		err = PTR_ERR(homa->peertab);
@@ -54,11 +62,8 @@ int homa_init(struct homa *homa)
 		return err;
 	}
 	homa->socktab = kmalloc(sizeof(*homa->socktab), GFP_KERNEL);
-	if (!homa->socktab) {
-		pr_err("%s couldn't create socktab: kmalloc failure",
-		       __func__);
+	if (!homa->socktab)
 		return -ENOMEM;
-	}
 	homa_socktab_init(homa->socktab);
 #ifndef __STRIP__ /* See strip.py */
 	err = homa_skb_init(homa);
@@ -138,11 +143,15 @@ void homa_destroy(struct homa *homa)
 		homa_grant_free(homa->grant);
 		homa->grant = NULL;
 	}
-#endif /* See strip.py */
 	if (homa->pacer) {
 		homa_pacer_free(homa->pacer);
 		homa->pacer = NULL;
 	}
+	if (homa->qshared) {
+		homa_qdisc_shared_free(homa->qshared);
+		homa->qshared = NULL;
+	}
+#endif /* See strip.py */
 	if (homa->peertab) {
 		homa_peer_free_peertab(homa->peertab);
 		homa->peertab = NULL;
@@ -163,7 +172,6 @@ void homa_destroy(struct homa *homa)
 int homa_net_init(struct homa_net *hnet, struct net *net, struct homa *homa)
 {
 	memset(hnet, 0, sizeof(*hnet));
-	hnet->net = net;
 	hnet->homa = homa;
 	hnet->prev_default_port = HOMA_MIN_DEFAULT_PORT - 1;
 	return 0;
@@ -230,6 +238,5 @@ void homa_spin(int ns)
 
 	end = homa_clock() + homa_ns_to_cycles(ns);
 	while (homa_clock() < end)
-		/* Empty loop body.*/
-		;
+		cpu_relax();
 }

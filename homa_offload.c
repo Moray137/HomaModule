@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file implements GSO (Generic Segmentation Offload) and GRO (Generic
  * Receive Offload) for Homa.
@@ -7,6 +7,7 @@
 #include "homa_impl.h"
 #include "homa_offload.h"
 #include "homa_pacer.h"
+#include "homa_qdisc.h"
 
 DEFINE_PER_CPU(struct homa_offload_core, homa_offload_core);
 
@@ -287,9 +288,9 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 	 *    gro_list by the caller, so it will be considered for merges
 	 *    in the future.
 	 */
+	struct homa *homa = homa_net(dev_net(skb->dev))->homa;
 	u64 saved_softirq_metric, softirq_cycles;
 	struct homa_offload_core *offload_core;
-	struct homa *homa = homa_from_skb(skb);
 	struct sk_buff *result = NULL;
 	struct homa_data_hdr *h_new;
 	u64 *softirq_cycles_metric;
@@ -467,6 +468,7 @@ struct sk_buff *homa_gro_receive(struct list_head *held_list,
 
 done:
 	homa_pacer_check(homa->pacer);
+	homa_qdisc_pacer_check(homa);
 	offload_core->last_gro = homa_clock();
 	return result;
 
@@ -506,8 +508,8 @@ void homa_gro_gen2(struct homa *homa, struct sk_buff *skb)
 	 */
 	struct homa_data_hdr *h =
 			(struct homa_data_hdr *)skb_transport_header(skb);
-	int this_core = smp_processor_id();
 	struct homa_offload_core *offload_core;
+	int this_core = smp_processor_id();
 	int candidate = this_core;
 	u64 now = homa_clock();
 	int i;
@@ -609,7 +611,7 @@ int homa_gro_complete(struct sk_buff *skb, int hoffset)
 {
 	struct homa_data_hdr *h =
 			(struct homa_data_hdr *)skb_transport_header(skb);
-	struct homa *homa = homa_from_skb(skb);
+	struct homa *homa = homa_net(dev_net(skb->dev))->homa;
 
 	// tt_record4("homa_gro_complete type %d, id %d, offset %d, count %d",
 	//		h->common.type, homa_local_id(h->common.sender_id),

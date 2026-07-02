@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #include "homa_peer.h"
@@ -20,7 +20,7 @@ FIXTURE(homa_utils) {
 FIXTURE_SETUP(homa_utils)
 {
 	homa_init(&self->homa);
-	self->hnet = mock_alloc_hnet(&self->homa);
+	self->hnet = mock_hnet(0, &self->homa);
 	mock_sock_init(&self->hsk, self->hnet, 0);
 	unit_log_clear();
 }
@@ -56,38 +56,28 @@ static void set_cutoffs(struct homa *homa, int c0, int c1, int c2,
 	homa->unsched_cutoffs[6] = c6;
 	homa->unsched_cutoffs[7] = c7;
 }
-#endif /* See strip.py */
 
-#ifndef __STRIP__ /* See strip.py */
-TEST_F(homa_utils, homa_init__grant_alloc_failure)
-{
-	struct homa homa2;
-
-	mock_kmalloc_errors = 1;
-	unit_log_clear();
-	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
-	EXPECT_SUBSTR("homa_grant_alloc couldn't allocate grant structure",
-		      mock_printk_output);
-	EXPECT_EQ(NULL, homa2.grant);
-	homa_destroy(&homa2);
-}
-#endif /* See strip.py */
 TEST_F(homa_utils, homa_init__pacer_alloc_failure)
 {
 	struct homa homa2;
 
-#ifndef __STRIP__ /* See strip.py */
-	mock_kmalloc_errors = 2;
-#else /* See strip.py */
 	mock_kmalloc_errors = 1;
-#endif/* See strip.py */
 	unit_log_clear();
 	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
-	EXPECT_SUBSTR("homa_pacer_alloc couldn't allocate homa_pacer struct",
-		      mock_printk_output);
 	EXPECT_EQ(NULL, homa2.pacer);
 	homa_destroy(&homa2);
 }
+TEST_F(homa_utils, homa_init__grant_alloc_failure)
+{
+	struct homa homa2;
+
+	mock_kmalloc_errors = 2;
+	unit_log_clear();
+	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
+	EXPECT_EQ(NULL, homa2.grant);
+	homa_destroy(&homa2);
+}
+#endif /* See strip.py */
 TEST_F(homa_utils, homa_init__peertab_alloc_failure)
 {
 	struct homa homa2;
@@ -95,12 +85,10 @@ TEST_F(homa_utils, homa_init__peertab_alloc_failure)
 #ifndef __STRIP__ /* See strip.py */
 	mock_kmalloc_errors = 4;
 #else /* See strip.py */
-	mock_kmalloc_errors = 2;
+	mock_kmalloc_errors = 1;
 #endif/* See strip.py */
 	unit_log_clear();
 	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
-	EXPECT_SUBSTR("homa_peer_alloc_peertab couldn't create peertab: kmalloc failure",
-		      mock_printk_output);
 	EXPECT_EQ(NULL, homa2.peertab);
 	homa_destroy(&homa2);
 }
@@ -109,14 +97,12 @@ TEST_F(homa_utils, homa_init__cant_allocate_port_map)
 	struct homa homa2;
 
 #ifndef __STRIP__ /* See strip.py */
-	mock_kmalloc_errors = 0x10;
+	mock_kmalloc_errors = 0x20;
 #else /* See strip.py */
-	mock_kmalloc_errors = 8;
+	mock_kmalloc_errors = 4;
 #endif/* See strip.py */
 	unit_log_clear();
 	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
-	EXPECT_SUBSTR("homa_init couldn't create socktab: kmalloc failure",
-		      mock_printk_output);
 	EXPECT_EQ(NULL, homa2.socktab);
 	homa_destroy(&homa2);
 }
@@ -125,7 +111,7 @@ TEST_F(homa_utils, homa_init__homa_skb_init_failure)
 {
 	struct homa homa2;
 
-	mock_kmalloc_errors = 0x20;
+	mock_kmalloc_errors = 0x40;
 	EXPECT_EQ(ENOMEM, -homa_init(&homa2));
 	EXPECT_SUBSTR("Couldn't initialize skb management (errno 12)",
 		      mock_printk_output);
@@ -146,7 +132,7 @@ TEST_F(homa_utils, homa_net_destroy__delete_sockets)
 	struct homa_sock hsk1, hsk2, hsk3;
 	struct homa_net *hnet;
 
-	hnet = mock_alloc_hnet(&self->homa);
+	hnet = mock_hnet(1, &self->homa);
 	mock_sock_init(&hsk1, hnet, 100);
 	mock_sock_init(&hsk2, hnet, 101);
 	mock_sock_init(&hsk3, self->hnet, 100);
@@ -165,7 +151,7 @@ TEST_F(homa_utils, homa_net_destroy__delete_peers)
 	struct homa_sock hsk2;
 	struct in6_addr addr;
 
-	hnet = mock_alloc_hnet(&self->homa);
+	hnet = mock_hnet(1, &self->homa);
 	mock_sock_init(&hsk2, hnet, 44);
 
 	addr = unit_get_in_addr("1.2.3.4");

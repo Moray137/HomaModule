@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-# A Switch object represent the top-of-rack switch for a CloudLab
+# A Switch object represents a Mellanox top-of-rack switch for a CloudLab
 # experiment, and it provides various operations on the switch such
 # as configuring ports and querying statistics such as maximum buffer
 # usage.
@@ -72,7 +72,7 @@ class Switch:
                 output += data
                 if re.search('Unrecognized command.*xyzzy.*help', output,
                         flags=re.DOTALL):
-                    return output;
+                    return output
             time.sleep(0.1)
 
     def get_max_buffer_usage(self):
@@ -80,7 +80,7 @@ class Switch:
         Return the maximum total buffer usage (across all egress ports).
         """
         output = self.do_cmd("show buffers pools ePool0")
-        match = re.search('.*ePool0\s+egress.*[0-9.]+M?\s+[0-9.]+M?\s+([0-9.]+)([MK]?)',
+        match = re.search(r'.*ePool0\s+egress.*[0-9.]+M?\s+[0-9.]+M?\s+([0-9.]+)([MK]?)',
                 output)
         if match:
             if match.group(2) == 'M':

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file various utility functions for unit testing; this file
  * is implemented entirely in C, and accesses Homa and kernel internals.
@@ -6,7 +6,6 @@
 
 #include "homa_impl.h"
 #include "homa_grant.h"
-#include "homa_pacer.h"
 #include "homa_peer.h"
 #include "homa_rpc.h"
 #include "ccutils.h"
@@ -14,6 +13,10 @@
 #include "kselftest_harness.h"
 #include "mock.h"
 #include "utils.h"
+
+#ifndef __STRIP__ /* See strip.py */
+#include "homa_pacer.h"
+#endif /* See strip.py */
 
 /**
  * unit_client_rpc() - Create a homa_client_rpc and arrange for it to be
@@ -48,7 +51,7 @@ struct homa_rpc *unit_client_rpc(struct homa_sock *hsk,
 	crpc = homa_rpc_alloc_client(hsk, &server_addr);
 	if (IS_ERR(crpc))
 		return NULL;
-	if (homa_message_out_fill(crpc, unit_iov_iter(NULL, req_length), 0)) {
+	if (homa_message_out_fill(crpc, unit_iov_iter(NULL, req_length), 0, 0)) {
 		homa_rpc_end(crpc);
 		return NULL;
 	}
@@ -262,7 +265,7 @@ void unit_log_message_out_packets(struct homa_message_out *message, int verbose)
  * unit_log_filled_skbs() - Append to the test log a human-readable description
  * of a list of packet buffers created by homa_fill_packets.
  * @skb:         First in list of sk_buffs to print; the list is linked
- *               using homa_next_skb.
+ *               using homa_skb_info->next_skb.
  * @verbose:     If non-zero, use homa_print_packet for each packet;
  *               otherwise use homa_print_packet_short.
  */
@@ -301,6 +304,7 @@ void unit_log_skb_list(struct sk_buff_head *packets, int verbose)
 	}
 }
 
+#ifndef __STRIP__ /* See strip.py */
 /**
  * unit_log_throttled() - Append to the test log information about all of
  * the messages in homa->throttle_rpcs.
@@ -317,21 +321,7 @@ void unit_log_throttled(struct homa *homa)
 				rpc->msgout.next_xmit_offset);
 	}
 }
-
-/**
- * unit_log_dead_peers() - Append to the test log the addresses of all
- * peers in peertab->dead_peers for @homa.
- * @homa:     Homa's overall state.
- */
-void unit_log_dead_peers(struct homa *homa)
-{
-	struct homa_peer *peer;
-
-	list_for_each_entry(peer, &homa->peertab->dead_peers, dead_links) {
-		unit_log_printf("; ", "%s",
-				homa_print_ipv6_addr(&peer->ht_key.addr));
-	}
-}
+#endif /* See strip.py */
 
 /**
  * unit_print_gaps() - Returns a static string describing the gaps in an RPC.
@@ -355,6 +345,21 @@ const char *unit_print_gaps(struct homa_rpc *rpc)
 					 ", time %llu", gap->time);
 	}
 	return buffer;
+}
+
+/**
+ * unit_reset_tx() - Reset the state of an RPC so that it appears no packets
+ * have been transmitted.
+ */
+void unit_reset_tx(struct homa_rpc *rpc)
+{
+	struct sk_buff *skb;
+
+	for (skb = rpc->msgout.packets; skb != NULL;
+	     skb = homa_get_skb_info(skb)->next_skb)
+		skb_dst_drop(skb);
+	rpc->msgout.next_xmit = &rpc->msgout.packets;
+	rpc->msgout.next_xmit_offset = 0;
 }
 
 /**
@@ -422,7 +427,7 @@ struct homa_rpc *unit_server_rpc(struct homa_sock *hsk,
 		return srpc;
 	homa_rpc_lock(srpc);
 	status = homa_message_out_fill(srpc, unit_iov_iter((void *) 2000,
-				       resp_length), 0);
+				       resp_length), 0, 0);
 	homa_rpc_unlock(srpc);
 	if (status != 0)
 		goto error;
@@ -460,6 +465,22 @@ struct iov_iter *unit_iov_iter(void *buffer, size_t length)
 	iovec.iov_base = buffer;
 	iovec.iov_len = length;
 	iov_iter_init(&iter, WRITE, &iovec, 1, length);
+	return &iter;
+}
+
+/**
+ * unit_bvec_iter() - Return an ITER_BVEC iov_iter over the given bio_vec
+ * array (kernel-memory iterator, e.g. for zero-copy TX tests).
+ * @bvecs:      Array of bio_vec entries describing the data.
+ * @nr_segs:    Number of entries in @bvecs.
+ * @length:     Total number of bytes across all entries.
+ */
+struct iov_iter *unit_bvec_iter(struct bio_vec *bvecs, unsigned long nr_segs,
+				size_t length)
+{
+	static struct iov_iter iter;
+
+	iov_iter_bvec(&iter, WRITE, bvecs, nr_segs, length);
 	return &iter;
 }
 

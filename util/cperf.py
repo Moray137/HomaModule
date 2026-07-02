@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # Copyright (c) 2020-2023 Homa Developers
-# SPDX-License-Identifier: BSD-1-Clause
+# SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 # This file contains library functions used to run cluster performance
 # tests for the Linux kernel implementation of Homa.
@@ -383,7 +383,7 @@ def init(options):
     vlog("Options: %s" % (s))
     vlog("Homa configuration (node%d):" % (options.nodes[0]))
     result = subprocess.run(['ssh', 'node%d' % (options.nodes[0]),
-            'sysctl', '-a'], capture_output=True, encoding="utf-8")
+            'sysctl', '-a'], capture_output=True, encoding="iso8859-1")
     if (result.returncode != 0):
         log("sysctl -a on node%d exited with status %d:" %
                 (options.nodes[0], result.returncode))
@@ -565,14 +565,15 @@ def do_ssh(command, nodes):
     for id in nodes:
         do_subprocess(["ssh", "node%d" % id] + command)
 
-def get_sysctl_parameter(name):
+def get_sysctl_parameter(name, node):
     """
     Retrieve the value of a particular system parameter using sysctl on
-    the current host, and return the value as a string.
+    the given node, and return the value as a string.
 
     name:      name of the desired configuration parameter
+    node:      node number on which the value should be retrieved
     """
-    output = do_subprocess(["sysctl", name])
+    output = do_subprocess(["ssh", "node%d" % node, "sysctl", name])
     match = re.match('.*= (.*)', output)
     if not match:
          raise Exception("Couldn't parse sysctl output: %s" % output)
@@ -746,6 +747,9 @@ def run_experiment(name, clients, options):
                     do_subprocess(["ssh", "node%d" % (id), "metrics.py"])
         if not "no_rtt_files" in options:
             do_cmd("dump_times /dev/null %s" % (name), clients)
+        if options.protocol == "homa" and options.tt_freeze:
+            log("Unfreezing timetraces on %s" % (nodes))
+            set_sysctl_parameter(".net.homa.action", "10", nodes)
         do_cmd("log Starting measurements for %s experiment" % (name),
                 server_nodes, clients)
         log("Starting measurements")
@@ -922,6 +926,9 @@ def run_experiments(*args):
             vlog("Initializing metrics")
             do_ssh(["metrics.py > /dev/null"], homa_nodes)
     do_cmd("dump_times /dev/null", all_nodes)
+    if homa_nodes and exp.tt_freeze:
+        log("Unfreezing timetraces on %s" % (all_nodes))
+        set_sysctl_parameter(".net.homa.action", "10", all_nodes)
     do_cmd("log Starting measurements", all_nodes)
     log("Starting measurements")
 
@@ -1444,15 +1451,18 @@ def get_digest(experiment):
     digests[experiment] = digest
     return digest
 
-def start_slowdown_plot(title, max_y, x_experiment, size=10,
+def start_plot_vs_msg_length(title, y_range, x_experiment, size=10,
         show_top_label=True, show_bot_label=True, figsize=[6,4],
         y_label="Slowdown", show_upper_x_axis=True):
     """
-    Create a pyplot graph that will be used for slowdown data. Returns the
-    Axes object for the plot.
+    Create a pyplot graph that will be used to display some value as a
+    function of message size, with the x-axis scaled so that distance
+    corresponds to cumulative number of messages.
 
     title:             Title for the plot; may be empty
-    max_y:             Maximum y-coordinate
+    y_range:           Either a single value giving maximum y-coordinate
+                       (min will be 1) or a list containing min and max
+                       values. The y-axis will be log-scale.
     x_experiment:      Name of experiment whose rtt distribution will be used to
                        label the x-axis of the plot. None means don't label the
                        x-axis (caller will presumably invoke cdf_xaxis to do it).
@@ -1470,11 +1480,16 @@ def start_slowdown_plot(title, max_y, x_experiment, size=10,
         ax.set_title(title, size=size)
     ax.set_xlim(0, 1.0)
     ax.set_yscale("log")
-    ax.set_ylim(1, max_y)
+    if isinstance(y_range, list):
+        min_y, max_y = y_range
+    else:
+        min_y = 1
+        max_y = y_range
+    ax.set_ylim(min_y, max_y)
     ax.tick_params(right=True, which="both", direction="in", length=5)
     ticks = []
     labels = []
-    y = 1
+    y = 10 ** (math.ceil(math.log10(min_y)))
     while y <= max_y:
         ticks.append(y)
         labels.append("%d" % (y))
@@ -1604,7 +1619,7 @@ def plot_slowdown(ax, experiment, percentile, label, **kwargs):
 
     ax:            matplotlib Axes object: info will be plotted here.
     experiment:    Name of the experiment whose data should be graphed.
-    percentile:    While percentile of slowdown to graph: must be "p50", "p99",
+    percentile:    Which percentile of slowdown to graph: must be "p50", "p99",
                    or "p999"
     label:         Text to display in the graph legend for this curve
     kwargs:        Additional keyword arguments to pass through to plt.plot
@@ -1623,6 +1638,23 @@ def plot_slowdown(ax, experiment, percentile, label, **kwargs):
     else:
         raise Exception("Bad percentile selector %s; must be p50, p99, or p999"
                 % (percentile))
+    ax.plot(x, y, label=label, **kwargs)
+
+def plot_histogram(ax, experiment, metric, label, **kwargs):
+    """
+    Add a histogram to a plot created by start_plot_vs_msg_length().
+
+    ax:            matplotlib Axes object: info will be plotted here.
+    experiment:    Name of the experiment whose data should be graphed.
+    percentile:    Metric from experiment to graph, such as "p50" for 50th
+                   percentile latency or "slow_99" for 99th percentile
+                   slowdown
+    label:         Text to display in the graph legend for this curve
+    kwargs:        Additional keyword arguments to pass through to plt.plot
+    """
+    digest = get_digest(experiment)
+    x, y = make_histogram(digest["cum_frac"], digest[metric],
+            init=[0, digest[metric][0]], after=False)
     ax.plot(x, y, label=label, **kwargs)
 
 def start_cdf_plot(title, min_x, max_x, min_y, x_label, y_label,

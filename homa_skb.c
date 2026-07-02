@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file contains functions for allocating and freeing sk_buffs for
  * outbound packets. In particular, this file implements efficient management
@@ -52,7 +52,7 @@ int homa_skb_init(struct homa *homa)
 		if (!homa->page_pools[numa]) {
 			struct homa_page_pool *pool;
 
-			pool = kmalloc(sizeof(*pool), GFP_ATOMIC | __GFP_ZERO);
+			pool = kzalloc(sizeof(*pool), GFP_ATOMIC);
 			if (!pool)
 				return -ENOMEM;
 			homa->page_pools[numa] = pool;
@@ -66,7 +66,7 @@ int homa_skb_init(struct homa *homa)
 /**
  * homa_skb_cleanup() - Invoked when a struct homa is deleted; cleans
  * up information related to skb allocation.
- * @homa:  Overall inforamtion about the Homa transport.
+ * @homa:  Overall information about the Homa transport.
  */
 void homa_skb_cleanup(struct homa *homa)
 {
@@ -112,7 +112,7 @@ void homa_skb_cleanup(struct homa *homa)
  *                function will allocate additional space for IP and
  *                Ethernet headers, as well as for the homa_skb_info.
  * Return:        New sk_buff, or NULL if there was insufficient memory.
- *                The sk_buff will be configured with so that the next
+ *                The sk_buff will be configured so that the next
  *                skb_put will be for the transport (Homa) header. The
  *                homa_skb_info is not initialized.
  */
@@ -121,9 +121,6 @@ struct sk_buff *homa_skb_alloc_tx(int length)
 	u64 start = homa_clock();
 	struct sk_buff *skb;
 
-	/* Note: allocate space for an IPv6 header, which is larger than
-	 * an IPv4 header.
-	 */
 	skb = alloc_skb(HOMA_SKB_EXTRA + sizeof(struct homa_skb_info) + length,
 			GFP_ATOMIC);
 	if (likely(skb)) {
@@ -323,8 +320,8 @@ success:
 int homa_skb_append_to_frag(struct homa *homa, struct sk_buff *skb, void *buf,
 			    int length)
 {
-	char *src = buf;
 	int chunk_length;
+	char *src = buf;
 	char *dst;
 
 	while (length > 0) {
@@ -363,6 +360,100 @@ int homa_skb_append_from_iter(struct homa *homa, struct sk_buff *skb,
 		if (copy_from_iter(dst, chunk_length, iter) != chunk_length)
 			return -EFAULT;
 		length -= chunk_length;
+	}
+	return 0;
+}
+
+/**
+ * homa_skb_append_from_iter_zerocopy() - Append data to an sk_buff by
+ * referencing the caller's pages directly (zero-copy) instead of copying.
+ * Works for any kernel-mode iov_iter (ITER_BVEC, ITER_KVEC, ITER_XARRAY) by
+ * extracting page references with iov_iter_extract_pages(). The caller must
+ * keep the underlying pages valid until the skb is freed; on free,
+ * homa_skb_free_many_tx() drops the references taken here via put_page()
+ * (foreign pages don't match the Homa page-pool reclaim test).
+ * @skb:      Append to this sk_buff.
+ * @iter:     Iterator describing the data; advanced by @length bytes on
+ *            success. Must not be user-backed (see homa_message_out_fill()).
+ * @length:   Number of bytes to append; iter must have at least this many.
+ * Return: 0 or a negative errno.
+ */
+int homa_skb_append_from_iter_zerocopy(struct sk_buff *skb,
+				       struct iov_iter *iter, int length)
+{
+	struct skb_shared_info *shinfo = skb_shinfo(skb);
+
+	while (length > 0) {
+		struct page *pages[16];
+		struct page **ppages = pages;
+		size_t offset;
+		ssize_t n;
+		int npages, i;
+
+		n = iov_iter_extract_pages(iter, &ppages, length,
+					   ARRAY_SIZE(pages), 0, &offset);
+		if (n < 0)
+			return n;
+		if (n == 0)
+			return -EFAULT;
+
+		npages = DIV_ROUND_UP(offset + n, PAGE_SIZE);
+
+		/* iov_iter_extract_pages() only pins (takes a reference on)
+		 * pages for user-backed iterators; for kernel-mode iters
+		 * (ITER_BVEC/ITER_KVEC/ITER_XARRAY) it returns the pages with
+		 * NO additional reference. homa_skb_free_many_tx(), however,
+		 * unconditionally put_page()s every foreign frag page, so take
+		 * a matching reference here. Without this the page refcount
+		 * underflows by one per transmit, eventually freeing a
+		 * still-in-use page (manifests as "BUG: Bad page state" with a
+		 * negative refcount, often discovered on an unrelated RX path).
+		 */
+		if (!user_backed_iter(iter)) {
+			for (i = 0; i < npages; i++)
+				get_page(ppages[i]);
+		}
+
+		for (i = 0; i < npages; i++) {
+			int chunk = min_t(size_t, n, PAGE_SIZE - offset);
+
+			/* Coalesce with last frag if this page is
+			 * physically contiguous (e.g. compound page
+			 * sub-pages). This matches non-ZC's behavior
+			 * of extending frags within a compound page.
+			 */
+			if (shinfo->nr_frags > 0 && offset == 0) {
+				skb_frag_t *last =
+					&shinfo->frags[shinfo->nr_frags - 1];
+				unsigned int last_end = skb_frag_off(last) +
+							skb_frag_size(last);
+
+				if (!(last_end & (PAGE_SIZE - 1)) &&
+				    ppages[i] == skb_frag_page(last) +
+						(last_end >> PAGE_SHIFT)) {
+					skb_frag_size_add(last, chunk);
+					skb->len += chunk;
+					skb->data_len += chunk;
+					put_page(ppages[i]);
+					length -= chunk;
+					n -= chunk;
+					continue;
+				}
+			}
+
+			if (shinfo->nr_frags >= HOMA_MAX_SKB_FRAGS) {
+				for (; i < npages; i++)
+					put_page(ppages[i]);
+				return -EINVAL;
+			}
+			skb_fill_page_desc(skb, shinfo->nr_frags, ppages[i],
+					   offset, chunk);
+			skb->len += chunk;
+			skb->data_len += chunk;
+			length -= chunk;
+			n -= chunk;
+			offset = 0;
+		}
 	}
 	return 0;
 }
@@ -470,7 +561,7 @@ void homa_skb_free_many_tx(struct homa *homa, struct sk_buff **skbs, int count)
 			/* This sk_buff is still in use somewhere, so can't
 			 * reclaim its pages.
 			 */
-			kfree_skb(skb);
+			consume_skb(skb);
 			continue;
 		}
 
@@ -492,7 +583,7 @@ void homa_skb_free_many_tx(struct homa *homa, struct sk_buff **skbs, int count)
 			}
 		}
 		shinfo->nr_frags = 0;
-		kfree_skb(skb);
+		consume_skb(skb);
 	}
 	if (num_pages > 0)
 		homa_skb_cache_pages(homa, pages_to_cache, num_pages);

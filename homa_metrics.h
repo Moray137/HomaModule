@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file contains declarations related to Homa's performance metrics.  */
 
@@ -48,6 +48,113 @@ struct homa_metrics {
 	 * messages too large to be counted by medium_msg_bytes.
 	 */
 	u64 large_msg_bytes;
+
+	/**
+	 * @client_requests_started: cumulative count of all client RPCs
+	 * that have been initiated on this node.
+	 */
+	u64 client_requests_started;
+
+	/**
+	 * @client_request_bytes_started: total number of bytes in the
+	 * request messages for all client RPCs that have been initiated on
+	 * this node.
+	 */
+	u64 client_request_bytes_started;
+
+	/**
+	 * @client_request_bytes_done: total number of bytes in request
+	 * messages that no longer need to be transmitted (for the first time)
+	 * either because they were transmitted or because the RPC was aborted.
+	 * Always <= client_request_bytes_started.
+	 */
+	u64 client_request_bytes_done;
+
+	/**
+	 * @client_requests_done: cumulative count of all client RPCs
+	 * whose request messages have been completely transmitted (or the RPC
+	 * was aborted).
+	 */
+	u64 client_requests_done;
+
+	/**
+	 * @client_responses_started: cumulative count of all client RPCs
+	 * for which at least one packet of the response has been received.
+	 */
+	u64 client_responses_started;
+
+	/**
+	 * @client_response_bytes_started: total number of bytes in
+	 * response messages for client RPCs for which at least one byte
+	 * of response has been received.
+	 */
+	u64 client_response_bytes_started;
+
+	/**
+	 * @client_response_bytes_done: cumulative count of bytes in
+	 * @client_response_bytes_started that no longer need to be received
+	 * (either they were received or the RPC was aborted).
+	 */
+	u64 client_response_bytes_done;
+
+	/**
+	 * @client_responses_done: cumulative count of all client RPCs
+	 * that have been completed on this node (either successfully or
+	 * with errors).
+	 */
+	u64 client_responses_done;
+
+	/**
+	 * @server_requests_started: cumulative count of all server RPCs
+	 * for which at least one packet of the request has been received.
+	 */
+	u64 server_requests_started;
+
+	/**
+	 * @server_request_bytes_started: total number of bytes in the
+	 * request messages for server RPCs counted by @server_reuqests_started.
+	 */
+	u64 server_request_bytes_started;
+
+	/**
+	 * @server_request_bytes_done: total number of bytes in
+	 * @server_request_bytes_started that no longer need to be received
+	 * (either they were received or the RPC was aborted).
+	 */
+	u64 server_request_bytes_done;
+
+	/**
+	 * @server_requests_done: cumulative count of all server RPCs
+	 * whose request messages have been completely received (or the RPC
+	 * was aborted).
+	 */
+	u64 server_requests_done;
+
+	/**
+	 * @server_responses_started: cumulative count of all server RPCs
+	 * for which transmission of the response has begun.
+	 */
+	u64 server_responses_started;
+
+	/**
+	 * @server_response_bytes_started: total number of bytes in
+	 * the messages counted by @server_responses_started.
+	 */
+	u64 server_response_bytes_started;
+
+	/**
+	 * @server_response_bytes_done: total number of bytes in
+	 * @server_response_bytes_started that no longer need to be transmitted
+	 * (either they were transmitted at least once or the RPC was aborted).
+	 */
+	u64 server_response_bytes_done;
+
+	/**
+	 * @server_responses_done: total number of server RPCS in
+	 * @server_requests_started that are no longer active (either the
+	 * response was completely sent or the RPC was aborted).
+	 */
+	u64 server_responses_done;
 
 	/**
 	 * @sent_msg_bytes: The total number of bytes in outbound
@@ -115,15 +222,15 @@ struct homa_metrics {
 	u64 wait_none;
 
 	/**
-	 * @wait_fast: total number of times that a message arrived for
-	 * a receiving thread while it was polling (i.e. the message
-	 * wasn't immediately available, but the thread never blocked).
+	 * @wait_fast: total number of times that a thread received an
+	 * incoming message while polling (i.e. the message wasn't
+	 * immediately available, but the thread never blocked).
 	 */
 	u64 wait_fast;
 
 	/**
-	 * @wait_block: total number of times that a thread blocked at
-	 * least once while waiting for an incoming message.
+	 * @wait_block: total number of times that a thread received an
+	 * incoming message after blocking at least once.
 	 */
 	u64 wait_block;
 
@@ -261,42 +368,74 @@ struct homa_metrics {
 	u64 data_pkt_reap_cycles;
 
 	/**
-	 * @pacer_cycles: total time spent executing in homa_pacer_main
-	 * (not including blocked time).
+	 * @idle_time_conflicts: total number of times that an update to
+	 * link_idle_time in homa_qdisc_update_link_idle failed because
+	 * of a conflicting access.
+	 */
+	__u64 idle_time_conflicts;
+
+	/**
+	 * @nic_backlog_cycles: total amount of time when there were packets
+	 * waiting to be transmitted in homa_qdisc because the NIC queue was
+	 * too long.
+	 */
+	u64 nic_backlog_cycles;
+
+	/**
+	 * @pacer_cycles: total execution time in the pacer thread (excluding
+	 * blocked time).
 	 */
 	u64 pacer_cycles;
 
 	/**
-	 * @pacer_lost_cycles: unnecessary delays in transmitting packets
-	 * (i.e. wasted output bandwidth) because the pacer was slow or got
-	 * descheduled.
+	 * @pacer_xmit_cycles: total time spent by the pacer actually
+	 * transmitting packets (as opposed to polling waiting for the
+	 * NIC queue to subside).
 	 */
-	u64 pacer_lost_cycles;
+	u64 pacer_xmit_cycles;
 
 	/**
-	 * @pacer_bytes: total number of bytes transmitted when
-	 * @homa->throttled_rpcs is nonempty.
+	 * @pacer_homa_packets: total number of Homa packets that were
+	 * transmitted by homa_qdisc_pacer (they were deferred because of
+	 * NIC queue overload).
 	 */
-	u64 pacer_bytes;
+	u64 pacer_homa_packets;
 
 	/**
-	 * @pacer_skipped_rpcs: total number of times that the pacer had to
-	 * abort because it couldn't lock an RPC.
+	 * @pacer_homa_bytes: total number of bytes in Homa packets that were
+	 * transmitted by homa_qdisc_pacer (they were deferred because of
+	 * NIC queue overload).
 	 */
-	u64 pacer_skipped_rpcs;
+	u64 pacer_homa_bytes;
 
 	/**
-	 * @pacer_needed_help: total number of times that homa_check_pacer
-	 * found that the pacer was running behind, so it actually invoked
-	 * homa_pacer_xmit.
+	 * @pacer_tcp_packets: total number of TCP packets that were
+	 * transmitted by homa_qdisc_pacer (they were deferred because of
+	 * NIC queue overload).
 	 */
-	u64 pacer_needed_help;
+	u64 pacer_tcp_packets;
 
 	/**
-	 * @throttled_cycles: total amount of time that @homa->throttled_rpcs
-	 * is nonempty.
+	 * @pacer_tcp_bytes: total number of bytes in TCP packets that were
+	 * transmitted by homa_qdisc_pacer (they were deferred because of
+	 * NIC queue overload).
 	 */
-	u64 throttled_cycles;
+	u64 pacer_tcp_bytes;
+
+	/**
+	 * @pacer_help_bytes: bytes that the pacer transmitted via calls to
+	 * homa_qdisc_pacer_check (presumably because the pacer thread
+	 * wasn't keeping up). Includes both TCP and Homa packets as well as
+	 * header bytes.
+	 */
+	u64 pacer_help_bytes;
+
+	/**
+	 * @qdisc_tcp_packets: total number of TCP packets that passed through
+	 * homa_qdisc; includes packets that were transmitted immediately as
+	 * well as those that were deferred.
+	 */
+	u64 qdisc_tcp_packets;
 
 	/**
 	 * @resent_packets: total number of data packets issued in response to
@@ -325,8 +464,9 @@ struct homa_metrics {
 	u64 peer_route_errors;
 
 	/**
-	 * @peer_dst_refreshes: total number of times that homa_dst_refresh
-	 * was called to update an obsolete dst for a peer.
+	 * @peer_dst_refreshes: total number of times that the dst for a
+	 * peer had to be regenerated because the existing one had become
+	 * obsolete.
 	 */
 	u64 peer_dst_refreshes;
 
@@ -515,17 +655,10 @@ struct homa_metrics {
 	u64 grant_priority_bumps;
 
 	/**
-	 * @fifo_grants: total number of times that grants were sent to
-	 * the oldest message.
+	 * @fifo_grant_bytes: total number of bytes of grants issued via
+	 * the FIFO granting mechanism
 	 */
-	u64 fifo_grants;
-
-	/**
-	 * @fifo_grants_no_incoming: total number of times that, when a
-	 * FIFO grant was issued, the message had no outstanding grants
-	 * (everything granted had been received).
-	 */
-	u64 fifo_grants_no_incoming;
+	u64 fifo_grant_bytes;
 
 	/**
 	 * @disabled_reaps: total number of times that the reaper couldn't
@@ -550,6 +683,13 @@ struct homa_metrics {
 	 * reaper_calls is incremented.
 	 */
 	u64 reaper_dead_skbs;
+
+	/**
+	 * @reaper_active_skbs: total number of times homa_rpc_reap had to skip
+	 * an RPC because one of its tx skb's was still in the transmit
+	 * pipeline.
+	 */
+	u64 reaper_active_skbs;
 
 	/**
 	 * @throttle_list_adds: total number of calls to homa_add_to_throttled.
@@ -696,7 +836,7 @@ static inline struct homa_metrics *homa_metrics_per_cpu(void)
 
 extern struct homa_metrics_output homa_mout;
 
-void     homa_metric_append(const char *format, ...);
+void     homa_metric_append(const char *name, u64 value, const char *format, ...);
 void     homa_metrics_end(void);
 int      homa_metrics_init(void);
 loff_t   homa_metrics_lseek(struct file *file, loff_t offset,

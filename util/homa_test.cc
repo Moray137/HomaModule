@@ -1,5 +1,5 @@
 /* Copyright (c) 2019-2022 Homa Developers
- * SPDX-License-Identifier: BSD-1-Clause
+ * SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
  */
 
 // This file contains a collection of tests for the Linux implementation
@@ -48,7 +48,11 @@ char *buf_region;
 /* Either AF_INET or AF_INET6: indicates whether to use IPv6 instead of IPv4. */
 int inet_family = AF_INET;
 
-/* Control blocks for receiving messages. */
+/* Control blocks for receiving messages. Reusing the same
+ * homa_recvmsg_args causes receive buffers to be returned to Homa
+ * automatically. Each call to recvmsg returns the buffers from the
+ * previous call.
+ */
 struct homa_recvmsg_args recv_args;
 struct msghdr recv_hdr;
 
@@ -895,12 +899,15 @@ void test_udpclose()
 	}
 }
 
-/* Receive one message every second. */
+/* Receive one message every second. After a few messages have been
+ * received, shut down the socket to make sure that the wmem waiting
+ * mechanism aborts properly.
+ */
 void recv_slow(int fd)
 {
 	int status;
 
-	while (1) {
+	for (int i = 0; i < 15; i++) {
 		sleep(1);
 		recv_args.id = 0;
 		recv_hdr.msg_controllen = sizeof(recv_args);
@@ -909,8 +916,10 @@ void recv_slow(int fd)
 			printf("Receiver exiting: %s\n", strerror(errno));
 			return;
 		}
-		printf("Received response with %d bytes\n", status);
+		printf("Received response %d with %d bytes\n", i, status);
 	}
+	printf("Receiver shutting down socket\n");
+	shutdown(fd, 0);
 }
 
 /**
@@ -932,7 +941,7 @@ void test_wmem(int fd, const sockaddr_in_union *dest, char *request)
 
 	iov.iov_base = request;
 	iov.iov_len = length;
-	for ( ; count > 0; count--) {
+	for (int i = 0; i < count; i++) {
 		init_sendmsg_hdrs(&msghdr, &homa_args, &iov, 1, &dest->sa,
 				sockaddr_size(&dest->sa));
 		status = sendmsg(fd, &msghdr, 0);
@@ -940,14 +949,15 @@ void test_wmem(int fd, const sockaddr_in_union *dest, char *request)
 			printf("Error in sendmsg: %s\n", strerror(errno));
 			break;
 		}
-		printf("Sent request with %d bytes\n", length);
+		printf("Sent request %d with %d bytes\n", i, length);
 	}
+	printf("Sender shutting down socket\n");
 	shutdown(fd, 0);
 	thread.join();
 }
 
 /**
- * test_wmem() - Use two threads, a sender and a receiver, and make the
+ * test_wmem_poll() - Use two threads, a sender and a receiver, and make the
  * receiver go so slowly that the sender uses up all available tx packet
  * memory and blocks. On the sender, use poll to wait for tx packet memory.
  * @fd:       Homa socket.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file handles timing-related functions for Homa, such as retries
  * and timeouts.
@@ -25,13 +25,14 @@
  * @rpc:     RPC to check; must be locked by the caller.
  */
 void homa_timer_check_rpc(struct homa_rpc *rpc)
-	__must_hold(&rpc->bucket->lock)
+	__must_hold(rpc->bucket->lock)
 {
 	struct homa *homa = rpc->hsk->homa;
+	int tx_end = homa_rpc_tx_end(rpc);
 
 	/* See if we need to request an ack for this RPC. */
 	if (!homa_is_client(rpc->id) && rpc->state == RPC_OUTGOING &&
-	    rpc->msgout.next_xmit_offset >= rpc->msgout.length) {
+	    tx_end == rpc->msgout.length) {
 		if (rpc->done_timer_ticks == 0) {
 			rpc->done_timer_ticks = homa->timer_ticks;
 		} else {
@@ -76,9 +77,9 @@ void homa_timer_check_rpc(struct homa_rpc *rpc)
 
 	if (rpc->state == RPC_OUTGOING) {
 #ifndef __STRIP__ /* See strip.py */
-		if (rpc->msgout.next_xmit_offset < rpc->msgout.granted) {
+		if (tx_end < rpc->msgout.granted) {
 #else /* See strip.py */
-		if (rpc->msgout.next_xmit_offset < rpc->msgout.length) {
+		if (tx_end < rpc->msgout.length) {
 #endif /* See strip.py */
 			/* There are granted bytes that we haven't transmitted,
 			 * so no need to be concerned; the ball is in our court.
@@ -123,23 +124,17 @@ void homa_timer_check_rpc(struct homa_rpc *rpc)
 void homa_timer(struct homa *homa)
 {
 	struct homa_socktab_scan scan;
+	struct homa_sock *hsk;
+	struct homa_rpc *rpc;
+	int rpc_count = 0;
 #ifndef __STRIP__ /* See strip.py */
 	static u64 prev_grant_count;
 	int total_incoming_rpcs = 0;
 	int sum_incoming_rec = 0;
-#endif /* See strip.py */
-	struct homa_sock *hsk;
-#ifndef __STRIP__ /* See strip.py */
 	static int zero_count;
-#endif /* See strip.py */
-	struct homa_rpc *rpc;
-#ifndef __STRIP__ /* See strip.py */
 	int sum_incoming = 0;
-	u64 total_grants;
-#endif /* See strip.py */
 	int total_rpcs = 0;
-	int rpc_count = 0;
-#ifndef __STRIP__ /* See strip.py */
+	u64 total_grants;
 	cycles_t start;
 	cycles_t end;
 	int core;
@@ -156,11 +151,15 @@ void homa_timer(struct homa *homa)
 		total_grants += m->packets_sent[GRANT - DATA];
 	}
 
-	tt_record4("homa_timer found total_incoming %d, num_grantable_rpcs %d, num_active_rpcs %d, new grants %d",
-		   atomic_read(&homa->grant->total_incoming),
-		   homa->grant->num_grantable_rpcs,
-		   homa->grant->num_active_rpcs,
-		   total_grants - prev_grant_count);
+	if (atomic_read(&homa->grant->total_incoming) != 0 ||
+	    homa->grant->num_grantable_rpcs != 0 ||
+	    homa->grant->num_active_rpcs != 0 ||
+	    total_grants - prev_grant_count != 0)
+		tt_record4("homa_timer found total_incoming %d, num_grantable_rpcs %d, num_active_rpcs %d, new grants %d",
+			   atomic_read(&homa->grant->total_incoming),
+			   homa->grant->num_grantable_rpcs,
+			   homa->grant->num_active_rpcs,
+			   total_grants - prev_grant_count);
 	if (total_grants == prev_grant_count &&
 	    homa->grant->num_grantable_rpcs > 20) {
 		zero_count++;
@@ -203,7 +202,8 @@ void homa_timer(struct homa *homa)
 			continue;
 		rcu_read_lock();
 		list_for_each_entry_rcu(rpc, &hsk->active_rpcs, active_links) {
-			total_rpcs++;
+			IF_NO_STRIP(total_rpcs++);
+
 			homa_rpc_lock(rpc);
 			if (rpc->state == RPC_IN_SERVICE) {
 				rpc->silent_ticks = 0;
@@ -237,13 +237,15 @@ void homa_timer(struct homa *homa)
 	}
 	homa_socktab_end_scan(&scan);
 #ifndef __STRIP__ /* See strip.py */
-	tt_record4("homa_timer found %d incoming RPCs, incoming sum %d, rec_sum %d, homa->total_incoming %d",
-		   total_incoming_rpcs, sum_incoming, sum_incoming_rec,
-		   atomic_read(&homa->grant->total_incoming));
+	if (total_incoming_rpcs > 0)
+		tt_record4("homa_timer found %d incoming RPCs, incoming sum %d, rec_sum %d, homa->total_incoming %d",
+			   total_incoming_rpcs, sum_incoming, sum_incoming_rec,
+			   atomic_read(&homa->grant->total_incoming));
 #endif /* See strip.py */
 	homa_skb_release_pages(homa);
 	homa_peer_gc(homa->peertab);
 #ifndef __STRIP__ /* See strip.py */
+	homa_snapshot_rpcs();
 	end = homa_clock();
 	INC_METRIC(timer_cycles, end - start);
 #endif /* See strip.py */

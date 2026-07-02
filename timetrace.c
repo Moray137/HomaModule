@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 
@@ -92,10 +92,6 @@ int tt_pf_storage = TT_PF_BUF_SIZE;
 /* Set during tests to disable "cpu_khz" line in trace output. */
 bool tt_test_no_khz;
 
-#ifdef __UNIT_TEST__
-unsigned int cpu_khz = 1000000;
-#endif
-
 /**
  * tt_init(): Enable time tracing, create /proc file for reading traces.
  * @proc_file: Name of a file in /proc; this file can be read to extract
@@ -118,10 +114,8 @@ int tt_init(char *proc_file)
 		struct tt_buffer *buffer;
 
 		buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
-		if (!buffer) {
-			pr_err("%s couldn't allocate tt_buffers\n", __func__);
+		if (!buffer)
 			goto error;
-		}
 		memset(buffer, 0, sizeof(*buffer));
 		tt_buffers[i] = buffer;
 	}
@@ -233,8 +227,20 @@ void tt_freeze(void)
 	 */
 	if (atomic_xchg(&tt_frozen, 1) == 0) {
 		tt_record("timetrace frozen");
-		pr_notice("%s invoked\n", __func__);
 		atomic_inc(&tt_freeze_count);
+		pr_err("%s invoked\n", __func__);
+	}
+}
+
+/**
+ * tt_unfreeze() - Release any freeze that may be in effect: normal
+ * timetrace recording will resume if it had stopped.
+ */
+void tt_unfreeze(void)
+{
+	pr_err("%s invoked\n", __func__);
+	if (atomic_xchg(&tt_frozen, 0) == 1) {
+		atomic_dec(&tt_freeze_count);
 	}
 }
 
@@ -262,6 +268,7 @@ void tt_record_buf(struct tt_buffer *buffer, u64 timestamp,
 		   u32 arg3)
 {
 	struct tt_event *event;
+	int index;
 
 	if (unlikely(atomic_read(&tt_freeze_count) > 0)) {
 		// In order to ensure that reads produce consistent
@@ -270,13 +277,14 @@ void tt_record_buf(struct tt_buffer *buffer, u64 timestamp,
 		return;
 	}
 
-	event = &buffer->events[buffer->next_index];
-	buffer->next_index = (buffer->next_index + 1)
-#ifdef __UNIT_TEST__
-		& (tt_buffer_size - 1);
-#else /* __UNIT_TEST__ */
-		& (TT_BUF_SIZE - 1);
-#endif /* __UNIT_TEST__ */
+	/* Even though there is a separate tt buffer for each core, we
+	 * still have to use an atomic operation to update next_index,
+	 * because an interrupt could occur while executing this function.
+	 * Before the atomic increment was added, tt entries were occasionally
+	 * lost.
+	 */
+	index = atomic_fetch_inc_relaxed(&buffer->next_index) & TT_BUF_MASK;
+	event = &buffer->events[index];
 
 	event->timestamp = timestamp;
 	event->format = format;
@@ -311,8 +319,8 @@ u64 tt_find_oldest(int *pos)
 		if (!buffer->events[tt_buffer_size - 1].format) {
 			pos[i] = 0;
 		} else {
-			int index = (buffer->next_index + 1)
-					& (tt_buffer_size - 1);
+			int index = (atomic_read(&buffer->next_index) + 1)
+					& TT_BUF_MASK;
 			struct tt_event *event = &buffer->events[index];
 
 			pos[i] = index;
@@ -325,10 +333,13 @@ u64 tt_find_oldest(int *pos)
 	 * sure that there's no missing data in what we print.
 	 */
 	for (i = 0; i < nr_cpu_ids; i++) {
+		int next;
+
 		buffer = tt_buffers[i];
+		next = tt_get_buf_index(buffer);
 		while (buffer->events[pos[i]].timestamp < start_time &&
-		       pos[i] != buffer->next_index) {
-			pos[i] = (pos[i] + 1) & (tt_buffer_size - 1);
+		       pos[i] != next) {
+			pos[i] = (pos[i] + 1) & TT_BUF_MASK;
 		}
 	}
 	return start_time;
@@ -367,7 +378,7 @@ int tt_proc_open(struct inode *inode, struct file *file)
 
 	if (!tt_test_no_khz) {
 		pf->bytes_available = snprintf(pf->msg_storage, TT_PF_BUF_SIZE,
-					       "cpu_khz: %u\n", cpu_khz);
+					       "cpu_khz: %u\n", tsc_khz);
 	}
 
 done:
@@ -424,7 +435,7 @@ ssize_t tt_proc_read(struct file *file, char __user *user_buf,
 			struct tt_buffer *buffer = tt_buffers[i];
 
 			event = &buffer->events[pf->pos[i]];
-			if (pf->pos[i] != buffer->next_index &&
+			if (pf->pos[i] != tt_get_buf_index(buffer) &&
 			    event->timestamp < earliest_time) {
 				current_core = i;
 				earliest_time = event->timestamp;
@@ -547,7 +558,7 @@ int tt_proc_release(struct inode *inode, struct file *file)
 				struct tt_buffer *buffer = tt_buffers[i];
 
 				buffer->events[tt_buffer_size - 1].format = NULL;
-				buffer->next_index = 0;
+				atomic_set(&buffer->next_index, 0);
 			}
 		}
 		atomic_dec(&tt_freeze_count);
@@ -607,7 +618,7 @@ void tt_print_file(char *path)
 
 	bytes_used += snprintf(buffer + bytes_used,
 			sizeof(buffer) - bytes_used,
-			"cpu_khz: %u\n", cpu_khz);
+			"cpu_khz: %u\n", tsc_khz);
 
 	/* Each iteration of this loop printk's one event. */
 	while (true) {
@@ -621,7 +632,7 @@ void tt_print_file(char *path)
 			struct tt_buffer *buffer = tt_buffers[i];
 
 			event = &buffer->events[pos[i]];
-			if (pos[i] != buffer->next_index &&
+			if (pos[i] != tt_get_buf_index(buffer) &&
 			    event->timestamp < earliest_time) {
 				current_core = i;
 				earliest_time = event->timestamp;
@@ -703,6 +714,7 @@ void tt_printk(void)
 	 */
 	static int pos[NR_CPUS];
 	u64 start_time;
+	int events;
 	int i;
 
 	if (atomic_xchg(&active, 1)) {
@@ -712,15 +724,18 @@ void tt_printk(void)
 	if (!init)
 		return;
 	atomic_inc(&tt_freeze_count);
+	pr_err("Dumping timetrace on core %d\n", raw_smp_processor_id());
 	start_time = tt_find_oldest(oldest);
+	events = 0;
 	for (i = 0; i < nr_cpu_ids; i++) {
-		if (oldest[i] == tt_buffers[i]->next_index)
+		if (oldest[i] == tt_get_buf_index(tt_buffers[i]))
 			pos[i] = -1;
 		else
-			pos[i] = (tt_buffers[i]->next_index - 1) &
-			         (tt_buffer_size - 1);
+			pos[i] = (atomic_read(&tt_buffers[i]->next_index) - 1) &
+			         TT_BUF_MASK;
 	}
 
+#if 0
 	/* Limit the number of entries logged per core (logging too many
 	 * seems to cause entries to be lost).
 	 */
@@ -728,8 +743,9 @@ void tt_printk(void)
 		if (((pos[i] - oldest[i]) & (TT_BUF_SIZE - 1)) > 200)
 			oldest[i] = (pos[i] - 200) & (TT_BUF_SIZE - 1);
 	}
+#endif
 
-	pr_err("cpu_khz: %u, start: %llu\n", cpu_khz, start_time);
+	pr_err("cpu_khz: %u, start: %llu\n", tsc_khz, start_time);
 
 	/* Each iteration of this loop printk's one event. */
 	while (true) {
@@ -766,8 +782,9 @@ void tt_printk(void)
 		pr_err("%lu [C%02d] %s\n",
 			  (unsigned long)event->timestamp,
 			  current_core, msg);
+		events++;
 	}
-	pr_err("Finished dumping timetrace to syslog\n");
+	pr_err("Finished dumping %d timetrace events to syslog\n", events);
 
 	atomic_dec(&tt_freeze_count);
 	atomic_set(&active, 0);
@@ -807,7 +824,7 @@ void tt_get_messages(char *buffer, size_t length)
 			struct tt_buffer *buffer = tt_buffers[i];
 
 			event = &buffer->events[pos[i]];
-			if (pos[i] != buffer->next_index &&
+			if (pos[i] != tt_get_buf_index(buffer) &&
 			    event->timestamp < earliest_time) {
 				current_core = i;
 				earliest_time = event->timestamp;
@@ -849,12 +866,11 @@ done:
  */
 void tt_dbg1(char *msg, ...)
 {
+	pr_err("tt_dbg1 starting\n");
 	if (atomic_read(&tt_frozen))
 		return;
 	tt_freeze();
-	pr_err("Dumping timetrace on core %d\n", raw_smp_processor_id());
 	tt_printk();
-	pr_err("Finished dumping timetrace\n");
 }
 
 /**

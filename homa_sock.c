@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file manages homa_sock and homa_socktab objects. */
 
@@ -115,7 +115,7 @@ struct homa_sock *homa_socktab_next(struct homa_socktab_scan *scan)
 	return NULL;
 
 success:
-	scan->hsk =  hlist_entry(next, struct homa_sock, socktab_links);
+	scan->hsk = hlist_entry(next, struct homa_sock, socktab_links);
 	sock_hold(&scan->hsk->sock);
 	rcu_read_unlock();
 	return scan->hsk;
@@ -140,7 +140,7 @@ void homa_socktab_end_scan(struct homa_socktab_scan *scan)
  * @hsk:    Object to initialize. The Homa-specific parts must have been
  *          initialized to zeroes by the caller.
  *
- * Return: 0 for success, otherwise a negative errno.
+ * Return:  0 for success, otherwise a negative errno.
  */
 int homa_sock_init(struct homa_sock *hsk)
 {
@@ -173,41 +173,19 @@ int homa_sock_init(struct homa_sock *hsk)
 	if (IS_ERR(buffer_pool))
 		return PTR_ERR(buffer_pool);
 
-	/* Initialize Homa-specific fields. */
+	/* Initialize Homa-specific fields. We can initialize everything
+	 * except the port and hash table links without acquiring the
+	 * socket lock.
+	 */
 	hsk->homa = homa;
 	hsk->hnet = hnet;
 	hsk->buffer_pool = buffer_pool;
-
-	/* Pick a default port. Must keep the socktab locked from now
-	 * until the new socket is added to the socktab, to ensure that
-	 * no other socket chooses the same port.
-	 */
-	spin_lock_bh(&socktab->write_lock);
-	starting_port = hnet->prev_default_port;
-	while (1) {
-		hnet->prev_default_port++;
-		if (hnet->prev_default_port < HOMA_MIN_DEFAULT_PORT)
-			hnet->prev_default_port = HOMA_MIN_DEFAULT_PORT;
-		other = homa_sock_find(hnet, hnet->prev_default_port);
-		if (!other)
-			break;
-		sock_put(&other->sock);
-		if (hnet->prev_default_port == starting_port) {
-			spin_unlock_bh(&socktab->write_lock);
-			hsk->shutdown = true;
-			hsk->homa = NULL;
-			result = -EADDRNOTAVAIL;
-			goto error;
-		}
-	}
-	hsk->port = hnet->prev_default_port;
-	hsk->inet.inet_num = hsk->port;
-	hsk->inet.inet_sport = htons(hsk->port);
 
 	hsk->is_server = false;
 	hsk->shutdown = false;
 	// Hard-coded for now,will see how this works or not
 	hsk->in_kernel = true;
+	hsk->rx_actor = NULL;
 	hsk->ip_header_length = (hsk->inet.sk.sk_family == AF_INET) ?
 				sizeof(struct iphdr) : sizeof(struct ipv6hdr);
 	spin_lock_init(&hsk->lock);
@@ -232,6 +210,35 @@ int homa_sock_init(struct homa_sock *hsk)
 		bucket->id = i + 1000000;
 		INIT_HLIST_HEAD(&bucket->rpcs);
 	}
+
+	/* Pick a default port. Must keep the socktab locked from now
+	 * until the new socket is added to the socktab, to ensure that
+	 * no other socket chooses the same port.
+	 */
+	spin_lock_bh(&socktab->write_lock);
+	starting_port = hnet->prev_default_port;
+	while (1) {
+		hnet->prev_default_port++;
+		if (hnet->prev_default_port < HOMA_MIN_DEFAULT_PORT)
+			hnet->prev_default_port = HOMA_MIN_DEFAULT_PORT;
+		other = homa_sock_find(hnet, hnet->prev_default_port);
+		if (!other)
+			break;
+		sock_put(&other->sock);
+		if (hnet->prev_default_port == starting_port) {
+			spin_unlock_bh(&socktab->write_lock);
+			hsk->shutdown = true;
+			hsk->homa = NULL;
+			result = -EADDRNOTAVAIL;
+			goto error;
+		}
+		spin_unlock_bh(&socktab->write_lock);
+		cond_resched();
+		spin_lock_bh(&socktab->write_lock);
+	}
+	hsk->port = hnet->prev_default_port;
+	hsk->inet.inet_num = hsk->port;
+	hsk->inet.inet_sport = htons(hsk->port);
 	hlist_add_head_rcu(&hsk->socktab_links,
 			   &socktab->buckets[homa_socktab_bucket(hnet,
 								 hsk->port)]);
@@ -244,6 +251,22 @@ error:
 	homa_pool_free(buffer_pool);
 	return result;
 }
+
+/**
+ * homa_sock_set_rx_actor() - Register (or clear) a read_sock-style actor for
+ * zero-copy receive on an in-kernel socket. When an actor is registered,
+ * homa_recvmsg() delivers each DATA skb of a received message to @actor
+ * instead of copying the message into the buffer pool. The per-call actor
+ * context is supplied via homa_recvmsg_args.rx_actor_ctx by each recvmsg
+ * caller, not stored on the socket.
+ * @hsk:    Socket to configure; must be an in-kernel socket.
+ * @actor:  Callback invoked per skb (NULL to disable and revert to the pool).
+ */
+void homa_sock_set_rx_actor(struct homa_sock *hsk, sk_read_actor_t actor)
+{
+	hsk->rx_actor = actor;
+}
+EXPORT_SYMBOL_GPL(homa_sock_set_rx_actor);
 
 /*
  * homa_sock_unlink() - Unlinks a socket from its socktab and does
@@ -323,11 +346,12 @@ void homa_sock_shutdown(struct homa_sock *hsk)
  * homa_sock_destroy() - Release all of the internal resources associated
  * with a socket; is invoked at time when that is safe (i.e., all references
  * on the socket have been dropped).
- * @hsk:       Socket to destroy.
+ * @sk:       Socket to destroy.
  */
 void homa_sock_destroy(struct sock *sk)
 {
 	struct homa_sock *hsk = homa_sk(sk);
+
 	IF_NO_STRIP(int i = 0);
 
 	if (!hsk->homa)
@@ -372,7 +396,8 @@ void homa_sock_destroy(struct sock *sk)
  *             becomes a no-op: the socket will continue to use
  *             its randomly assigned client port.
  *
- * Return:  0 for success, otherwise a negative errno.
+ * Return:  0 for success, otherwise a negative errno. If an error is
+ *          returned, hsk->error_msg is set.
  */
 int homa_sock_bind(struct homa_net *hnet, struct homa_sock *hsk,
 		   u16 port)
@@ -383,11 +408,14 @@ int homa_sock_bind(struct homa_net *hnet, struct homa_sock *hsk,
 
 	if (port == 0)
 		return result;
-	if (port >= HOMA_MIN_DEFAULT_PORT)
+	if (port >= HOMA_MIN_DEFAULT_PORT) {
+		hsk->error_msg = "port number invalid: in the automatically assigned range";
 		return -EINVAL;
+	}
 	homa_sock_lock(hsk);
 	spin_lock_bh(&socktab->write_lock);
 	if (hsk->shutdown) {
+		hsk->error_msg = "socket has been shut down";
 		result = -ESHUTDOWN;
 		goto done;
 	}
@@ -395,8 +423,10 @@ int homa_sock_bind(struct homa_net *hnet, struct homa_sock *hsk,
 	owner = homa_sock_find(hnet, port);
 	if (owner) {
 		sock_put(&owner->sock);
-		if (owner != hsk)
+		if (owner != hsk) {
+			hsk->error_msg = "requested port number is already in use";
 			result = -EADDRINUSE;
+		}
 		goto done;
 	}
 	hlist_del_rcu(&hsk->socktab_links);
@@ -448,7 +478,7 @@ struct homa_sock *homa_sock_find(struct homa_net *hnet, u16 port)
  * @hsk:    socket to  lock.
  */
 void homa_sock_lock_slow(struct homa_sock *hsk)
-	__acquires(&hsk->lock)
+	__acquires(hsk->lock)
 {
 	u64 start = homa_clock();
 
@@ -469,7 +499,7 @@ void homa_sock_lock_slow(struct homa_sock *hsk)
  *             Used only for metrics.
  */
 void homa_bucket_lock_slow(struct homa_rpc_bucket *bucket, u64 id)
-	__acquires(rpc_bucket_lock)
+	__acquires(bucket->lock)
 {
 	u64 start = homa_clock();
 
@@ -500,6 +530,10 @@ int homa_sock_wait_wmem(struct homa_sock *hsk, int nonblocking)
 {
 	long timeo = hsk->sock.sk_sndtimeo;
 	int result;
+
+	/* Note: we can't use sock_wait_for_wmem because that function
+	 * is not available to modules (as of August 2025 it's static).
+	 */
 
 	if (nonblocking)
 		timeo = 0;

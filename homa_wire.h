@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines the on-the-wire format of Homa packets. */
 
@@ -53,10 +53,17 @@ enum homa_packet_type {
 #define HOMA_SKB_EXTRA MAX_TCP_HEADER
 
 /**
+ * define HOMA_ETH_FRAME_OVERHEAD - Additional overhead bytes for each
+ * Ethernet packet that are not included in the packet header (preamble,
+ * start frame delimiter, CRC, and inter-packet gap).
+ */
+#define HOMA_ETH_FRAME_OVERHEAD 24
+
+/**
  * define HOMA_ETH_OVERHEAD - Number of bytes per Ethernet packet for Ethernet
  * header, CRC, preamble, and inter-packet gap.
  */
-#define HOMA_ETH_OVERHEAD 42
+#define HOMA_ETH_OVERHEAD (18 + HOMA_ETH_FRAME_OVERHEAD)
 
 /**
  * define HOMA_MIN_PKT_LENGTH - Every Homa packet must be padded to at least
@@ -119,10 +126,13 @@ struct homa_common_hdr {
 	u8 type;
 
 	/**
-	 * @doff: High order 4 bits holds the number of 4-byte chunks in a
-	 * homa_data_hdr (low-order bits unused). Used only for DATA packets;
-	 * must be in the same position as the data offset in a TCP header.
-	 * Used by TSO to determine where the replicated header portion ends.
+	 * @doff: High order 4 bits correspond to the Data Offset field of a
+	 * TCP header. In DATA packets they hold the number of 4-byte chunks
+	 * in a homa_data_hdr; used by TSO to determine where the replicated
+	 * header portion ends. For other packets the offset is always 5
+	 * (standard TCP header length); other values may cause some NICs
+	 * (such as Intel E810-C) to drop outgoing packets when TCP hijacking
+	 * is enabled. The low-order bits are always 0.
 	 */
 	u8 doff;
 
@@ -388,13 +398,6 @@ struct homa_grant_hdr {
 	 * with higher offset. Larger numbers indicate higher priorities.
 	 */
 	u8 priority;
-
-	/**
-	 * @resend_all: Nonzero means that the sender should resend all previously
-	 * transmitted data, starting at the beginning of the message (assume
-	 * that no packets have been successfully received).
-	 */
-	u8 resend_all;
 } __packed;
 #endif /* See strip.py */
 
@@ -543,5 +546,32 @@ static inline u64 homa_local_id(__be64 sender_id)
 	 */
 	return be64_to_cpu(sender_id) ^ 1;
 }
+
+#ifndef __STRIP__ /* See strip.py */
+/**
+ * homa_set_hijack() - Set fields in a Homa header that are needed for
+ * TCP hijacking to work properly.
+ * @common:   Header in which to set fields.
+ */
+static inline void homa_set_hijack(struct homa_common_hdr *common)
+{
+	common->flags = HOMA_TCP_FLAGS;
+	common->urgent = htons(HOMA_TCP_URGENT);
+	common->doff = 0x50;
+}
+
+/**
+ * homa_get_offset() - Returns the offset within message of the first byte
+ * of data in a Homa DATA packet (the offset is stored in different places
+ * in different situations).
+ * @h:       Header for DATA packet
+ * Return:   See above
+ */
+static inline int homa_get_offset(struct homa_data_hdr *h)
+{
+	return (h->seg.offset != -1) ? ntohl(h->seg.offset) :
+	       ntohl(h->common.sequence);
+}
+#endif /* See strip.py */
 
 #endif /* _HOMA_WIRE_H */

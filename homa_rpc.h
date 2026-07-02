@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines homa_rpc and related structs.  */
 
@@ -27,7 +27,7 @@ struct homa_message_out {
 	 */
 	int length;
 
-	/** @num_skbs: Total number of buffers currently in @packets. */
+	/** @num_skbs: Total number of buffers currently in @to_free. */
 	int num_skbs;
 
 	/**
@@ -44,26 +44,50 @@ struct homa_message_out {
 
 	/**
 	 * @packets: Singly-linked list of all packets in message, linked
-	 * using homa_next_skb. The list is in order of offset in the message
-	 * (offset 0 first); each sk_buff can potentially contain multiple
-	 * data_segments, which will be split into separate packets by GSO.
-	 * This list grows gradually as data is copied in from user space,
-	 * so it may not be complete.
+	 * using homa_skb_info->next_skb. The list is in order of offset in
+	 * the message (offset 0 first); each sk_buff can potentially contain
+	 * multiple data_segments, which will be split into separate packets
+	 * by GSO. This list grows gradually as data is copied in from user
+	 * space, so it may not be complete.
 	 */
 	struct sk_buff *packets;
 
 	/**
 	 * @next_xmit: Pointer to pointer to next packet to transmit (will
-	 * either refer to @packets or homa_next_skb(skb) for some skb
+	 * either refer to @packets or homa_skb_info->next_skb for some skb
 	 * in @packets).
 	 */
 	struct sk_buff **next_xmit;
 
 	/**
 	 * @next_xmit_offset: All bytes in the message, up to but not
-	 * including this one, have been transmitted.
+	 * including this one, have been passed to ip_queue_xmit or
+	 * ip6_xmit.
 	 */
 	int next_xmit_offset;
+
+	/**
+	 * @first_not_tx: All packets in @packets preceding this one have
+	 * been confirmed to have been transmitted by the NIC (the driver
+	 * has released its reference). NULL means all packets are known to
+	 * have been transmitted. Used by homa_rpc_tx_end.
+	 */
+	struct sk_buff *first_not_tx;
+
+	/**
+	 * @to_free: Singly-linked list of packets that must be freed by
+	 * homa_rpc_reap. Initially holds retransmitted packets, but
+	 * eventually includes the packets in @packets. homa_rpc_reap uses
+	 * this list to ensure that all tx packets have been freed by the
+	 * IP stack before it frees the homa_rpc (otherwise homa_qdisc might
+	 * try to access the RPC via a packet's homa_skb_info). Note: I
+	 * considered using skb->destructor to release a reference on the RPC,
+	 * but this does not appear to be reliable because (a) skb->destructor
+	 * may be overwritten and (b) it may be called before the skb has
+	 * cleared the tx pipeline (via skb_orphan?). Also, need to retain
+	 * @packets in case they are needed for retransmission.
+	 */
+	struct sk_buff *to_free;
 
 #ifndef __STRIP__ /* See strip.py */
 	/**
@@ -92,6 +116,13 @@ struct homa_message_out {
 	 * Used to find the oldest outgoing message.
 	 */
 	u64 init_time;
+
+	/**
+	 * @fill_start_ns: ktime_get_ns() timestamp recorded at the start
+	 * of homa_message_out_fill(). Used together with the departure
+	 * timestamp in homa_xmit_data() to measure per-RPC TX latency.
+	 */
+	u64 fill_start_ns;
 };
 
 /**
@@ -121,14 +152,15 @@ struct homa_gap {
  */
 struct homa_message_in {
 	/**
-	 * @length: Payload size in bytes. A value less than 0 means this
-	 * structure is uninitialized and therefore not in use.
+	 * @length: Payload size in bytes. -1 means this structure is
+	 * uninitialized and therefore not in use.
 	 */
 	int length;
 
 	/**
 	 * @packets: DATA packets for this message that have been received but
-	 * not yet copied to user space (no particular order).
+	 * not yet copied to user space (ordered by increasing offset). The
+	 * lock in this structure is not used (the RPC lock is used instead).
 	 */
 	struct sk_buff_head packets;
 
@@ -191,16 +223,42 @@ struct homa_message_in {
 	int rec_incoming;
 
 	/**
-	 * @birth: homa_clock() time when homa_grant_manage_rpc was invoked
-	 * for this RPC. Managed by homa_grant.c. Only set if the RPC needs
-	 * grants.
+	 * @birth: homa_clock() time when this structure was initialized
+	 * (i.e. first data packet was received for message).
 	 */
 	u64 birth;
-
-	/** @resend_all: if nonzero, set resend_all in the next grant packet. */
-	u8 resend_all;
 #endif /* See strip.py */
 };
+
+#ifndef __STRIP__ /* See strip.py */
+/**
+ * struct homa_rpc_qdisc - Information that homa_qdisc needs to store in
+ * each RPC. Managed entirely by homa_qdisc.
+ */
+struct homa_rpc_qdisc {
+	/**
+	 * @packets: List of tx skbs from this RPC that have been deferred
+	 * by homa_qdisc. Non-empty means this RPC is currently linked into
+	 * homa_qdisc_dev->deferred_rpcs.
+	 */
+	struct sk_buff_head packets;
+
+	/**
+	 * @rb_node: Used to link this struct into
+	 * homa_qdisc_dev->deferred_rpcs.
+	 */
+	struct rb_node rb_node;
+
+	/**
+	 * @tx_left: The number of (trailing) bytes of the tx message
+	 * that have not been transmitted by homa_qdisc yet. Only updated
+	 * when packets are added to or removed from the deferred list;
+	 * may be out of date (too high) if packets have been transmitted
+	 * without being deferred.
+	 */
+	int tx_left;
+};
+#endif /* See strip.py */
 
 /**
  * struct homa_rpc - One of these structures exists for each active
@@ -252,9 +310,9 @@ struct homa_rpc {
 	 * manipulated with atomic operations because some of the manipulations
 	 * occur without holding the RPC lock.
 	 */
-	atomic_t flags;
+	unsigned long flags;
 
-	/* Valid bits for @flags:
+	/* Valid bit numbers for @flags:
 	 * RPC_PKTS_READY -        The RPC has input packets ready to be
 	 *                         copied to user space.
 	 * APP_NEEDS_LOCK -        Means that code in the application thread
@@ -270,15 +328,16 @@ struct homa_rpc {
 	 *                         where the app explicitly requests the
 	 *                         response from this particular RPC.
 	 */
-#define RPC_PKTS_READY        1
-#define APP_NEEDS_LOCK        4
-#define RPC_PRIVATE           8
+#define RPC_PKTS_READY        0
+#define APP_NEEDS_LOCK        1
+#define RPC_PRIVATE           2
 
 	/**
-	 * @refs: Number of unmatched calls to homa_rpc_hold; it's not safe
-	 * to free the RPC until this is zero.
+	 * @refs: Number of references to this RPC, including one for each
+	 * unmatched call to homa_rpc_hold plus one for the socket's reference
+	 * in either active_rpcs or dead_rpcs.
 	 */
-	atomic_t refs;
+	refcount_t refs;
 
 	/**
 	 * @peer: Information about the other machine (the server, if
@@ -324,6 +383,11 @@ struct homa_rpc {
 	 * response).
 	 */
 	struct homa_message_out msgout;
+
+#ifndef __STRIP__ /* See strip.py */
+	/** @qrpc: Information managed by homa_qdisc for this RPC. */
+	struct homa_rpc_qdisc qrpc;
+#endif /* See strip.py */
 
 	/**
 	 * @hash_links: Used to link this object into a hash bucket for
@@ -419,6 +483,8 @@ void     homa_abort_rpcs(struct homa *homa, const struct in6_addr *addr,
 			 int port, int error);
 void     homa_abort_sock_rpcs(struct homa_sock *hsk, int error);
 void     homa_rpc_abort(struct homa_rpc *crpc, int error);
+void     homa_rpc_acked(struct homa_sock *hsk, const struct in6_addr *saddr,
+			struct homa_ack *ack);
 struct homa_rpc
 	*homa_rpc_alloc_client(struct homa_sock *hsk,
 			       const union sockaddr_in_union *dest);
@@ -432,9 +498,7 @@ struct homa_rpc
 struct homa_rpc
 	*homa_rpc_find_server(struct homa_sock *hsk,
 			      const struct in6_addr *saddr, u64 id);
-void     homa_rpc_acked(struct homa_sock *hsk, const struct in6_addr *saddr,
-			struct homa_ack *ack);
-void     homa_rpc_end(struct homa_rpc *rpc);
+void     homa_rpc_get_info(struct homa_rpc *rpc, struct homa_rpc_info *info);
 int      homa_rpc_reap(struct homa_sock *hsk, bool reap_all);
 
 /**
@@ -442,7 +506,7 @@ int      homa_rpc_reap(struct homa_sock *hsk, bool reap_all);
  * @rpc:    RPC to lock.
  */
 static inline void homa_rpc_lock(struct homa_rpc *rpc)
-	__acquires(rpc_bucket_lock)
+	__acquires(rpc->bucket->lock)
 {
 	homa_bucket_lock(rpc->bucket, rpc->id);
 }
@@ -454,7 +518,7 @@ static inline void homa_rpc_lock(struct homa_rpc *rpc)
  *             currently owned by someone else.
  */
 static inline int homa_rpc_try_lock(struct homa_rpc *rpc)
-	__cond_acquires(rpc_bucket_lock)
+	__cond_acquires(rpc->bucket->lock)
 {
 	if (!spin_trylock_bh(&rpc->bucket->lock))
 		return 0;
@@ -462,11 +526,25 @@ static inline int homa_rpc_try_lock(struct homa_rpc *rpc)
 }
 
 /**
+ * homa_rpc_lock_preempt() - Same as homa_rpc_lock, except sets the
+ * APP_NEEDS_LOCK flags while waiting to encourage the existing lock
+ * owner to relinquish the lock.
+ * @rpc:   RPC to lock.
+ */
+static inline void homa_rpc_lock_preempt(struct homa_rpc *rpc)
+	__acquires(rpc->bucket->lock)
+{
+	set_bit(APP_NEEDS_LOCK, &rpc->flags);
+	homa_bucket_lock(rpc->bucket, rpc->id);
+	clear_bit(APP_NEEDS_LOCK, &rpc->flags);
+}
+
+/**
  * homa_rpc_unlock() - Release the lock for an RPC.
  * @rpc:   RPC to unlock.
  */
 static inline void homa_rpc_unlock(struct homa_rpc *rpc)
-	__releases(rpc_bucket_lock)
+	__releases(rpc->bucket->lock)
 {
 	homa_bucket_unlock(rpc->bucket, rpc->id);
 }
@@ -509,14 +587,21 @@ static inline void homa_unprotect_rpcs(struct homa_sock *hsk)
 #ifndef __UNIT_TEST__
 /**
  * homa_rpc_hold() - Increment the reference count on an RPC, which will
- * prevent it from being freed until homa_rpc_put() is called. Used in
- * situations where a pointer to the RPC needs to be retained during a
- * period where it is unprotected by locks.
+ * prevent it from being freed until homa_rpc_put() is called. References
+ * are taken in two situations:
+ * 1. An RPC is going to be manipulated by a collection of functions. In
+ *    this case the top-most function that identifies the RPC takes the
+ *    reference; any function that receives an RPC as an argument can
+ *    assume that a reference has been taken on the RPC by some higher
+ *    function on the call stack.
+ * 2. A pointer to an RPC is stored in an object for use later, such as
+ *    an interest. A reference must be held as long as the pointer remains
+ *    accessible in the object.
  * @rpc:      RPC on which to take a reference.
  */
 static inline void homa_rpc_hold(struct homa_rpc *rpc)
 {
-	atomic_inc(&rpc->refs);
+	refcount_inc(&rpc->refs);
 }
 
 /**
@@ -526,7 +611,7 @@ static inline void homa_rpc_hold(struct homa_rpc *rpc)
  */
 static inline void homa_rpc_put(struct homa_rpc *rpc)
 {
-	atomic_dec(&rpc->refs);
+	refcount_dec(&rpc->refs);
 }
 #endif /* __UNIT_TEST__ */
 
@@ -550,7 +635,7 @@ static inline bool homa_is_client(u64 id)
  */
 static inline bool homa_rpc_needs_attention(struct homa_rpc *rpc)
 {
-	return (rpc->error != 0 || atomic_read(&rpc->flags) & RPC_PKTS_READY);
+	return (rpc->error != 0 || test_bit(RPC_PKTS_READY, &rpc->flags));
 }
 
 #endif /* _HOMA_RPC_H */

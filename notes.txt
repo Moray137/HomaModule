@@ -1,12 +1,18 @@
 Notes for Homa implementation in Linux:
 ---------------------------------------
 
-* Failure modes:
-  * homa_grant_add_rpc: list has a loop, or encounter a null list link
-  * stack corruption under homa_recvmsg after socket shutdown.
+* Performance problems to track down:
+  * On c6620 cluster, Homa is getting RPC timeouts on w4 at 'b 80' and '-b 100'
+  * On xl170s, both TCP and Homa run slower with qdisc than pacer (P99 for
+    TCP small packets increases by 50%)
 
 * Move interest cleanup code from homa_sock to a new function in
   homa_interest. Also move wakeup code from homa_rpc_handoff.
+
+* Find a way to reduce pacer core utilization? It currently takes about 0.7
+  core when running at high load. Maybe use polling threads instead?
+
+* Use skb_attempt_defer_free once it has been properly exported.
 
 * Thoughts on making TCP and Homa play better together:
   * Goals:
@@ -34,6 +40,21 @@ Notes for Homa implementation in Linux:
       protocols. Maybe adjust rates for the token buckets based on recent
       traffic?
   * Also consider the amount of data that is "stuck" in the NIC?
+
+* Consider eliminating SoftIRQ: process packets completely at NAPI level?
+  * This eliminates the latency and cache overheads of switching cores
+    for SoftIRQ
+  * Should also help with tail latency: eliminates one opportunity for
+    hot-spots
+  * Load balancing should still be fine (especially if port number is used
+    for packet spraying)
+  * Or, always do SoftIRQ processing on same node as NAPI?
+
+* Eliminate use of link_mbps in homa_grant.c; perhaps replace with
+  configuration parameter fifo_mbps? Maybe the grant mechanism needs
+  to be net_device-specific?
+
+* Eliminate HOMA_FLAG_DONT_THROTTLE
 
 * Optimizations for skb freeing:
   * In GRO, merge page frags out of skbs and return skbs to napi with
@@ -69,18 +90,6 @@ Notes for Homa implementation in Linux:
   * The grant will be sent more quickly by the server because it doesn't
     have to process a batch of data packets first
 
-* homa_grant_recalc is being invoked a *lot* and it takes a lot of time each
-  call (13 usec/call, duty cycle > 100%):
-  * Does it need to relock every ranked RPC every call?
-  * About 25% of calls are failed attempts to promote an unranked RPC
-    (perhaps because the slots for its host are all taken?)
-  * Could it abort early if there is no incoming headroom?
-
-* Notes on refactoring of grant mechanism:
-  * Need to reimplement FIFO grants
-  * Replace fifo_grant_increment with fifo_grant_interval
-  * Refactor so that the msgin structure is always properly initialized?
-
 * The current implementation can execute RPCs multiple times on the server:
   * The initial RPC arrives, but takes the slow path to SoftIRQ, which can
     take many ms.
@@ -92,10 +101,6 @@ Notes for Homa implementation in Linux:
 
 * Use vmap to map the user-space buffer pool so that the kernel can use
   memcpy rather than copy_to_user?
-
-* SoftIRQ processing can lock out kernel-to-user copies; add a preemption
-  mechanism where the copying code can set a flag that it needs the lock,
-  then SoftIRQ releases the lock until the flag is clear?
 
 * For W3, throttle_min_bytes is a problem: a significant fraction of all
   transmitted bytes aren't being counted; as a result, the NIC queue
@@ -117,6 +122,8 @@ Notes for Homa implementation in Linux:
 * CloudLab cluster issues:
   * amd272 had a problem where all xmits from core 47 incurred a 1-2 ms
     delay; power-cycling it fixed the problem.
+  * (July 2025) amd163 was causing cp_vs_tcp to run slowly (max cluster
+    throughput only 16-18 Gbps).
 
 * Notes on performance data from buffer benchmarking 8/2023:
   * Restricting buffer space ("buffers"):
@@ -185,13 +192,6 @@ Notes for Homa implementation in Linux:
 * IPv6 issues:
   * See if error checking made syscalls slower.
   * GSO always uses SKB_GSO_TCPV6; sometimes it should be V4.
-
-* Refactor of granting mechanism:
-  * Eliminate grant_increment: change to fifo_grant_increment instead
-  * grant_non_fifo may need to grant to a message that is also receiving
-    regular grants
-  * What if a message receives data beyond incoming, which completes the
-    message?
 
 * Pinning memory: see mm.h and mm/gup.c
   * get_user_page

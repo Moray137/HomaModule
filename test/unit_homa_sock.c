@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #include "homa_interest.h"
@@ -40,7 +40,7 @@ FIXTURE(homa_sock) {
 FIXTURE_SETUP(homa_sock)
 {
 	homa_init(&self->homa);
-	self->hnet = mock_alloc_hnet(&self->homa);
+	self->hnet = mock_hnet(0, &self->homa);
 	mock_sock_init(&self->hsk, self->hnet, 0);
 	self->client_ip[0] = unit_get_in_addr("196.168.0.1");
 	self->client_port = 40000;
@@ -60,7 +60,7 @@ TEST_F(homa_sock, homa_socktab_destroy)
 	struct homa_sock hsk1, hsk2, hsk3;
 	struct homa_net *hnet;
 
-	hnet = mock_alloc_hnet(&self->homa);
+	hnet = mock_hnet(1, &self->homa);
 	mock_sock_init(&hsk1, hnet, 100);
 	mock_sock_init(&hsk2, hnet, 101);
 	mock_sock_init(&hsk3, self->hnet, 100);
@@ -311,8 +311,12 @@ TEST_F(homa_sock, homa_sock_bind)
 	EXPECT_EQ(HOMA_MIN_DEFAULT_PORT, self->hsk.port);
 	EXPECT_EQ(EINVAL, -homa_sock_bind(self->hnet, &self->hsk,
 			HOMA_MIN_DEFAULT_PORT + 100));
+	EXPECT_STREQ("port number invalid: in the automatically assigned range",
+		     self->hsk.error_msg);
 
 	EXPECT_EQ(EADDRINUSE, -homa_sock_bind(self->hnet, &self->hsk, 100));
+	EXPECT_STREQ("requested port number is already in use",
+		     self->hsk.error_msg);
 	EXPECT_EQ(0, -homa_sock_bind(self->hnet, &hsk2, 100));
 
 	EXPECT_EQ(0, -homa_sock_bind(self->hnet, &self->hsk, 110));
@@ -329,6 +333,7 @@ TEST_F(homa_sock, homa_sock_bind__socket_shutdown)
 {
 	unit_sock_destroy(&self->hsk);
 	EXPECT_EQ(ESHUTDOWN, -homa_sock_bind(self->hnet, &self->hsk, 100));
+	EXPECT_STREQ("socket has been shut down", self->hsk.error_msg);
 }
 
 TEST_F(homa_sock, homa_sock_find__basics)
@@ -350,7 +355,7 @@ TEST_F(homa_sock, homa_sock_find__same_port_in_different_hnets)
 	struct homa_sock *hsk;
 	struct homa_net *hnet;
 
-	hnet = mock_alloc_hnet(&self->homa);
+	hnet = mock_hnet(1, &self->homa);
 	mock_sock_init(&hsk1, self->hnet, 100);
 	mock_sock_init(&hsk2, hnet, 100);
 

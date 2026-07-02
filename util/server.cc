@@ -1,5 +1,5 @@
 /* Copyright (c) 2019-2022 Homa Developers
- * SPDX-License-Identifier: BSD-1-Clause
+ * SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
  */
 
 /* This is a test program that acts as a server for testing either
@@ -116,6 +116,10 @@ void homa_server(int port)
 		int seed;
 		int result;
 
+		/* Note: by reusing recv_args for successive calls to
+		 * recvmsg we automatically return to Homa the buffers
+		 * left in recv_args by the previous call to recvmsg.
+		 */
 		recv_args.id = 0;
 		hdr.msg_controllen = sizeof(recv_args);
 		length = recvmsg(fd, &hdr, 0);

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file contains definitions that are shared across the files
  * that implement Homa for Linux.
@@ -35,6 +35,17 @@
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/vmalloc.h>
+
+/* MSG_SPLICE_PAGES is a kernel-internal sendmsg() flag (not exported to user
+ * space) that asks the transport to reference the caller's pages directly
+ * instead of copying. In-kernel Homa consumers set it to request zero-copy TX.
+ * Provide a fallback for older kernels / unit-test header sets that lack it;
+ * the value is fixed in the kernel ABI.
+ */
+#ifndef MSG_SPLICE_PAGES
+#define MSG_SPLICE_PAGES 0x8000000
+#endif
+
 #include <net/icmp.h>
 #include <net/ip.h>
 #include <net/netns/generic.h>
@@ -80,12 +91,6 @@ struct homa_sock;
 void     homa_throttle_lock_slow(struct homa *homa);
 #endif /* See strip.py */
 
-#ifdef __CHECKER__
-#define __context__(x, y, z) __attribute__((context(x, y, z)))
-#else
-#define __context__(...)
-#endif /* __CHECKER__ */
-
 /**
  * union sockaddr_in_union - Holds either an IPv4 or IPv6 address (smaller
  * and easier to use than sockaddr_storage).
@@ -114,18 +119,23 @@ struct homa {
 	 */
 	atomic64_t next_outgoing_id;
 
+#ifndef __UPSTREAM__ /* See strip.py */
+	/** @qshared: Contains information used by homa_qdisc.c. */
+	struct homa_qdisc_shared *qshared;
+#endif /* See strip.py */
+
 #ifndef __STRIP__ /* See strip.py */
+	/**
+	 * @pacer:  Information related to the pacer; managed by homa_pacer.c.
+	 */
+	struct homa_pacer *pacer;
+
 	/**
 	 * @grant: Contains information used by homa_grant.c to manage
 	 * grants for incoming messages.
 	 */
 	struct homa_grant *grant;
 #endif /* See strip.py */
-
-	/**
-	 * @pacer:  Information related to the pacer; managed by homa_pacer.c.
-	 */
-	struct homa_pacer *pacer;
 
 	/**
 	 * @peertab: Info about all the other hosts we have communicated with;
@@ -202,7 +212,15 @@ struct homa {
 	 * @unsched_bytes and @window). Set externally via sysctl.
 	 */
 	int unsched_bytes;
+#endif /* See strip.py */
 
+	/**
+	 * @link_mbps: The raw bandwidth of the network uplink, in
+	 * units of 1e06 bits per second.  Set externally via sysctl.
+	 */
+	int link_mbps;
+
+#ifndef __STRIP__ /* See strip.py */
 	/**
 	 * @poll_usecs: Amount of time (in microseconds) that a thread
 	 * will spend busy-waiting for an incoming messages before
@@ -501,9 +519,6 @@ struct homa {
  * particular network namespace.
  */
 struct homa_net {
-	/** @net: Network namespace corresponding to this structure. */
-	struct net *net;
-
 	/** @homa: Global Homa information. */
 	struct homa *homa;
 
@@ -526,10 +541,7 @@ struct homa_net {
  * linear part of the skb.
  */
 struct homa_skb_info {
-	/**
-	 * @next_skb: used to link together all of the skb's for a Homa
-	 * message (in order of offset).
-	 */
+	/** @next_skb: used to link together outgoing skb's for a message. */
 	struct sk_buff *next_skb;
 
 	/**
@@ -554,6 +566,9 @@ struct homa_skb_info {
 	 * this packet.
 	 */
 	int offset;
+
+	/** @rpc: RPC that this packet belongs to. */
+	void *rpc;
 };
 
 /**
@@ -641,6 +656,7 @@ static inline struct in6_addr skb_canonical_ipv6_saddr(struct sk_buff *skb)
 	return mapped;
 }
 
+#ifndef __STRIP__ /* See strip.py */
 /**
  * is_homa_pkt() - Return true if @skb is a Homa packet, false otherwise.
  * @skb:    Packet buffer to check.
@@ -648,16 +664,21 @@ static inline struct in6_addr skb_canonical_ipv6_saddr(struct sk_buff *skb)
  */
 static inline bool is_homa_pkt(struct sk_buff *skb)
 {
-	struct iphdr *iph = ip_hdr(skb);
+	int protocol;
 
-#ifndef __STRIP__ /* See strip.py */
-	return ((iph->protocol == IPPROTO_HOMA) ||
-		((iph->protocol == IPPROTO_TCP) &&
-		 (tcp_hdr(skb)->urg_ptr == htons(HOMA_TCP_URGENT))));
-#else /* See strip.py */
-	return iph->protocol == IPPROTO_HOMA;
-#endif /* See strip.py */
+	/* If the network header hasn't been created yet, assume it's a
+	 * Homa packet (Homa never generates any non-Homa packets).
+	 */
+	if (skb->network_header == 0)
+		return true;
+	protocol = (skb_is_ipv6(skb)) ? ipv6_hdr(skb)->nexthdr :
+					ip_hdr(skb)->protocol;
+	return (protocol == IPPROTO_HOMA ||
+		(protocol == IPPROTO_TCP &&
+		 tcp_hdr(skb)->urg_ptr == htons(HOMA_TCP_URGENT)));
+	return protocol == IPPROTO_HOMA;
 }
+#endif /* See strip.py */
 
 /**
  * homa_make_header_avl() - Invokes pskb_may_pull to make sure that all the
@@ -676,6 +697,7 @@ static inline bool homa_make_header_avl(struct sk_buff *skb)
 	return pskb_may_pull(skb, pull_length);
 }
 
+#ifndef __UPSTREAM__ /* See strip.py */
 #ifdef __UNIT_TEST__
 void unit_log_printf(const char *separator, const char *format, ...)
 		__printf(2, 3);
@@ -686,6 +708,7 @@ void unit_hook(char *id);
 #define UNIT_LOG(...)
 #define UNIT_HOOK(...)
 #endif /* __UNIT_TEST__ */
+#endif /* See strip.py */
 
 extern unsigned int homa_net_id;
 
@@ -697,6 +720,7 @@ int      homa_bind(struct socket *sk, struct sockaddr *addr,
 void     homa_close(struct sock *sock, long timeout);
 int      homa_connect(struct sock *sk, struct sockaddr *addr, int addrlen);
 int      homa_copy_to_pool(struct homa_rpc *rpc);
+int      homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx);
 void     homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
 void     homa_destroy(struct homa *homa);
 void     homa_dispatch_pkts(struct sk_buff *skb);
@@ -712,11 +736,14 @@ int      homa_getsockopt(struct sock *sk, int level, int optname,
 int      homa_hash(struct sock *sk);
 enum hrtimer_restart homa_hrtimer(struct hrtimer *timer);
 int      homa_init(struct homa *homa);
-int      homa_ioctl(struct sock *sk, int cmd, int *karg);
+int      homa_ioc_info(struct socket *sock, unsigned long arg);
+int      homa_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg);
 int      homa_load(void);
 int      homa_message_out_fill(struct homa_rpc *rpc,
-			       struct iov_iter *iter, int xmit);
+			       struct iov_iter *iter, int xmit, int flags);
 void     homa_message_out_init(struct homa_rpc *rpc, int length);
+int      homa_tx_lat_init(void);
+void     homa_tx_lat_end(void);
 void     homa_need_ack_pkt(struct sk_buff *skb, struct homa_sock *hsk,
 			   struct homa_rpc *rpc);
 void     homa_net_destroy(struct homa_net *hnet);
@@ -732,6 +759,7 @@ void     homa_request_retrans(struct homa_rpc *rpc);
 void     homa_resend_pkt(struct sk_buff *skb, struct homa_rpc *rpc,
 			 struct homa_sock *hsk);
 void     homa_rpc_handoff(struct homa_rpc *rpc);
+int      homa_rpc_tx_end(struct homa_rpc *rpc);
 int      homa_sendmsg(struct sock *sk, struct msghdr *msg, size_t len);
 int      homa_setsockopt(struct sock *sk, int level, int optname,
 			 sockptr_t optval, unsigned int optlen);
@@ -744,17 +772,19 @@ void     homa_timer_check_rpc(struct homa_rpc *rpc);
 int      homa_timer_main(void *transport);
 struct sk_buff *homa_tx_data_pkt_alloc(struct homa_rpc *rpc,
 				       struct iov_iter *iter, int offset,
-				       int length, int max_seg_data);
+				       int length, int max_seg_data,
+				       bool zerocopy);
 void     homa_unhash(struct sock *sk);
 void     homa_rpc_unknown_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
 void     homa_unload(void);
-int      homa_wait_private(struct homa_rpc *rpc, int nonblocking);
-struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking);
+int      homa_wait_private(struct homa_rpc *rpc, int nonblocking,
+			   void *caller_ctx);
+struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking,
+				  void *caller_ctx);
 int      homa_xmit_control(enum homa_packet_type type, void *contents,
 			   size_t length, struct homa_rpc *rpc);
 int      __homa_xmit_control(void *contents, size_t length,
 			     struct homa_peer *peer, struct homa_sock *hsk);
-void     homa_xmit_data(struct homa_rpc *rpc, bool force);
 void     homa_xmit_unknown(struct sk_buff *skb, struct homa_sock *hsk);
 
 #ifndef __STRIP__ /* See strip.py */
@@ -762,7 +792,7 @@ void     homa_cutoffs_pkt(struct sk_buff *skb, struct homa_sock *hsk);
 int      homa_dointvec(const struct ctl_table *table, int write,
 		       void *buffer, size_t *lenp, loff_t *ppos);
 void     homa_incoming_sysctl_changed(struct homa *homa);
-int      homa_ioc_abort(struct sock *sk, int *karg);
+int      homa_ioc_abort(struct socket *sock, unsigned long arg);
 int      homa_message_in_init(struct homa_rpc *rpc, int length,
 			      int unsched);
 void     homa_prios_changed(struct homa *homa);
@@ -773,51 +803,25 @@ int      homa_sysctl_softirq_cores(const struct ctl_table *table,
 				   loff_t *ppos);
 int      homa_unsched_priority(struct homa *homa, struct homa_peer *peer,
 			       int length);
+void     homa_xmit_data(struct homa_rpc *rpc, bool force);
 void     __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc,
 			  int priority);
 #else /* See strip.py */
 int      homa_message_in_init(struct homa_rpc *rpc, int unsched);
 void     homa_resend_data(struct homa_rpc *rpc, int start, int end);
+void     homa_xmit_data(struct homa_rpc *rpc);
 void     __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc);
 #endif /* See strip.py */
 
 /**
- * homa_net_from_net() - Return the struct homa_net associated with a particular
+ * homa_net() - Return the struct homa_net associated with a particular
  * struct net.
  * @net:     Get the Homa data for this net namespace.
  * Return:   see above.
  */
-static inline struct homa_net *homa_net_from_net(struct net *net)
+static inline struct homa_net *homa_net(struct net *net)
 {
 	return (struct homa_net *)net_generic(net, homa_net_id);
-}
-
-/**
- * homa_from_skb() - Return the struct homa associated with a particular
- * sk_buff.
- * @skb:     Get the struct homa for this packet buffer.
- * Return:   see above.
- */
-static inline struct homa *homa_from_skb(struct sk_buff *skb)
-{
-	struct homa_net *hnet;
-
-	hnet = net_generic(dev_net(skb->dev), homa_net_id);
-	return hnet->homa;
-}
-
-/**
- * homa_net_from_skb() - Return the struct homa_net associated with a particular
- * sk_buff.
- * @skb:     Get the struct homa for this packet buffer.
- * Return:   see above.
- */
-static inline struct homa_net *homa_net_from_skb(struct sk_buff *skb)
-{
-	struct homa_net *hnet;
-
-	hnet = net_generic(dev_net(skb->dev), homa_net_id);
-	return hnet;
 }
 
 /**
@@ -827,24 +831,24 @@ static inline struct homa_net *homa_net_from_skb(struct sk_buff *skb)
  */
 static inline u64 homa_clock(void)
 {
-	/* As of May 2025 there does not appear to be a portable API that
-	 * meets Homa's needs:
-	 * - The Intel X86 TSC works well but is not portable.
-	 * - sched_clock() does not guarantee monotonicity or consistency.
-	 * - ktime_get_mono_fast_ns and ktime_get_raw_fast_ns are very slow
-	 *   (27 ns to read, vs 8 ns for TSC)
-	 * Thus we use a hybrid approach that uses TSC (via get_cycles) where
-	 * available (which should be just about everywhere Homa runs).
+	/* This function exists to make it easy to switch time sources
+	 * if/when new or better sources become available.
 	 */
 #ifdef __UNIT_TEST__
 	u64 mock_get_clock(void);
 	return mock_get_clock();
 #else /* __UNIT_TEST__ */
-#ifdef CONFIG_X86_TSC
+#ifndef __UPSTREAM__ /* See strip.py */
+	/* As of August 2025, get_cycles takes only about 8 ns/call, vs.
+	 * 14 ns/call for ktime_get_ns. This saves about .24 core when
+	 * driving a 25 Gbps network at high load (see perf.txt for details).
+	 * Unfortunately, Linux reviewers will not allow get_cycles in the
+	 * upstreamed version.
+	 */
 	return get_cycles();
-#else
-	return ktime_get_mono_fast_ns();
-#endif /* CONFIG_X86_TSC */
+#else /* See strip.py */
+	return ktime_get_ns();
+#endif /* See strip.py */
 #endif /* __UNIT_TEST__ */
 }
 
@@ -858,11 +862,11 @@ static inline u64 homa_clock_khz(void)
 #ifdef __UNIT_TEST__
 	return 1000000;
 #else /* __UNIT_TEST__ */
-#ifdef CONFIG_X86_TSC
+#ifndef __UPSTREAM__ /* See strip.py */
 	return cpu_khz;
-#else
+#else /* See strip.py */
 	return 1000000;
-#endif /* CONFIG_X86_TSC */
+#endif /* See strip.py */
 #endif /* __UNIT_TEST__ */
 }
 
@@ -877,18 +881,15 @@ static inline u64 homa_ns_to_cycles(u64 ns)
 #ifdef __UNIT_TEST__
 	return ns;
 #else /* __UNIT_TEST__ */
-#ifdef CONFIG_X86_TSC
 	u64 tmp;
 
-	tmp = ns * cpu_khz;
+	tmp = ns * homa_clock_khz();
 	do_div(tmp, 1000000);
 	return tmp;
-#else
-	return ns;
-#endif /* CONFIG_X86_TSC */
 #endif /* __UNIT_TEST__ */
 }
 
+#ifndef __STRIP__ /* See strip.py */
 /**
  * homa_usecs_to_cycles() - Convert from units of microseconds to units of
  * homa_clock().
@@ -900,17 +901,30 @@ static inline u64 homa_usecs_to_cycles(u64 usecs)
 #ifdef __UNIT_TEST__
 	return usecs * 1000;
 #else /* __UNIT_TEST__ */
-#ifdef CONFIG_X86_TSC
 	u64 tmp;
 
-	tmp = usecs * cpu_khz;
+	tmp = usecs * homa_clock_khz();
 	do_div(tmp, 1000);
 	return tmp;
-#else
-	return usecs * 1000;
-#endif /* CONFIG_X86_TSC */
 #endif /* __UNIT_TEST__ */
 }
+#endif /* See strip.py */
+
+#ifndef __STRIP__ /* See strip.py */
+/**
+ * homa_high_priority() - Return the next-to-highest available priority
+ * level.  Used in situations where we want to boost the priority of
+ * something but don't want to interfere with the highest priority packets
+ * such as control packets.
+ * @homa:  Overall information about the Homa protocol.
+ * Return: See above.
+ *
+ */
+static inline int homa_high_priority(struct homa *homa)
+{
+	return (homa->num_priorities <= 2) ? 0 : homa->num_priorities - 2;
+}
+#endif /* See strip.py */
 
 /* ---------- Transport-layer stats (NVMe-over-Homa measurement) ---------- */
 #include <linux/percpu.h>
@@ -1020,9 +1034,6 @@ static __always_inline void homa_tl_record(struct homa_sock *hsk,
  *    * RPC lock
  *    * Socket lock
  *    * Other lock
- * 3. It is not safe to wait on an RPC lock while holding any other lock.
- * 4. It is safe to wait on a socket lock while holding an RPC lock, but
- *    not while holding any other lock.
  *
  * It may seem surprising that RPC locks are acquired *before* socket locks,
  * but this is essential for high performance. Homa has been designed so that

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file contains stripped-down replacements that have been
  * temporarily removed from Homa during the Linux upstreaming
@@ -54,7 +54,7 @@ static inline int  homa_skb_append_from_skb(struct homa *homa,
 
 static inline void homa_skb_free_tx(struct homa *homa, struct sk_buff *skb)
 {
-	kfree_skb(skb);
+	consume_skb(skb);
 }
 
 static inline void homa_skb_free_many_tx(struct homa *homa,
@@ -63,7 +63,7 @@ static inline void homa_skb_free_many_tx(struct homa *homa,
 	int i;
 
 	for (i = 0; i < count; i++)
-		kfree_skb(skbs[i]);
+		consume_skb(skbs[i]);
 }
 
 static inline void homa_skb_get(struct sk_buff *skb, void *dest, int offset,

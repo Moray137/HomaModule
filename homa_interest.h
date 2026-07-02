@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines struct homa_interest and related functions.  */
 
@@ -71,13 +71,9 @@ struct homa_interest {
  *               homa_interest_init_shared.
  */
 static inline void homa_interest_unlink_shared(struct homa_interest *interest)
+	__must_hold(hsk->lock)
 {
-	tt_record("homa_interest_unlink_shared invoked");
-	if (!list_empty(&interest->links)) {
-		homa_sock_lock(interest->hsk);
-		list_del_init(&interest->links);
-		homa_sock_unlock(interest->hsk);
-	}
+	list_del_init(&interest->links);
 }
 
 /**
@@ -89,7 +85,7 @@ static inline void homa_interest_unlink_shared(struct homa_interest *interest)
  *               the caller.
  */
 static inline void homa_interest_unlink_private(struct homa_interest *interest)
-	__must_hold(&interest->rpc->bucket->lock)
+	__must_hold(interest->rpc->bucket->lock)
 {
 	if (interest == interest->rpc->private_interest)
 		interest->rpc->private_interest = NULL;
@@ -100,7 +96,7 @@ void     homa_interest_init_shared(struct homa_interest *interest,
 int      homa_interest_init_private(struct homa_interest *interest,
 				    struct homa_rpc *rpc);
 void     homa_interest_notify_private(struct homa_rpc *rpc);
-int      homa_interest_wait(struct homa_interest *interest, int nonblocking);
+int      homa_interest_wait(struct homa_interest *interest);
 
 #ifndef __STRIP__ /* See strip.py */
 struct homa_interest

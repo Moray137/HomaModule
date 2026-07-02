@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #include "homa_grant.h"
@@ -21,7 +21,7 @@ FIXTURE(homa_pool) {
 FIXTURE_SETUP(homa_pool)
 {
 	homa_init(&self->homa);
-	self->hnet = mock_alloc_hnet(&self->homa);
+	self->hnet = mock_hnet(0, &self->homa);
 #ifndef __STRIP__ /* See strip.py */
 	self->homa.unsched_bytes = 10000;
 	self->homa.grant->window = 10000;
@@ -110,7 +110,7 @@ TEST_F(homa_pool, homa_pool_set_region__region_not_page_aligned)
 
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk,
 			((char *) 0x1000000) + 10,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__region_too_small)
 {
@@ -118,7 +118,7 @@ TEST_F(homa_pool, homa_pool_set_region__region_too_small)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk, (void *) 0x1000000,
-			HOMA_BPAGE_SIZE));
+			HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__cant_allocate_descriptors)
 {
@@ -127,7 +127,7 @@ TEST_F(homa_pool, homa_pool_set_region__cant_allocate_descriptors)
 
 	mock_kmalloc_errors = 1;
 	EXPECT_EQ(ENOMEM, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__cant_allocate_core_info)
 {
@@ -136,12 +136,12 @@ TEST_F(homa_pool, homa_pool_set_region__cant_allocate_core_info)
 
 	mock_kmalloc_errors = 2;
 	EXPECT_EQ(ENOMEM, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__pool_already_has_region)
 {
 	EXPECT_EQ(EINVAL, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			100*HOMA_BPAGE_SIZE));
+			100*HOMA_BPAGE_SIZE, false));
 }
 TEST_F(homa_pool, homa_pool_set_region__success)
 {
@@ -149,7 +149,7 @@ TEST_F(homa_pool, homa_pool_set_region__success)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(0, -homa_pool_set_region(&self->hsk, (void *) 0x100000,
-			78*HOMA_BPAGE_SIZE));
+			78*HOMA_BPAGE_SIZE, false));
 	EXPECT_EQ(78, self->hsk.buffer_pool->num_bpages);
 	EXPECT_EQ(-1, self->hsk.buffer_pool->descriptors[69].owner);
 }
@@ -162,7 +162,7 @@ TEST_F(homa_pool, homa_pool_get_rcvbuf)
 	self->hsk.buffer_pool = homa_pool_alloc(&self->hsk);
 
 	EXPECT_EQ(0, -homa_pool_set_region(&self->hsk, (void *)0x40000,
-		  10*HOMA_BPAGE_SIZE + 1000));
+		  10*HOMA_BPAGE_SIZE + 1000, false));
 	homa_pool_get_rcvbuf(self->hsk.buffer_pool, &args);
 	EXPECT_EQ(0x40000, args.start);
 	EXPECT_EQ(10*HOMA_BPAGE_SIZE, args.length);
@@ -675,6 +675,29 @@ TEST_F(homa_pool, homa_pool_check_waiting__wake_up_waiting_rpc)
 	ASSERT_NE(NULL, crpc);
 	EXPECT_EQ(0, crpc->msgin.num_bpages);
 	EXPECT_EQ(2, pool->bpages_needed);
+	EXPECT_EQ(-1, crpc->msgin.rank);
+
+	/* Free the required pages. */
+	unit_log_clear();
+	atomic_set(&pool->free_bpages, 2);
+	homa_pool_check_waiting(pool);
+	EXPECT_EQ(2, crpc->msgin.num_bpages);
+	EXPECT_STREQ("xmit RESEND 0--2@6", unit_log_get());
+	EXPECT_EQ(0, crpc->msgin.rank);
+}
+TEST_F(homa_pool, homa_pool_check_waiting__wake_up_waiting_rpc_only_one_priority_level)
+{
+	struct homa_pool *pool = self->hsk.buffer_pool;
+	struct homa_rpc *crpc;
+
+	/* Queue up an RPC that needs 2 bpages. */
+	atomic_set(&pool->free_bpages, 0);
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, &self->client_ip,
+			&self->server_ip, 4000, 98, 1000, 2*HOMA_BPAGE_SIZE);
+	ASSERT_NE(NULL, crpc);
+	EXPECT_EQ(0, crpc->msgin.num_bpages);
+	EXPECT_EQ(2, pool->bpages_needed);
+	self->homa.num_priorities = 1;
 
 	/* Free the required pages. */
 	unit_log_clear();
@@ -682,8 +705,28 @@ TEST_F(homa_pool, homa_pool_check_waiting__wake_up_waiting_rpc)
 	homa_pool_check_waiting(pool);
 	EXPECT_EQ(2, crpc->msgin.num_bpages);
 	EXPECT_EQ(0, crpc->msgin.rank);
-	EXPECT_STREQ("xmit GRANT 10000@0 resend_all",
-		     unit_log_get());
+	EXPECT_STREQ("xmit RESEND 0--2@0", unit_log_get());
+}
+TEST_F(homa_pool, homa_pool_check_waiting__wake_up_waiting_rpc_no_need_for_grants)
+{
+	struct homa_pool *pool = self->hsk.buffer_pool;
+	struct homa_rpc *crpc;
+
+	atomic_set(&pool->free_bpages, 0);
+	crpc = unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, &self->client_ip,
+			&self->server_ip, 4000, 98, 1000, 5000);
+	ASSERT_NE(NULL, crpc);
+	EXPECT_EQ(0, crpc->msgin.num_bpages);
+	EXPECT_EQ(1, pool->bpages_needed);
+	EXPECT_EQ(-1, crpc->msgin.rank);
+
+	/* Free the required pages. */
+	unit_log_clear();
+	atomic_set(&pool->free_bpages, 2);
+	homa_pool_check_waiting(pool);
+	EXPECT_EQ(1, crpc->msgin.num_bpages);
+	EXPECT_STREQ("xmit RESEND 0--2@6", unit_log_get());
+	EXPECT_EQ(-1, crpc->msgin.rank);
 }
 #endif /* See strip.py */
 TEST_F(homa_pool, homa_pool_check_waiting__reallocation_fails)
@@ -705,4 +748,36 @@ TEST_F(homa_pool, homa_pool_check_waiting__reallocation_fails)
 	EXPECT_EQ(0, crpc->msgin.num_bpages);
 	EXPECT_STREQ("", unit_log_get());
 	EXPECT_EQ(4, pool->bpages_needed);
+}
+
+TEST_F(homa_pool, homa_pool_avail_bytes__no_region)
+{
+	struct homa_pool *pool = homa_pool_alloc(&self->hsk);
+
+	EXPECT_EQ(0, homa_pool_avail_bytes(pool));
+	homa_pool_free(pool);
+}
+TEST_F(homa_pool, homa_pool_avail_bytes__a_few_pages_allocated)
+{
+	struct homa_pool *pool = self->hsk.buffer_pool;
+	u32 pages[10];
+
+	EXPECT_EQ(100 * HOMA_BPAGE_SIZE, homa_pool_avail_bytes(pool));
+	EXPECT_EQ(0, homa_pool_get_pages(pool, 5, pages, 0));
+	EXPECT_EQ(95 * HOMA_BPAGE_SIZE, homa_pool_avail_bytes(pool));
+}
+TEST_F(homa_pool, homa_pool_avail_bytes__include_free_space_in_core_private_pages)
+{
+	struct homa_pool *pool = self->hsk.buffer_pool;
+
+	pcpu_hot.cpu_number = 3;
+	EXPECT_EQ(100 * HOMA_BPAGE_SIZE, homa_pool_avail_bytes(pool));
+	unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, &self->client_ip,
+			&self->server_ip, 4000, 98, 1000, 2000);
+	EXPECT_EQ(100 * HOMA_BPAGE_SIZE - 2000, homa_pool_avail_bytes(pool));
+
+	pcpu_hot.cpu_number = 5;
+	unit_client_rpc(&self->hsk, UNIT_RCVD_ONE_PKT, &self->client_ip,
+			&self->server_ip, 4000, 98, 1000, 50000);
+	EXPECT_EQ(100 * HOMA_BPAGE_SIZE - 52000, homa_pool_avail_bytes(pool));
 }

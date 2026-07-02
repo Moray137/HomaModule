@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #include "homa_grant.h"
@@ -34,7 +34,7 @@ FIXTURE_SETUP(homa_timer)
 	self->server_addr.in6.sin6_addr = *self->server_ip;
 	self->server_addr.in6.sin6_port =  htons(self->server_port);
 	homa_init(&self->homa);
-	self->hnet = mock_alloc_hnet(&self->homa);
+	self->hnet = mock_hnet(0, &self->homa);
 	self->homa.flags |= HOMA_FLAG_DONT_THROTTLE;
 	self->homa.resend_ticks = 2;
 	self->homa.timer_ticks = 100;
@@ -62,11 +62,17 @@ TEST_F(homa_timer, homa_timer_check_rpc__request_ack)
 
 	/* First call: do nothing (response not fully transmitted). */
 	homa_rpc_lock(srpc);
+#ifndef __STRIP__ /* See strip.py */
+	homa_xmit_data(srpc, false);
+#else /* See strip.py */
+	homa_xmit_data(srpc);
+#endif /* See strip.py */
+	skb_get(srpc->msgout.packets);
 	homa_timer_check_rpc(srpc);
 	EXPECT_EQ(0, srpc->done_timer_ticks);
+	kfree_skb(srpc->msgout.packets);
 
 	/* Second call: set done_timer_ticks. */
-	homa_xmit_data(srpc, false);
 	unit_log_clear();
 	homa_timer_check_rpc(srpc);
 	EXPECT_EQ(100, srpc->done_timer_ticks);
@@ -143,6 +149,7 @@ TEST_F(homa_timer, homa_timer_check_rpc__granted_bytes_not_sent)
 			self->server_port, self->client_id, 5000, 200);
 
 	ASSERT_NE(NULL, crpc);
+	crpc->msgout.next_xmit_offset = 0;
 	unit_log_clear();
 	crpc->silent_ticks = 10;
 	homa_rpc_lock(crpc);

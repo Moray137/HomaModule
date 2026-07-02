@@ -2,6 +2,86 @@ This file contains various notes and lessons learned concerning performance
 of the Homa Linux kernel module.  The notes are in reverse chronological
 order.
 
+63. (September 2025) Compared CPU utilization against TCP. Measured with
+top, running cp_vs_tcp -w w4 -b20 on a 6-node xl170 cluster (20 cores):
+
+                                   Homa        TCP    Homa no polling
+us (user)                           9.8       15.7         11.0
+sy (system)                        31.5       11.8         17.3
+ni (nice)                           0.0        0.0          0.0
+id (idle)                          38.0       49.2         51.9
+wa (iowait)                         0.0        0.0          0.0
+hi (hardware interrupts)            0.0        0.0          0.0
+si (software interrupts)           19.3       22.2         19.5
+st (hypervisor steal)               0.0        0.0          0.0
+
+Without polling, Homa's CPU utilization is slightly lower than TCP's.
+Polling costs an extra 2-3 cores for Homa.
+
+62. (August 2025) Using ktime_get_ns (rdtscp) instead of get_cycles (rdtsc)
+in homa_clock (Linux reviewers won't allow get_cycles for upstreaming).
+rdtscp takes about 14 ns per call, vs. 8 for ktime_get_ns. Running "w4 -b20"
+on xl170s homa_clock invocations are 21 M/sec, so expect about .12 additional
+core to be used. Measurements on xl170 cluster (25 Gbps network) using "w4 -b20"
+(average across 6 nodes in experiment, then average over 5 runs):
+                                rdtsc      rdtscp    Ratio
+Gbps/sec/core:                   6.46        6.22    0.954
+Total core utilization:          6.20        6.44    1.038
+
+Same experiment but in overload ("w4 -b40"):
+                                rdtsc      rdtscp    Ratio
+Gbps/sec/core:                   5.44        5.32    0.980
+Total core utilization:          8.08        8.05    0.997
+Maximum throughput (Gbps):      21.95       21.42    0.976
+
+61. (July 2025) Client responses could starve server requests. This came
+about because a server request that wakes up after waiting for buffer space
+has 0 received bytes. In contrast, a new client response will have received
+unscheduled bytes. As a result, the client responses always got priority for
+new grants and server requests could starve. The solution was to grant server
+requests an amount equal to the unscheduled bytes when they wake up after
+qwaiting for buffer space.
+
+60. (July 2025) Measured impact of new FIFO grant mechanism on xl170
+cluster using "-w starve -b 40 -s 30 -n 6" (priorities were not enabled).
+Slowdowns as a function of message length:
+
+         grant_fifo_fraction = 0    grant_fifo_fraction = 50   grant_fifo_fraction = 100
+# length    s50    s99      s999          s50    s99    s999          s50    s99    s999
+  100000   13.7     25.5    86.8         13.3   21.7    31.9         13.2   22.2    32.7
+  200000   13.0     32.2    75.7         12.7   21.2    29.0         12.6   21.5    30.7
+  300000   13.4     30.2    64.5         13.1   22.1    28.2         13.0   22.7    30.2
+  400000   14.3     30.9    60.1         14.0   24.5    30.6         14.1   25.9    33.3
+  500000   16.1     35.0    83.0         15.9   30.5    37.4         16.4   32.8    41.6
+  600000   19.0     49.3   185.7         19.5   41.2    53.1         20.8   47.7    62.2
+  700000   24.1     70.1   222.0         26.7   67.8    91.4         30.8   88.6   122.2
+  800000   34.8    121.2   282.6         47.5  178.9   268.4         67.9  315.6   470.3
+  900000   72.6    307.5   470.5       1155.3 2139.8  2314.1       1477.2 1746.0  1823.7
+ 1000000  3093.4 12063.2 13050.8       1982.2 2354.0  2482.9       1467.0 1647.1  1709.4
+
+Even shorter messages seem to benefit from the FIFO mechanism (not sure why...).
+Increasing the FIFO fraction from 5% to 10% doesn't make much difference and
+starts to penalize smaller messages more.
+
+FIFO also helps even when the cluster isn't overloaded: slowdown at
+"-w starve -b 20 -s 30 -n 6":
+
+         grant_fifo_fraction = 0    grant_fifo_fraction = 50
+# length     s50    s99    s999           s50    s99    s999
+  100000    11.0   20.0    27.4          11.1   20.0    28.1
+  200000    10.5   19.5    26.0          10.5   19.6    26.1
+  300000    10.6   20.4    25.7          10.7   20.8    25.8
+  400000    11.1   22.0    26.8          11.2   22.7    28.5
+  500000    11.8   24.6    31.3          12.1   26.9    35.4
+  600000    13.0   30.3    39.2          13.4   33.5    45.9
+  700000    14.6   39.4    53.5          15.2   46.9    67.8
+  800000    16.9   55.3    82.7          17.6   63.8    92.7
+  900000    20.2   93.6   147.9          20.8   80.5   112.2
+ 1000000    23.4  155.6   250.4          23.3   93.3   128.7
+
+When the cluster isn't overloaded, short messages get a bit worse when FIFO
+is enabled.
+
 59. (May 2025) Measured overhead to read various clocks on 2.4 GHz
 Xeon E5-2640 (note: measured when CPU is active, hence running in fastest
 mode):
@@ -9,6 +89,7 @@ mode):
 Function                  Units        Overhead
 -----------------------------------------------
 rdtsc                     cycles         8 ns
+rdtscp                    cycles        14 ns
 sched_clock               ns             9 ns
 ktime_get_mono_fast_ns    ns            24 ns
 ktime_get_raw_fast_ns     ns            24 ns

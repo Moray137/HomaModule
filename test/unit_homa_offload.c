@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 #include "homa_impl.h"
 #include "homa_offload.h"
@@ -42,7 +42,7 @@ FIXTURE_SETUP(homa_offload)
 	int i;
 
 	homa_init(&self->homa);
-	self->hnet = mock_alloc_hnet(&self->homa);
+	self->hnet = mock_hnet(0, &self->homa);
 	self->homa.flags |= HOMA_FLAG_DONT_THROTTLE;
 	self->homa.unsched_bytes = 10000;
 	mock_sock_init(&self->hsk, self->hnet, 99);
@@ -337,7 +337,6 @@ TEST_F(homa_offload, homa_gro_receive__fast_grant_optimization)
 	h.common.type = GRANT;
 	h.offset = htonl(11000);
 	h.priority = 3;
-	h.resend_all = 0;
 
 	/* First attempt: HOMA_GRO_FAST_GRANTS not enabled. */
 	self->homa.gro_policy = 0;

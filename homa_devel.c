@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-2-Clause
+// SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+
 
 /* This file contains functions that are useful to have in Homa during
  * development, but aren't needed in production versions.
@@ -10,11 +10,14 @@
 #include "homa_peer.h"
 #include "homa_rpc.h"
 #ifndef __STRIP__ /* See strip.py */
+#include "homa_qdisc.h"
 #include "homa_skb.h"
 #else /* See strip.py */
 #include "homa_stub.h"
 #endif /* See strip.py */
 #include "homa_wire.h"
+
+#include <linux/rbtree_augmented.h>
 
 #ifndef __STRIP__ /* See strip.py */
 /* homa_drop_packet will accept this many more packets before it drops some. */
@@ -28,6 +31,20 @@ static int drop_count;
 /* Used for random-number generation. */
 static u32 seed;
 #endif /* See strip.py */
+
+/* Used to record a history of rx state. */
+#define MAX_RX_SNAPSHOTS 1000
+static struct homa_rpc_snapshot rpc_snapshots[MAX_RX_SNAPSHOTS];
+static int next_snapshot;
+
+/* homa_clock() time when most recent rx snapshot was taken. */
+u64 snapshot_time;
+
+/* Interval between rx snapshots in ms. */
+#define RX_SNAPSHOT_INTERVAL 20
+
+/* Interval between rx snapshots, in homa_clock() units. */
+u64 snapshot_interval;
 
 /**
  * homa_print_ipv4_addr() - Convert an IPV4 address to the standard string
@@ -154,9 +171,7 @@ char *homa_print_packet(struct sk_buff *skb, char *buffer, int buf_len)
 				seg_length = homa_info->data_bytes;
 			data_left = homa_info->data_bytes - seg_length;
 		}
-		offset = ntohl(h->seg.offset);
-		if (offset == -1)
-			offset = ntohl(h->common.sequence);
+		offset = homa_get_offset(h);
 #ifndef __STRIP__ /* See strip.py */
 		used = homa_snprintf(buffer, buf_len, used,
 				     ", message_length %d, offset %d, data_length %d, incoming %d",
@@ -203,11 +218,10 @@ char *homa_print_packet(struct sk_buff *skb, char *buffer, int buf_len)
 #ifndef __STRIP__ /* See strip.py */
 	case GRANT: {
 		struct homa_grant_hdr *h = (struct homa_grant_hdr *)header;
-		char *resend = (h->resend_all) ? ", resend_all" : "";
 
 		used = homa_snprintf(buffer, buf_len, used,
-				     ", offset %d, grant_prio %u%s",
-				     ntohl(h->offset), h->priority, resend);
+				     ", offset %d, grant_prio %u",
+				     ntohl(h->offset), h->priority);
 		break;
 	}
 #endif /* See strip.py */
@@ -306,9 +320,7 @@ char *homa_print_packet_short(struct sk_buff *skb, char *buffer, int buf_len)
 			seg_length = homa_info->seg_length;
 			data_left = homa_info->data_bytes - seg_length;
 		}
-		offset = ntohl(h->seg.offset);
-		if (offset == -1)
-			offset = ntohl(h->common.sequence);
+		offset = homa_get_offset(h);
 
 		pos = skb_transport_offset(skb) + sizeof(*h) + seg_length;
 		used = homa_snprintf(buffer, buf_len, 0, "DATA%s %d@%d",
@@ -335,10 +347,9 @@ char *homa_print_packet_short(struct sk_buff *skb, char *buffer, int buf_len)
 #ifndef __STRIP__ /* See strip.py */
 	case GRANT: {
 		struct homa_grant_hdr *h = (struct homa_grant_hdr *)header;
-		char *resend = h->resend_all ? " resend_all" : "";
 
-		snprintf(buffer, buf_len, "GRANT %d@%d%s", ntohl(h->offset),
-			 h->priority, resend);
+		snprintf(buffer, buf_len, "GRANT %d@%d", ntohl(h->offset),
+			 h->priority);
 		break;
 	}
 #endif /* See strip.py */
@@ -398,7 +409,7 @@ void homa_freeze_peers(void)
 	int err;
 
 	/* Find a socket to use (any socket for the namespace will do). */
-	hnet = homa_net_from_net(&init_net);
+	hnet = homa_net(&init_net);
 	rcu_read_lock();
 	hsk = homa_socktab_start_scan(hnet->homa->socktab, &scan);
 	while (hsk && hsk->hnet != hnet)
@@ -412,8 +423,7 @@ void homa_freeze_peers(void)
 	freeze.common.type = FREEZE;
 	freeze.common.sport = htons(hsk->port);
 	freeze.common.dport = 0;
-	IF_NO_STRIP(freeze.common.flags = HOMA_TCP_FLAGS);
-	IF_NO_STRIP(freeze.common.urgent = htons(HOMA_TCP_URGENT));
+	IF_NO_STRIP(homa_set_hijack(&freeze.common));
 	freeze.common.sender_id = 0;
 
 	rhashtable_walk_enter(&hnet->homa->peertab->ht, &iter);
@@ -912,5 +922,350 @@ int homa_drop_packet(struct homa *homa)
 		tt_record2("homa_drop_packet set accept_count %d, drop_count 0x%x",
 			   accept_count, drop_count);
 	}
+}
+#endif /* See strip.py */
+
+/**
+ * homa_snapshot_get_stats() - Fill in a homa_rpc_snapshot with the latest
+ * statistics.
+ * @snap:    Structure to fill in.
+ */
+void homa_snapshot_get_stats(struct homa_rpc_snapshot *snap)
+{
+	IF_NO_STRIP(int core);
+
+	memset(snap, 0, sizeof(*snap));
+	snap->clock = homa_clock();
+#ifndef __STRIP__ /* See strip.py */
+	for (core = 0; core < nr_cpu_ids; core++) {
+		struct homa_metrics *m = &per_cpu(homa_metrics, core);
+
+		snap->client_requests_started += m->client_requests_started;
+		snap->client_request_bytes_started +=
+				m->client_request_bytes_started;
+		snap->client_request_bytes_done += m->client_request_bytes_done;
+		snap->client_requests_done += m->client_requests_done;
+
+		snap->client_responses_started += m->client_responses_started;
+		snap->client_response_bytes_started +=
+				m->client_response_bytes_started;
+		snap->client_response_bytes_done +=
+				m->client_response_bytes_done;
+		snap->client_responses_done += m->client_responses_done;
+
+		snap->server_requests_started += m->server_requests_started;
+		snap->server_request_bytes_started +=
+				m->server_request_bytes_started;
+		snap->server_request_bytes_done += m->server_request_bytes_done;
+		snap->server_requests_done += m->server_requests_done;
+
+		snap->server_responses_started += m->server_responses_started;
+		snap->server_response_bytes_started +=
+				m->server_response_bytes_started;
+		snap->server_response_bytes_done +=
+				m->server_response_bytes_done;
+		snap->server_responses_done += m->server_responses_done;
+	}
+#endif /* See strip.py */
+}
+
+/**
+ * homa_snapshot_rpcs() - This function is called by homa_timer; it collects
+ * data about overall progress of client and server RPCs.
+ */
+void homa_snapshot_rpcs(void)
+{
+	struct homa_rpc_snapshot *snap;
+	u64 now = homa_clock();
+
+	if (snapshot_interval == 0)
+		snapshot_interval = homa_clock_khz() * RX_SNAPSHOT_INTERVAL;
+
+	if (now < snapshot_time + snapshot_interval)
+		return;
+	snapshot_time = now;
+	snap = &rpc_snapshots[next_snapshot];
+	homa_snapshot_get_stats(snap);
+	next_snapshot++;
+	if (next_snapshot >= MAX_RX_SNAPSHOTS)
+		next_snapshot = 0;
+}
+
+/**
+ * homa_rpc_snapshot_log_tt() - Dump all of the RPC snapshot data to the
+ * timetrace.
+ */
+void homa_rpc_snapshot_log_tt(void)
+{
+	u64 creq_base, creq_bbase, cresp_base, cresp_bbase;
+	u64 sreq_base, sreq_bbase, sresp_base, sresp_bbase;
+	struct homa_rpc_snapshot *snap;
+	u64 now = homa_clock();
+	u64 usecs;
+	int i;
+
+	i = next_snapshot;
+
+	/* Offset all the output values to start at 0, in order to avoid
+	 * wraparound in 32-bit timetrace values.
+	 */
+	creq_base = rpc_snapshots[i].client_requests_done;
+	creq_bbase = rpc_snapshots[i].client_request_bytes_done;
+	cresp_base = rpc_snapshots[i].client_responses_done;
+	cresp_bbase = rpc_snapshots[i].client_response_bytes_done;
+	sreq_base = rpc_snapshots[i].server_requests_done;
+	sreq_bbase = rpc_snapshots[i].server_request_bytes_done;
+	sresp_base = rpc_snapshots[i].server_responses_done;
+	sresp_bbase = rpc_snapshots[i].server_response_bytes_done;
+	do {
+		snap = &rpc_snapshots[i];
+
+		/* Compute how many microseconds before now this snapshot
+		 * was taken.
+		 */
+		usecs = 1000*(now - snap->clock);
+		do_div(usecs, homa_clock_khz());
+
+		tt_record1("rpc snapshot usecs %d", -usecs);
+		tt_record4("rpc snapshot client requests started %d, kbytes_started %d, kbytes_done %d, done %d",
+			   snap->client_requests_started - creq_base,
+			   (snap->client_request_bytes_started -
+			    creq_bbase) >> 10,
+			   (snap->client_request_bytes_done -
+			    creq_bbase) >> 10,
+			   snap->client_requests_done - creq_base);
+		tt_record4("rpc snapshot client responses started %d, kbytes_started %d, kbytes_done %d, done %d",
+			   snap->client_responses_started - cresp_base,
+			   (snap->client_response_bytes_started -
+			    cresp_bbase) >> 10,
+			   (snap->client_response_bytes_done -
+			    cresp_bbase) >> 10,
+			   snap->client_responses_done - cresp_base);
+		tt_record4("rpc snapshot server requests started %d, kbytes_started %d, kbytes_done %d, done %d",
+			   snap->server_requests_started - sreq_base,
+			   (snap->server_request_bytes_started -
+			    sreq_bbase) >> 10,
+			   (snap->server_request_bytes_done -
+			    sreq_bbase) >> 10,
+			   snap->server_requests_done - sreq_base);
+		tt_record4("rpc snapshot server responses started %d, kbytes_started %d, kbytes_done %d, done %d",
+			   snap->server_responses_started - sresp_base,
+			   (snap->server_response_bytes_started -
+			    sresp_bbase) >> 10,
+			   (snap->server_response_bytes_done -
+			    sresp_bbase) >> 10,
+			   snap->server_responses_done - sresp_base);
+
+		i++;
+		if (i >= MAX_RX_SNAPSHOTS)
+			i = 0;
+	} while (i != next_snapshot);
+}
+
+/**
+ * homa_rpc_stats_log() - Print statistics on RPC progress to the system log.
+ */
+void homa_rpc_stats_log(void)
+{
+	struct homa_rpc_snapshot snap;
+
+	homa_snapshot_get_stats(&snap);
+	pr_notice("Client requests: started %llu, done %llu, delta %llu\n",
+		  snap.client_requests_started, snap.client_requests_done,
+		  snap.client_requests_started - snap.client_requests_done);
+	pr_notice("Client request bytes: started %llu, bytes_done %llu, delta %llu\n",
+		  snap.client_request_bytes_started,
+		  snap.client_request_bytes_done,
+		  snap.client_request_bytes_started -
+		  snap.client_request_bytes_done);
+	pr_notice("Client responses: started %llu, done %llu, delta %llu\n",
+		  snap.client_responses_started, snap.client_responses_done,
+		  snap.client_responses_started - snap.client_responses_done);
+	pr_notice("Client response bytes: started %llu, bytes_done %llu, delta %llu\n",
+		  snap.client_response_bytes_started,
+		  snap.client_response_bytes_done,
+		  snap.client_response_bytes_started -
+		  snap.client_response_bytes_done);
+	pr_notice("Server requests: started %llu, done %llu, delta %llu\n",
+		  snap.server_requests_started, snap.server_requests_done,
+		  snap.server_requests_started - snap.server_requests_done);
+	pr_notice("Server request bytes: started %llu, bytes_done %llu, delta %llu\n",
+		  snap.server_request_bytes_started,
+		  snap.server_request_bytes_done,
+		  snap.server_request_bytes_started -
+		  snap.server_request_bytes_done);
+	pr_notice("Server responses: started %llu, done %llu, delta %llu\n",
+		  snap.server_responses_started, snap.server_responses_done,
+		  snap.server_responses_started - snap.server_responses_done);
+	pr_notice("Server response bytes: started %llu, bytes_done %llu, delta %llu\n",
+		  snap.server_response_bytes_started,
+		  snap.server_response_bytes_done,
+		  snap.server_response_bytes_started -
+		  snap.server_response_bytes_done);
+}
+
+#ifndef __STRIP__ /* See strip.py */
+/**
+ * homa_rpcs_deferred() - Return true if there are any RPCs with packets
+ * that have been deferred by homa_qdisc, false if there are none.
+ * @homa:      Overall information about the Homa protocol.
+ * Return:     See above.
+ */
+bool homa_rpcs_deferred(struct homa *homa)
+{
+	struct homa_qdisc_shared *qshared = homa->qshared;
+	struct homa_qdisc_dev *qdev;
+	bool result = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(qdev, &qshared->qdevs, links) {
+		if (homa_qdisc_any_deferred(qdev)) {
+			result = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return result;
+}
+
+/**
+ * homa_validate_rbtree() -  Scan the structure of a red-black tree and
+ * abort the kernel (dumping the timetrace) if the internal structure
+ * does not satisfy the required invariants.
+ * @node:     Node whose subtree should be scanned.
+ * @depth:    Depth of node (number of black nodes above this node, 0 for
+ *            root).
+ * @message:  Textual message identifying the point where this function
+ *            was invoked (used when reporting errors).
+ */
+void homa_validate_rbtree(struct rb_node *node, int depth, char *message)
+{
+	struct homa_rpc *rpc, *child_rpc;
+	struct rb_node *child;
+	static int max_depth;
+	int black, new_depth;
+
+	if (depth == 0) {
+		if (!node)
+			return;
+		if (!rb_is_black(node)) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree root is red");
+#else
+			tt_record("freezing because rbtree root is red");
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		max_depth = -1;
+	}
+
+	rpc = container_of(node, struct homa_rpc, qrpc.rb_node);
+	if (rpc->magic != HOMA_RPC_MAGIC) {
+#ifdef __UNIT_TEST__
+		FAIL("rpc id %llu (0x%px) in rbtree has bad magic 0x%x",
+			rpc->id, rpc, rpc->magic);
+#else
+		tt_record4("freezing because rpc id %d (0x%x%08x) in rbtree has bad magic 0x%x",
+			   rpc->id, tt_hi(rpc), tt_lo(rpc), rpc->magic);
+#endif /* __UNIT_TEST__ */
+		goto error;
+
+	}
+
+	black = rb_is_black(node);
+	new_depth = depth + black;
+	if (!node->rb_left || !node->rb_right) {
+		if (max_depth < 0) {
+			max_depth = new_depth;
+		} else if (max_depth != new_depth) {
+#ifdef __UNIT_TEST__
+			FAIL("inconsistent rbtree depths: %d and %d",
+			     max_depth, new_depth);
+#else
+			tt_record2("freezing because of inconsistent rbtree depths: %d and %d",
+				   max_depth, depth);
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		goto done;
+	}
+
+	child = node->rb_left;
+	if (child) {
+		child_rpc = container_of(child, struct homa_rpc, qrpc.rb_node);
+		if (__rb_parent(child->__rb_parent_color) != node) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree left child has bad parent, rpc id %llu",
+			     child_rpc->id);
+#else
+			tt_record1("freezing because rbtree left child has bad parent, rpc id %llu",
+				   child_rpc->id);
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		if (!black && !rb_is_black(child)) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree red parent has red left child");
+#else
+			tt_record("rbtree red parent has red left child");
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		if (!homa_qdisc_precedes(child_rpc, rpc)) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree contained out-of-order left child");
+#else
+			tt_record("freezing because rbtree contained out-of-order left child");
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		homa_validate_rbtree(child, depth + black, message);
+	}
+
+	child = node->rb_right;
+	if (child) {
+		if (__rb_parent(child->__rb_parent_color) != node) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree right child has bad parent, rpc id %llu",
+			     child_rpc->id);
+#else
+			tt_record1("freezing because rbtree right child has bad parent, rpc id %llu",
+				   child_rpc->id);
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		if (!black && !rb_is_black(child)) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree red parent has red right child");
+#else
+			tt_record("freezing because rbtree red parent has red right child");
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		child_rpc = container_of(child, struct homa_rpc, qrpc.rb_node);
+		if (!homa_qdisc_precedes(rpc, child_rpc)) {
+#ifdef __UNIT_TEST__
+			FAIL("rbtree contained out-of-order right child");
+#else
+			tt_record("freezing because rbtree rbtree contained out-of-order right child");
+#endif /* __UNIT_TEST__ */
+			goto error;
+		}
+		homa_validate_rbtree(child, depth + black, message);
+	}
+
+done:
+	return;
+
+error:
+#ifndef __UNIT_TEST__
+	tt_record(message);
+	if (!atomic_read(&tt_frozen)) {
+		tt_freeze();
+		pr_err("rbtree consistency error at %s\n", message);
+		tt_printk();
+		BUG_ON(1);
+	}
+#endif /* __UNIT_TEST__ */
 }
 #endif /* See strip.py */

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: BSD-2-Clause */
+/* SPDX-License-Identifier: BSD-2-Clause or GPL-2.0+ */
 
 /* This file defines structs and other things related to Homa sockets.  */
 
@@ -8,10 +8,6 @@
 /* Forward declarations. */
 struct homa;
 struct homa_pool;
-
-#ifndef __STRIP__ /* See strip.py */
-void     homa_sock_lock_slow(struct homa_sock *hsk);
-#endif /* See strip.py */
 
 /* Number of hash buckets in a homa_socktab. Must be a power of 2. */
 #define HOMA_SOCKTAB_BUCKET_BITS 10
@@ -80,18 +76,18 @@ struct homa_rpc_bucket {
 	 *    it has been looked up and before it has been locked.
 	 * 3. The lookup mechanism does not use RCU.  This is important because
 	 *    RPCs are created rapidly and typically live only a few tens of
-	 *    microseconds.  As of May 2027 RCU introduces a lag of about
+	 *    microseconds.  As of May 2025 RCU introduces a lag of about
 	 *    25 ms before objects can be deleted; for RPCs this would result
 	 *    in hundreds or thousands of RPCs accumulating before RCU allows
 	 *    them to be deleted.
 	 * This approach has the disadvantage that RPCs within a bucket share
-	 * locks and thus may not be able to work concurently, but there are
+	 * locks and thus may not be able to work concurrently, but there are
 	 * enough buckets in the table to make such colllisions rare.
 	 *
 	 * See "Homa Locking Strategy" in homa_impl.h for more info about
 	 * locking.
 	 */
-	spinlock_t lock __context__(rpc_bucket_lock, 1, 1);
+	spinlock_t lock;
 
 	/**
 	 * @id: identifier for this bucket, used in error messages etc.
@@ -169,7 +165,9 @@ struct homa_sock {
 	/**
 	 * @shutdown: True means the socket is no longer usable (either
 	 * shutdown has already been invoked, or the socket was never
-	 * properly initialized).
+	 * properly initialized). Note: can't use the SOCK_DEAD flag for
+	 * this because that flag doesn't get set until much later in the
+	 * process of closing a socket.
 	 */
 	bool shutdown;
 
@@ -181,6 +179,14 @@ struct homa_sock {
 
 	/** @socktab_links: Links this socket into a homa_socktab bucket. */
 	struct hlist_node socktab_links;
+
+	/**
+	 * @error_msg: Static string giving human-readable information about
+	 * the reason for the last error returned by a Homa kernel call.
+	 * Applications can fetch this with the HOMAIOCINFO ioctl to figure
+	 * out why a call failed.
+	 */
+	char *error_msg;
 
 	/* Information above is (almost) never modified; start a new
 	 * cache line below for info that is modified frequently.
@@ -214,7 +220,7 @@ struct homa_sock {
 
 	/**
 	 * @dead_rpcs: Contains RPCs for which homa_rpc_end has been
-	 * called, but their packet buffers haven't yet been freed.
+	 * called, but which have not yet been reaped by homa_rpc_reap.
 	 */
 	struct list_head dead_rpcs;
 
@@ -275,6 +281,17 @@ struct homa_sock {
 	 * for in-kernel purposes or user space purposes.
 	 */
 	bool in_kernel;
+
+	/**
+	 * @rx_actor: For NVMe/Homa zero-copy RX. If non-NULL (only valid when
+	 * @in_kernel is true), homa_recvmsg() delivers each DATA skb of the
+	 * received message to this read_sock-style actor, in increasing
+	 * message-offset order, instead of copying the message into the buffer
+	 * pool. The per-call actor context is supplied via
+	 * homa_recvmsg_args.rx_actor_ctx, not stored on the socket, so
+	 * multiple workers sharing one socket can each use their own buffer.
+	 */
+	sk_read_actor_t rx_actor;
 };
 
 /**
@@ -292,12 +309,15 @@ struct homa_v6_sock {
 #ifndef __STRIP__ /* See strip.py */
 void               homa_bucket_lock_slow(struct homa_rpc_bucket *bucket,
 					 u64 id);
+void               homa_sock_lock_slow(struct homa_sock *hsk);
 #endif /* See strip.py */
 int                homa_sock_bind(struct homa_net *hnet, struct homa_sock *hsk,
 				  u16 port);
 void               homa_sock_destroy(struct sock *sk);
 struct homa_sock  *homa_sock_find(struct homa_net *hnet, u16 port);
 int                homa_sock_init(struct homa_sock *hsk);
+void               homa_sock_set_rx_actor(struct homa_sock *hsk,
+					  sk_read_actor_t actor);
 void               homa_sock_shutdown(struct homa_sock *hsk);
 void               homa_sock_unlink(struct homa_sock *hsk);
 int                homa_sock_wait_wmem(struct homa_sock *hsk, int nonblocking);
@@ -316,7 +336,7 @@ struct homa_sock  *homa_socktab_start_scan(struct homa_socktab *socktab,
  * @hsk:     Socket to lock.
  */
 static inline void homa_sock_lock(struct homa_sock *hsk)
-	__acquires(&hsk->lock)
+	__acquires(hsk->lock)
 {
 	if (!spin_trylock_bh(&hsk->lock))
 		homa_sock_lock_slow(hsk);
@@ -327,7 +347,7 @@ static inline void homa_sock_lock(struct homa_sock *hsk)
  * @hsk:     Socket to lock.
  */
 static inline void homa_sock_lock(struct homa_sock *hsk)
-	__acquires(&hsk->lock)
+	__acquires(hsk->lock)
 {
 	spin_lock_bh(&hsk->lock);
 }
@@ -338,7 +358,7 @@ static inline void homa_sock_lock(struct homa_sock *hsk)
  * @hsk:   Socket to lock.
  */
 static inline void homa_sock_unlock(struct homa_sock *hsk)
-	__releases(&hsk->lock)
+	__releases(hsk->lock)
 {
 	spin_unlock_bh(&hsk->lock);
 }
@@ -375,8 +395,8 @@ static inline struct homa_rpc_bucket
 	/* We can use a really simple hash function here because RPC ids
 	 * are allocated sequentially.
 	 */
-	return &hsk->client_rpc_buckets[(id >> 1)
-			& (HOMA_CLIENT_RPC_BUCKETS - 1)];
+	return &hsk->client_rpc_buckets[(id >> 1) &
+	       (HOMA_CLIENT_RPC_BUCKETS - 1)];
 }
 
 /**
@@ -406,7 +426,7 @@ static inline struct homa_rpc_bucket
  *             Used only for metrics.
  */
 static inline void homa_bucket_lock(struct homa_rpc_bucket *bucket, u64 id)
-	__acquires(rpc_bucket_lock)
+	__acquires(bucket->lock)
 {
 	if (!spin_trylock_bh(&bucket->lock))
 		homa_bucket_lock_slow(bucket, id);
@@ -419,7 +439,7 @@ static inline void homa_bucket_lock(struct homa_rpc_bucket *bucket, u64 id)
  *             Used only for metrics.
  */
 static inline void homa_bucket_lock(struct homa_rpc_bucket *bucket, u64 id)
-	__acquires(rpc_bucket_lock)
+	__acquires(bucket->lock)
 {
 	spin_lock_bh(&bucket->lock);
 }
@@ -431,7 +451,7 @@ static inline void homa_bucket_lock(struct homa_rpc_bucket *bucket, u64 id)
  * @id:       ID of the RPC that was using the lock.
  */
 static inline void homa_bucket_unlock(struct homa_rpc_bucket *bucket, u64 id)
-	__releases(rpc_bucket_lock)
+	__releases(bucket->lock)
 {
 	spin_unlock_bh(&bucket->lock);
 }
@@ -461,12 +481,18 @@ static inline bool homa_sock_wmem_avl(struct homa_sock *hsk)
  */
 static inline void homa_sock_wakeup_wmem(struct homa_sock *hsk)
 {
+	/* Note: can't use sk_stream_write_space for this functionality
+	 * because it uses a different test to determine whether enough
+	 * memory is available.
+	 */
 	if (test_bit(SOCK_NOSPACE, &hsk->sock.sk_socket->flags) &&
 	    homa_sock_wmem_avl(hsk)) {
 		tt_record2("homa_sock_wakeup_wmem waking up port %d, wmem %d",
 			   hsk->port, refcount_read(&hsk->sock.sk_wmem_alloc));
 		clear_bit(SOCK_NOSPACE, &hsk->sock.sk_socket->flags);
+		rcu_read_lock();
 		wake_up_interruptible_poll(sk_sleep(&hsk->sock), EPOLLOUT);
+		rcu_read_unlock();
 	}
 }
 

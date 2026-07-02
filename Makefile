@@ -4,7 +4,6 @@ HOMA_OBJS := homa_devel.o \
 	homa_incoming.o \
 	homa_interest.o \
 	homa_outgoing.o \
-	homa_pacer.o \
 	homa_peer.o \
 	homa_pool.o \
 	homa_plumbing.o \
@@ -20,6 +19,8 @@ else
 HOMA_OBJS += homa_grant.o \
 	homa_metrics.o \
 	homa_offload.o \
+	homa_pacer.o \
+	homa_qdisc.o \
 	homa_skb.o
 endif
 
@@ -57,24 +58,24 @@ kdoc:
 	$(LINUX_SRC_DIR)/scripts/kernel-doc -none $(CHECK_SRCS)
 
 checkpatch:
-	$(LINUX_SRC_DIR)/scripts/checkpatch.pl --file --strict $(CHECK_SRCS)
+	$(LINUX_SRC_DIR)/scripts/checkpatch.pl --file --strict  --codespell $(CHECK_SRCS)
 
 # Copy stripped source files to a Linux source tree
 HOMA_TARGET ?= $(LINUX_SRC_DIR)/net/homa
 CP_HDRS := homa_impl.h \
 	   homa_interest.h \
-	   homa_pacer.h \
 	   homa_peer.h \
 	   homa_pool.h \
 	   homa_rpc.h \
 	   homa_sock.h \
 	   homa_stub.h \
-	   homa_wire.h
+	   homa_wire.h \
+	   murmurhash3.h
 CP_SRCS := $(patsubst %.o,%.c,$(filter-out homa_devel.o homa_grant.o \
-		homa_metrics.o homa_offload.o homa_skb.o timetrace.o, $(HOMA_OBJS)))
+		homa_metrics.o homa_offload.o homa_pacer.o homa_qdisc.o \
+		homa_skb.o timetrace.o, $(HOMA_OBJS)))
 CP_EXTRAS := Kconfig \
-	     Makefile \
-	     strip_decl.py
+	     Makefile
 CP_TARGETS := $(patsubst %,$(HOMA_TARGET)/%,$(CP_HDRS) $(CP_SRCS) $(CP_EXTRAS))
 net-next: $(CP_TARGETS) $(LINUX_SRC_DIR)/include/uapi/linux/homa.h
 $(HOMA_TARGET)/%: % util/strip.py
