@@ -468,11 +468,15 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 #ifndef __STRIP__ /* See strip.py */
 	rpc->msgout.granted = rpc->msgout.unscheduled;
 #endif /* See strip.py */
-	if (!zerocopy) {
-		u64 stash_t = ktime_get_ns();
+	{
+		u64 now = ktime_get_ns();
 
-		homa_skb_stash_pages(rpc->hsk->homa, rpc->msgout.length);
-		INC_METRIC(temp[3], ktime_get_ns() - stash_t);
+		INC_METRIC(temp[8], now - fill_start_ns);   /* setup phase */
+		if (!zerocopy) {
+			homa_skb_stash_pages(rpc->hsk->homa,
+					     rpc->msgout.length);
+			INC_METRIC(temp[3], ktime_get_ns() - now);
+		}
 	}
 
 	/* Each iteration of the loop below creates one GSO packet. */
@@ -517,7 +521,12 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 		}
 		bytes_left -= skb_data_bytes;
 
-		homa_rpc_lock(rpc);
+		{
+			u64 lock_t = ktime_get_ns();
+
+			homa_rpc_lock(rpc);
+			INC_METRIC(temp[7], ktime_get_ns() - lock_t);
+		}
 		if (rpc->state == RPC_DEAD) {
 			/* RPC was freed while we were copying. */
 			rpc->hsk->error_msg = "rpc deleted while creating outgoing message";

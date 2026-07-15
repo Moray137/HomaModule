@@ -31,6 +31,7 @@ declare -A R_TPUT R_P50 R_P90 R_P99
 declare -A R_FILL R_ALLOC R_XMIT R_STASH R_COUNT
 declare -A R_TXLAT_P50 R_TXLAT_P90 R_TXLAT_P99
 declare -A R_IQXMIT R_NPKTS R_SKBFREE
+declare -A R_SETUP R_LOCK R_RESID
 
 # Format ns with auto unit: >=10000ns → X.Xus, otherwise Xns
 fmt_ns() {
@@ -102,7 +103,7 @@ run_one() {
     R_TXLAT_P99[$key]=$(echo "$txlat" | grep -oP '^p99 \K[0-9]+' || echo "0")
 
     # Sum temp[] across all cores + collect skb_free metrics
-    local t0=0 t1=0 t2=0 t3=0 t4=0 t5=0 t6=0
+    local t0=0 t1=0 t2=0 t3=0 t4=0 t5=0 t6=0 t7=0 t8=0
     local skb_free_cyc=0 skb_free_cnt=0 cpu_khz=0
 
     # Get cpu_khz first (appears once, not per-core)
@@ -119,10 +120,12 @@ run_one() {
             temp4) t4=$((t4 + val)) ;;
             temp5) t5=$((t5 + val)) ;;
             temp6) t6=$((t6 + val)) ;;
+            temp7) t7=$((t7 + val)) ;;
+            temp8) t8=$((t8 + val)) ;;
             skb_free_cycles) skb_free_cyc=$((skb_free_cyc + val)) ;;
             skb_frees) skb_free_cnt=$((skb_free_cnt + val)) ;;
         esac
-    done < <(grep -E '^(temp[0-6]|skb_free_cycles|skb_frees) ' /proc/net/homa_metrics)
+    done < <(grep -E '^(temp[0-8]|skb_free_cycles|skb_frees) ' /proc/net/homa_metrics)
 
     R_COUNT[$key]=$t4
     if [ "$t4" -gt 0 ] && [ "$cpu_khz" -gt 0 ]; then
@@ -132,18 +135,23 @@ run_one() {
         R_STASH[$key]=$((t3 / t4))
         R_IQXMIT[$key]=$((t5 / t4))
         R_NPKTS[$key]=$((t6 / t4))
+        R_SETUP[$key]=$((t8 / t4))
+        R_LOCK[$key]=$((t7 / t4))
+        # fill residual = fill - setup - stash - alloc - lock - xmit_in_fill
+        R_RESID[$key]=$(( (t0 - t8 - t3 - t1 - t7 - t2) / t4 ))
         # cycles → ns: ns = cycles * 1000000 / cpu_khz
         local skb_free_ns
         skb_free_ns=$(echo "$skb_free_cyc * 1000000 / $cpu_khz / $t4" | bc)
         R_SKBFREE[$key]=$skb_free_ns
         echo ""
         echo "  temp[] avg (ns/call, $t4 RPCs, $t6 pkts):"
-        echo "    fill=${R_FILL[$key]}  alloc=${R_ALLOC[$key]}  xmit_in_fill=${R_XMIT[$key]}  stash=${R_STASH[$key]}"
+        echo "    fill=${R_FILL[$key]}  setup=${R_SETUP[$key]}  alloc=${R_ALLOC[$key]}  lock=${R_LOCK[$key]}  xmit_in_fill=${R_XMIT[$key]}  stash=${R_STASH[$key]}  residual=${R_RESID[$key]}"
         echo "    iq_xmit/rpc=${R_IQXMIT[$key]}  pkts/rpc=${R_NPKTS[$key]}  iq_xmit/pkt=$((t5 / t6))"
         echo "    skb_free/rpc=$(fmt_ns "$skb_free_ns") ($skb_free_cnt skbs freed)"
     else
         R_FILL[$key]=0; R_ALLOC[$key]=0; R_XMIT[$key]=0; R_STASH[$key]=0
         R_IQXMIT[$key]=0; R_NPKTS[$key]=0; R_SKBFREE[$key]=0
+        R_SETUP[$key]=0; R_LOCK[$key]=0; R_RESID[$key]=0
         echo "  temp[]: (no samples)"
     fi
 
@@ -169,10 +177,10 @@ echo ""
 echo "=============================================================================="
 echo " SUMMARY"
 echo "=============================================================================="
-printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s %9s\n" \
-    "Size" "Mode" "Tput" "txP50us" "txP90us" "txP99us" \
-    "fill" "alloc" "stash" "iq_xmit" "pkts" "iq/pkt" "skb_free" "free/pkt"
-printf "%s\n" "----------------------------------------------------------------------------------------------------------------------"
+printf "%-8s %-5s %7s %9s %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
+    "Size" "Mode" "Tput" "txP50us" \
+    "fill" "setup" "alloc" "lock" "resid" "stash" "iq_xmit" "iq/pkt" "pkts" "skb_free" "free/pkt"
+printf "%s\n" "--------------------------------------------------------------------------------------------------------------------------------------"
 
 for i in "${!SIZES[@]}"; do
     size=${SIZES[$i]}
@@ -193,22 +201,22 @@ for i in "${!SIZES[@]}"; do
             iq_per_pkt=0
             free_per_pkt=0
         fi
-        printf "%-8s %-5s %5s/s %6s.%sus %6s.%sus %6s.%sus %9s %9s %9s %9s %5s %9s %9s %9s\n" \
+        printf "%-8s %-5s %5s/s %6s.%sus %9s %9s %9s %9s %9s %9s %9s %9s %5s %9s %9s\n" \
             "$name" "$mode" \
             "${R_TPUT[$key]:-?}" \
             "$((local_p50 / 1000))" "$(( (local_p50 % 1000) / 100 ))" \
-            "$((local_p90 / 1000))" "$(( (local_p90 % 1000) / 100 ))" \
-            "$((local_p99 / 1000))" "$(( (local_p99 % 1000) / 100 ))" \
-            "$(fmt_ns "${R_FILL[$key]:-0}")" "$(fmt_ns "${R_ALLOC[$key]:-0}")" \
-            "$(fmt_ns "${R_STASH[$key]:-0}")" \
-            "$(fmt_ns "$iqxmit")" "$npkts" "$(fmt_ns "$iq_per_pkt")" \
+            "$(fmt_ns "${R_FILL[$key]:-0}")" "$(fmt_ns "${R_SETUP[$key]:-0}")" \
+            "$(fmt_ns "${R_ALLOC[$key]:-0}")" "$(fmt_ns "${R_LOCK[$key]:-0}")" \
+            "$(fmt_ns "${R_RESID[$key]:-0}")" "$(fmt_ns "${R_STASH[$key]:-0}")" \
+            "$(fmt_ns "$iqxmit")" "$(fmt_ns "$iq_per_pkt")" "$npkts" \
             "$(fmt_ns "$skbfree")" "$(fmt_ns "$free_per_pkt")"
     done
 done
 
 echo ""
-echo "  txP50/P90/P99 = TX-only fill-to-last-departure (homa_tx_lat)"
-echo "  fill/alloc/stash = per-RPC avg (homa_message_out_fill breakdown)"
+echo "  txP50 = TX-only fill-to-last-departure (homa_tx_lat)"
+echo "  fill = setup + stash + alloc + lock + xmit_in_fill + resid (per-RPC homa_message_out_fill)"
+echo "    setup=init+geometry+dst lookup | lock=homa_rpc_lock re-acquire | resid=unlock+bookkeeping"
 echo "  iq_xmit = per-RPC total ip_queue_xmit (all paths) | iq/pkt = per-GSO-pkt"
 echo "  skb_free = per-RPC SKB release cost (put_page + consume_skb) | free/pkt = per-GSO-pkt"
 echo "=============================================================================="
