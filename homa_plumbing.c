@@ -552,6 +552,13 @@ static struct ctl_table homa_ctl_table[] = {
 		.proc_handler	= homa_dointvec
 	},
 	{
+		.procname	= "sort_rx_packets",
+		.data		= OFFSET(sort_rx_packets),
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= homa_dointvec
+	},
+	{
 		.procname	= "temp",
 		.data		= OFFSET(temp[0]),
 		.maxlen		= sizeof(((struct homa *)0)->temp),

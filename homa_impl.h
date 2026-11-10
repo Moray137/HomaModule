@@ -366,6 +366,13 @@ struct homa {
 	int hijack_tcp;
 
 	/**
+	 * @sort_rx_packets: Nonzero keeps incoming DATA skbs ordered by
+	 * message offset as they arrive, for in-kernel byte-stream consumers.
+	 * Set externally via sysctl; defaults to zero.
+	 */
+	int sort_rx_packets;
+
+	/**
 	 * @max_gro_skbs: Maximum number of socket buffers that can be
 	 * aggregated by the GRO mechanism.  Set externally via sysctl.
 	 */

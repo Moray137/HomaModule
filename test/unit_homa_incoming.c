@@ -367,6 +367,28 @@ TEST_F(homa_incoming, homa_add_packet__basics)
 			unit_log_get());
 	EXPECT_EQ(4, skb_queue_len(&crpc->msgin.packets));
 }
+#ifndef __STRIP__ /* See strip.py */
+TEST_F(homa_incoming, homa_add_packet__sort_rx_packets)
+{
+	struct homa_rpc *crpc = unit_client_rpc(&self->hsk,
+			UNIT_OUTGOING, self->client_ip, self->server_ip,
+			self->server_port, 99, 1000, 1000);
+	int offsets[] = {1400, 4200, 0, 2800, 5600};
+	int i;
+
+	self->homa.sort_rx_packets = 1;
+	homa_message_in_init(crpc, 10000, 0);
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		self->data.seg.offset = htonl(offsets[i]);
+		homa_add_packet(crpc, mock_skb_alloc(self->client_ip,
+				&self->data.common, 1400, offsets[i]));
+	}
+	unit_log_clear();
+	unit_log_skb_list(&crpc->msgin.packets, 0);
+	EXPECT_STREQ("DATA 1400@0; DATA 1400@1400; DATA 1400@2800; DATA 1400@4200; DATA 1400@5600",
+			unit_log_get());
+}
+#endif /* See strip.py */
 TEST_F(homa_incoming, homa_add_packet__packet_overlaps_message_end)
 {
 	struct homa_rpc *crpc = unit_client_rpc(&self->hsk,

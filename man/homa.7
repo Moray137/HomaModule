@@ -859,6 +859,12 @@ not release pages from a pool if the amount of unused space in
 the pool has been less than this (specified in Kbytes) at any point
 in the recent past.
 .TP
+.IR sort_rx_packets
+If nonzero, Homa inserts each incoming DATA packet into its message queue
+in increasing byte-offset order, scanning backwards from the queue tail.
+This keeps packets ready for in-order delivery to in-kernel consumers.
+The default is 0, which retains the original arrival-order queueing.
+.TP
 .IR tcp_credit_increment
 Determines the granularity of bandwidth sharing among qdiscs that have
 deferred TCP output packets. Read the code in homa_qdisc.c to learn more
