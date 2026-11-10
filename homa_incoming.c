@@ -321,7 +321,26 @@ ignore:
 	return reason;
 
 keep:
+#ifndef __STRIP__ /* See strip.py */
+	if (rpc->hsk->homa->sort_rx_packets) {
+		struct homa_data_hdr *h2;
+		struct sk_buff *pos;
+
+		/* Scan back from the tail: packets usually arrive in order.
+		 * If every packet is later, pos ends at the list head.
+		 */
+		skb_queue_reverse_walk(&rpc->msgin.packets, pos) {
+			h2 = (struct homa_data_hdr *)pos->data;
+			if (ntohl(h2->seg.offset) < start)
+				break;
+		}
+		__skb_queue_after(&rpc->msgin.packets, pos, skb);
+	} else {
+		__skb_queue_tail(&rpc->msgin.packets, skb);
+	}
+#else /* See strip.py */
 	__skb_queue_tail(&rpc->msgin.packets, skb);
+#endif /* See strip.py */
 	skb_get(skb);
 	rpc->msgin.bytes_remaining -= length;
 #ifndef __STRIP__ /* See strip.py */

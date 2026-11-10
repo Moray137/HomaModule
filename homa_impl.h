@@ -323,6 +323,14 @@ struct homa {
 	 * perform TSO. Set externally via sysctl.
 	 */
 	int gso_force_software;
+
+	/**
+	 * @sort_rx_packets: A non-zero value will cause Homa to keep the
+	 * packets of each incoming message sorted by offset, so that
+	 * in-kernel consumers can process them as a byte stream. Set
+	 * externally via sysctl.
+	 */
+	int sort_rx_packets;
 #endif /* See strip.py */
 
 	/**

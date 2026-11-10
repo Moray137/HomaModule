@@ -861,6 +861,13 @@ into two different parameters:
 and
 .IR window .
 .TP
+.IR sort_rx_packets
+If this value is nonzero, Homa keeps the packets of each incoming message
+sorted by offset as they arrive, so that in-kernel consumers can process
+the message as a byte stream. Homa inserts each packet by scanning back
+from the most recent one, so packets that arrive in order cost no extra
+work. The default is 0.
+.TP
 .IR timeout_ticks
 If this much time elapses without any signs of life from a node (such as
 sending a DATA or GRANT packet), its peers may declare it nonresponsive
