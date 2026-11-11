@@ -181,6 +181,7 @@ static void compute_results(void)
 	u64 p50, p90, p99;
 	int achieved_rate, elapsed_ms;
 	u64 *scratch = NULL;
+	u64 *sorted;
 	int cls, i;
 
 	if (n == 0) {
@@ -188,79 +189,74 @@ static void compute_results(void)
 		return;
 	}
 
-	/* Per-size percentiles are computed after collection, not logged
-	 * per I/O, so measurement adds only one size-class byte per sample.
+	/* Preserve the unsorted latency/class pairs for per-size quantiles.
+	 * Size-class logging is only one byte per completed RPC.
 	 */
 	if (mixed_workload)
 		scratch = kvmalloc_array(n, sizeof(*scratch), GFP_KERNEL);
-
-	results_len = 0;
-	for (cls = 0; scratch && cls < KBENCH_MIX_CLASSES; cls++) {
-		int count = 0;
-
-		for (i = 0; i < n; i++)
-			if (lat_classes[i] == cls)
-				scratch[count++] = latencies[i];
-		if (!count)
-			continue;
-		sort(scratch, count, sizeof(*scratch), cmp_u64, NULL);
-		results_len += scnprintf(results_buf + results_len,
-			PAGE_SIZE - results_len,
-			"  %d KiB: n=%d p50=%llu.%01llu us p99=%llu.%01llu us\n",
-			mix_sizes[cls] / 1024, count,
-			scratch[count / 2] / 1000,
-			(scratch[count / 2] % 1000) / 100,
-			scratch[(count * 99) / 100] / 1000,
-			(scratch[(count * 99) / 100] % 1000) / 100);
+	if (scratch) {
+		memcpy(scratch, latencies, n * sizeof(*scratch));
+		sorted = scratch;
+	} else {
+		sorted = latencies;
 	}
-	kvfree(scratch);
 
-	sort(latencies, n, sizeof(u64), cmp_u64, NULL);
-	p50 = latencies[n / 2];
-	p90 = latencies[(n * 90) / 100];
-	p99 = latencies[(n * 99) / 100];
+	sort(sorted, n, sizeof(*sorted), cmp_u64, NULL);
+	p50 = sorted[n / 2];
+	p90 = sorted[(n * 90) / 100];
+	p99 = sorted[(n * 99) / 100];
 
 	elapsed_ms = (duration_sec - warmup_sec) * 1000;
 	achieved_rate = elapsed_ms > 0 ?
 		(int)((u64)n * 1000 / elapsed_ms) : 0;
 
-	/* Preserve the six-size details after the overall results. */
-	{
-		char *detail = NULL;
-		int detail_len = results_len;
+	results_len = scnprintf(results_buf, PAGE_SIZE,
+		"HomaKBench results:\n"
+		"  transport=%s tx_zc=%d rx_single_copy=%d nonblocking=%d\n"
+		"  workload=%s fixed_msg_size=%d rate=%d num_sockets=%d\n"
+		"  duration=%ds warmup=%ds simulate_app_copy=%d\n"
+		"  offered_slots_total=%d skipped_busy_total=%d failed_rpc=%d\n"
+		"  completed RPCs: %d\n"
+		"  P50: %llu.%01llu us\n"
+		"  P90: %llu.%01llu us\n"
+		"  P99: %llu.%01llu us\n"
+		"  throughput: %d RPCs/sec (achieved)\n",
+		transport, tx_zc, rx_single_copy, nonblocking,
+		workload, msg_size, rate, num_sockets,
+		duration_sec, warmup_sec, simulate_app_copy,
+		atomic_read(&offered_count),
+		atomic_read(&skipped_count), atomic_read(&failures),
+		n,
+		p50 / 1000, (p50 % 1000) / 100,
+		p90 / 1000, (p90 % 1000) / 100,
+		p99 / 1000, (p99 % 1000) / 100,
+		achieved_rate);
 
-		if (detail_len) {
-			detail = kmemdup_nul(results_buf, detail_len, GFP_KERNEL);
-			if (!detail)
-				detail_len = 0;
-		}
-		results_len = scnprintf(results_buf, PAGE_SIZE,
-			"HomaKBench results:\n"
-			"  transport=%s tx_zc=%d rx_single_copy=%d nonblocking=%d\n"
-			"  workload=%s fixed_msg_size=%d rate=%d num_sockets=%d\n"
-			"  duration=%ds warmup=%ds simulate_app_copy=%d\n"
-			"  offered_slots=%d skipped_busy=%d failed_rpc=%d\n"
-			"  completed RPCs: %d\n"
-			"  P50: %llu.%01llu us\n"
-			"  P90: %llu.%01llu us\n"
-			"  P99: %llu.%01llu us\n"
-			"  throughput: %d RPCs/sec (achieved)\n",
-			transport, tx_zc, rx_single_copy, nonblocking,
-			workload, msg_size, rate, num_sockets,
-			duration_sec, warmup_sec, simulate_app_copy,
-			atomic_read(&offered_count),
-			atomic_read(&skipped_count), atomic_read(&failures),
-			n,
-			p50 / 1000, (p50 % 1000) / 100,
-			p90 / 1000, (p90 % 1000) / 100,
-			p99 / 1000, (p99 % 1000) / 100,
-			achieved_rate);
-		if (detail) {
+	/* At end of the run only: derive each size-class percentile from
+	 * the recorded samples. Failure to allocate scratch affects only
+	 * the breakdown, not aggregate results.
+	 */
+	if (mixed_workload && scratch) {
+		for (cls = 0; cls < KBENCH_MIX_CLASSES; cls++) {
+			int count = 0;
+
+			for (i = 0; i < n; i++)
+				if (lat_classes[i] == cls)
+					scratch[count++] = latencies[i];
+			if (!count)
+				continue;
+			sort(scratch, count, sizeof(*scratch), cmp_u64, NULL);
 			results_len += scnprintf(results_buf + results_len,
-				PAGE_SIZE - results_len, "%s", detail);
-			kfree(detail);
+				PAGE_SIZE - results_len,
+				"  %d KiB: n=%d p50=%llu.%01llu us p99=%llu.%01llu us\n",
+				mix_sizes[cls] / 1024, count,
+				scratch[count / 2] / 1000,
+				(scratch[count / 2] % 1000) / 100,
+				scratch[(count * 99) / 100] / 1000,
+				(scratch[(count * 99) / 100] % 1000) / 100);
 		}
 	}
+	kvfree(scratch);
 	pr_info("%s", results_buf);
 }
 
