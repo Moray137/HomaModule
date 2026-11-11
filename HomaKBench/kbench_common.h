@@ -103,6 +103,16 @@ static inline int kbench_homa_send(struct socket *sock, struct msghdr *msg,
 	return ret;
 }
 
+/* Cheap corruption sentinels for the benchmark's constant-fill payload.
+ * This is not a full content hash; it avoids a second full scan of RX data.
+ */
+static inline bool kbench_pattern_ok(const char *buf, int len, u8 pattern)
+{
+	return len > 0 && (u8)buf[0] == pattern &&
+		(u8)buf[len / 2] == pattern &&
+		(u8)buf[len - 1] == pattern;
+}
+
 /* TCP framing: 4-byte network-order length prefix before each message. */
 #define KBENCH_TCP_HDR_SIZE	4
 
