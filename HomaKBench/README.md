@@ -70,9 +70,10 @@ cat /sys/kernel/debug/homakbench/results
 ```
 
 For an end-to-end pool-copy baseline that includes the former second copy,
-run `rx_single_copy=0 simulate_app_copy=1` on the client and
-`rx_single_copy=0` on the server. Do **not** enable
-`simulate_app_copy` for `rx_single_copy=1`.
+run `rx_single_copy=0 simulate_app_copy=1` on **both** the client and
+the server. Server-side `simulate_app_copy=1` copies pool bytes into
+a worker-local buffer, approximating the old Target pool-to-SG copy.
+Do **not** enable `simulate_app_copy` for `rx_single_copy=1`.
 Run the two-by-two TX/RX combinations without adding sorting as a separate
 benchmark knob.
 
