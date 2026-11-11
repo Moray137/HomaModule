@@ -52,10 +52,15 @@ int homa_message_in_init(struct homa_rpc *rpc, int length)
 	INIT_LIST_HEAD(&rpc->msgin.gaps);
 	rpc->msgin.bytes_remaining = length;
 	IF_NO_STRIP(rpc->msgin.birth = homa_clock());
-	err = homa_pool_alloc_msg(rpc);
-	if (err != 0) {
-		rpc->msgin.length = -1;
-		return err;
+	/* RX actors consume skbs directly; pool buffers are unnecessary. */
+	if (rpc->hsk->in_kernel && rpc->hsk->rx_actor) {
+		rpc->msgin.num_bpages = 0;
+	} else {
+		err = homa_pool_alloc_msg(rpc);
+		if (err != 0) {
+			rpc->msgin.length = -1;
+			return err;
+		}
 	}
 #ifndef __STRIP__ /* See strip.py */
 	homa_grant_init_rpc(rpc, unsched);
@@ -267,11 +272,17 @@ discard:
 
 keep:
 #ifndef __STRIP__ /* See strip.py */
-	if (rpc->hsk->homa->sort_rx_packets) {
+	if (rpc->hsk->homa->sort_rx_packets ||
+	    (rpc->hsk->in_kernel && rpc->hsk->rx_actor)) {
+#else /* See strip.py */
+	if (rpc->hsk->in_kernel && rpc->hsk->rx_actor) {
+#endif /* See strip.py */
 		struct homa_data_hdr *h2;
 		struct sk_buff *pos;
 
-		/* Scan backwards: packets typically arrive in offset order. */
+		/* Keep actor messages sorted on insertion; vanilla retains
+		 * the sort_rx_packets sysctl behavior.
+		 */
 		skb_queue_reverse_walk(&rpc->msgin.packets, pos) {
 			h2 = (struct homa_data_hdr *)pos->data;
 			if (ntohl(h2->seg.offset) < start)
@@ -281,9 +292,6 @@ keep:
 	} else {
 		__skb_queue_tail(&rpc->msgin.packets, skb);
 	}
-#else /* See strip.py */
-	__skb_queue_tail(&rpc->msgin.packets, skb);
-#endif /* See strip.py */
 	rpc->msgin.bytes_remaining -= length;
 #ifndef __STRIP__ /* See strip.py */
 	if (h->retransmit)
@@ -326,6 +334,7 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	struct sk_buff *skb;
 	int error = 0;
 	int n = 0;
+	int copied = 0;
 #ifndef __STRIP__ /* See strip.py */
 	u64 start;
 #endif /* See strip.py */
@@ -347,58 +356,10 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 		return 0;
 	}
 
-	/* Move all packets to a private queue sorted by message offset, so we
-	 * can present them to the actor as a contiguous, in-order byte stream.
-	 * Fast path: check if the queue is already sorted (the common case on
-	 * a LAN where packets arrive in order). If so, just splice it over in
-	 * O(1) instead of doing the O(n^2) insertion sort.
-	 */
+	/* Packet insertion already maintains offset order for RX actors. */
 	__skb_queue_head_init(&sorted);
 	n = skb_queue_len(&rpc->msgin.packets);
-	if (n > 1) {
-		int prev_offset = -1;
-		bool in_order = true;
-
-		skb_queue_walk(&rpc->msgin.packets, skb) {
-			struct homa_data_hdr *h =
-				(struct homa_data_hdr *)skb->data;
-			int off = ntohl(h->seg.offset);
-
-			if (off <= prev_offset) {
-				in_order = false;
-				break;
-			}
-			prev_offset = off;
-		}
-		if (in_order) {
-			skb_queue_splice_init(&rpc->msgin.packets, &sorted);
-		} else {
-			while ((skb = __skb_dequeue(&rpc->msgin.packets))) {
-				struct homa_data_hdr *h =
-					(struct homa_data_hdr *)skb->data;
-				int offset = ntohl(h->seg.offset);
-				struct sk_buff *cur;
-				bool inserted = false;
-
-				skb_queue_walk(&sorted, cur) {
-					struct homa_data_hdr *ch =
-						(struct homa_data_hdr *)
-						cur->data;
-
-					if (ntohl(ch->seg.offset) > offset) {
-						__skb_insert(skb, cur->prev,
-							     cur, &sorted);
-						inserted = true;
-						break;
-					}
-				}
-				if (!inserted)
-					__skb_queue_tail(&sorted, skb);
-			}
-		}
-	} else {
-		skb_queue_splice_init(&rpc->msgin.packets, &sorted);
-	}
+	skb_queue_splice_init(&rpc->msgin.packets, &sorted);
 	clear_bit(RPC_PKTS_READY, &rpc->flags);
 
 	/* Drop the lock while invoking the actor: it copies (potentially a lot
@@ -423,11 +384,14 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 			error = desc.error;
 			break;
 		}
-		if (used <= 0) {
-			error = -EFAULT;
+		if (used != pkt_length) {
+			error = used < 0 ? used : -EIO;
 			break;
 		}
+		copied += used;
 	}
+	if (!error && copied != rpc->msgin.length)
+		error = -EIO;
 
 #ifndef __STRIP__ /* See strip.py */
 	start = homa_clock();
@@ -447,18 +411,7 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 		return error ? error : -EINVAL;
 	}
 
-	/* The data never went through the buffer pool, so release the bpages
-	 * that were allocated for this message (they are required earlier so
-	 * that grants are issued and packets aren't dropped) and report zero
-	 * bpages to the caller.
-	 */
-	if (rpc->msgin.num_bpages > 0) {
-		homa_pool_release_buffers(rpc->hsk->buffer_pool,
-					  rpc->msgin.num_bpages,
-					  rpc->msgin.bpage_offsets);
-		rpc->msgin.num_bpages = 0;
-	}
-
+	/* No pool buffers were allocated for this RX actor message. */
 	homa_rpc_put(rpc);
 	return error;
 }
@@ -900,7 +853,8 @@ void homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc)
 			goto discard;
 	}
 
-	if (rpc->msgin.num_bpages == 0) {
+	if (!(rpc->hsk->in_kernel && rpc->hsk->rx_actor) &&
+	    rpc->msgin.num_bpages == 0) {
 		/* Drop packets that arrive when we can't allocate buffer
 		 * space. If we keep them around, packet buffer usage can
 		 * exceed available cache space, resulting in poor
@@ -920,7 +874,12 @@ void homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc)
 
 	homa_add_packet(rpc, skb);
 
+	/* Actor delivery waits for a complete message; vanilla still
+	 * wakes readers on partially received messages.
+	 */
 	if (skb_queue_len(&rpc->msgin.packets) != 0 &&
+	    (!(rpc->hsk->in_kernel && rpc->hsk->rx_actor) ||
+	     rpc->msgin.bytes_remaining == 0) &&
 	    !test_bit(RPC_PKTS_READY, &rpc->flags)) {
 		set_bit(RPC_PKTS_READY, &rpc->flags);
 		homa_rpc_handoff(rpc);
