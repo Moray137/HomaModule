@@ -334,6 +334,10 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 	if (ret != size ||
 	    (rx_single_copy && sc->actor_ctx.bytes_received != ret))
 		return -EIO;
+	if (rx_single_copy &&
+	    !kbench_pattern_ok(sc->actor_ctx.app_buf, ret,
+				KBENCH_REPLY_PATTERN))
+		return -EBADMSG;
 
 	/* Simulate the second pool-to-app copy for baseline mode. */
 	if (simulate_app_copy && !rx_single_copy && sc->app_copy_scratch &&
@@ -349,6 +353,10 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 			       sc->pool_region + off, chunk);
 			copied += chunk;
 		}
+		if (copied != ret ||
+		    !kbench_pattern_ok(sc->app_copy_scratch, ret,
+				KBENCH_REPLY_PATTERN))
+			return -EBADMSG;
 	}
 
 	return ret;
