@@ -6,6 +6,9 @@
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/inet.h>
+#include <linux/kthread.h>
+#include <linux/wait.h>
+#include <linux/jiffies.h>
 #include <net/sock.h>
 #include <net/inet_sock.h>
 
@@ -30,6 +33,74 @@ static inline int kbench_homa_setsockopt(struct socket *sock, int optname,
 {
 	return sock->sk->sk_prot->setsockopt(sock->sk, SOL_HOMA, optname,
 					      KERNEL_SOCKPTR(optval), optlen);
+}
+
+/* Homa returns a whole message. MSG_DONTWAIT only affects the syscall:
+ * a worker may sleep on socket readiness between nonblocking attempts.
+ * Register the wait entry BEFORE the first attempt to avoid missed wakeups.
+ */
+static inline int kbench_homa_recv(struct socket *sock, struct msghdr *msg,
+				  bool nonblocking)
+{
+	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+	int ret;
+
+	if (!nonblocking)
+		return kernel_recvmsg(sock, msg, NULL, 0, 0, 0);
+
+	add_wait_queue(sk_sleep(sock->sk), &wait);
+	for (;;) {
+		ret = kernel_recvmsg(sock, msg, NULL, 0, 0, MSG_DONTWAIT);
+		if (ret != -EAGAIN)
+			break;
+		if (kthread_should_stop()) {
+			ret = -EINTR;
+			break;
+		}
+		wait_woken(&wait, TASK_INTERRUPTIBLE,
+			   msecs_to_jiffies(100));
+	}
+	remove_wait_queue(sk_sleep(sock->sk), &wait);
+	return ret;
+}
+
+/* Homa kernel sendmsg returns 0 on success. -EAGAIN is retryable before
+ * constructing an RPC (the current Homa path checks TX memory first).
+ * Restore the iterator on every attempt, particularly for MSG_SPLICE_PAGES.
+ */
+static inline int kbench_homa_send(struct socket *sock, struct msghdr *msg,
+				  const struct kvec *kvec, size_t len,
+				  const struct bio_vec *bvec, int nr_bvec,
+				  bool tx_zc, bool nonblocking)
+{
+	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+	int ret;
+
+	if (nonblocking)
+		add_wait_queue(sk_sleep(sock->sk), &wait);
+	for (;;) {
+		msg->msg_flags = (nonblocking ? MSG_DONTWAIT : 0) |
+				 (tx_zc ? MSG_SPLICE_PAGES : 0);
+		if (tx_zc) {
+			iov_iter_bvec(&msg->msg_iter, ITER_SOURCE, bvec,
+				      nr_bvec, len);
+			ret = sock_sendmsg(sock, msg);
+		} else {
+			ret = kernel_sendmsg(sock, msg, (struct kvec *)kvec,
+					     1, len);
+		}
+		if (ret != -EAGAIN || !nonblocking)
+			break;
+		if (kthread_should_stop()) {
+			ret = -EINTR;
+			break;
+		}
+		wait_woken(&wait, TASK_INTERRUPTIBLE,
+			   msecs_to_jiffies(100));
+	}
+	if (nonblocking)
+		remove_wait_queue(sk_sleep(sock->sk), &wait);
+	return ret;
 }
 
 /* TCP framing: 4-byte network-order length prefix before each message. */
