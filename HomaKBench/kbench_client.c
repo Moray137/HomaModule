@@ -557,9 +557,9 @@ static int setup_homa_socket(struct sock_ctx *sc, int idx)
 		goto err;
 	}
 
-	/* rx_actor (ZC RX) disabled for now to isolate TX-only ZC effects.
-	 * Re-enable when RX ZC performance issues are resolved.
-	 */
+	if (rx_single_copy)
+		homa_sock_set_rx_actor(homa_sk(sc->sock->sk),
+				       kbench_rx_actor);
 
 	return 0;
 err:
