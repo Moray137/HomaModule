@@ -41,6 +41,10 @@ static int nonblocking;
 module_param(nonblocking, int, 0444);
 MODULE_PARM_DESC(nonblocking, "Use MSG_DONTWAIT with socket-readiness waits");
 
+static int simulate_app_copy;
+module_param(simulate_app_copy, int, 0444);
+MODULE_PARM_DESC(simulate_app_copy, "Copy vanilla RX pool contents into an app-like buffer");
+
 static char *bind_ip = "192.168.11.93";
 module_param(bind_ip, charp, 0444);
 MODULE_PARM_DESC(bind_ip, "IP to bind server socket");
@@ -62,6 +66,7 @@ struct server_worker {
 	int nr_reply_pages;
 	char *pool_region;
 	struct kbench_actor_ctx actor_ctx;
+	char *app_copy_scratch;
 };
 
 static struct server_worker *worker_state;
@@ -109,6 +114,26 @@ static int homa_worker_fn(void *data)
 		    (rx_single_copy && w->actor_ctx.bytes_received != ret)) {
 			pr_warn_ratelimited("kbench_server: invalid RX length %d\n", ret);
 			continue;
+		}
+		if (!rx_single_copy && simulate_app_copy) {
+			/* Match the extra pool-to-final-destination copy that
+			 * Target's vanilla NVMe/Homa receive path performs.
+			 */
+			int copied = 0, i;
+			char *pool = worker_state[0].pool_region;
+
+			for (i = 0; i < recv_args.num_bpages && copied < ret; i++) {
+				u32 off = recv_args.bpage_offsets[i];
+				int len = min_t(int, ret - copied, HOMA_BPAGE_SIZE);
+
+				memcpy(w->app_copy_scratch + copied, pool + off, len);
+				copied += len;
+			}
+			if (copied != ret) {
+				pr_warn_ratelimited("kbench_server: incomplete pool-to-app copy (%d/%d)\n",
+						    copied, ret);
+				continue;
+			}
 		}
 
 		/* Send response. */
@@ -385,7 +410,8 @@ static int __init kbench_server_init(void)
 		rx_single_copy = !!rx_actor_used;
 	if ((tx_zc != 0 && tx_zc != 1) ||
 	    (rx_single_copy != 0 && rx_single_copy != 1) ||
-	    (nonblocking != 0 && nonblocking != 1))
+	    (nonblocking != 0 && nonblocking != 1) ||
+	    (simulate_app_copy != 0 && simulate_app_copy != 1))
 		return -EINVAL;
 
 	nr_workers = num_online_cpus();
@@ -439,6 +465,14 @@ static int __init kbench_server_init(void)
 			worker_state[i].actor_ctx.buf_size =
 				KBENCH_MAX_MSG_SIZE;
 		}
+		if (!rx_single_copy && simulate_app_copy && is_homa) {
+			worker_state[i].app_copy_scratch =
+				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
+			if (!worker_state[i].app_copy_scratch) {
+				ret = -ENOMEM;
+				goto err_bufs;
+			}
+		}
 	}
 
 	if (is_homa)
@@ -463,6 +497,7 @@ err_bufs:
 		}
 		kvfree(worker_state[i].reply_buf);
 		kvfree(worker_state[i].actor_ctx.app_buf);
+		kvfree(worker_state[i].app_copy_scratch);
 	}
 	kfree(worker_state);
 	kfree(workers);
@@ -521,6 +556,7 @@ static void __exit kbench_server_exit(void)
 		}
 		kvfree(worker_state[i].reply_buf);
 		kvfree(worker_state[i].actor_ctx.app_buf);
+		kvfree(worker_state[i].app_copy_scratch);
 		kvfree(worker_state[i].pool_region);
 	}
 	kfree(worker_state);
