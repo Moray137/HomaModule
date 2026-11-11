@@ -21,6 +21,7 @@
 #include <linux/hrtimer.h>
 #include <linux/net.h>
 #include <linux/inet.h>
+#include <linux/random.h>
 #include <net/sock.h>
 
 #include "kbench_common.h"
@@ -31,6 +32,34 @@ module_param(transport, charp, 0444);
 
 static int zc;
 module_param(zc, int, 0444);
+
+/* tx_zc supersedes the old zc parameter if explicitly supplied. */
+static int tx_zc = -1;
+module_param(tx_zc, int, 0444);
+
+static int rx_single_copy;
+module_param(rx_single_copy, int, 0444);
+
+static int nonblocking;
+module_param(nonblocking, int, 0444);
+
+/* Synthetic six-size workload (request fractions in percent).
+ * 8KiB dominates and 4KiB represents the bottom 10% critical class.
+ * This is NOT the exact original blksw trace distribution.
+ */
+#define KBENCH_MIX_CLASSES 6
+static const int mix_sizes[KBENCH_MIX_CLASSES] = {
+	4096, 8192, 12288, 16384, 131072, 1048576
+};
+static int blksw_weights[KBENCH_MIX_CLASSES] = { 10, 57, 10, 10, 8, 5 };
+static unsigned int weights_count = KBENCH_MIX_CLASSES;
+module_param_array_named(blksw_weights, blksw_weights, int,
+			 &weights_count, 0444);
+static char *workload = "fixed";
+module_param(workload, charp, 0444);
+static bool mixed_workload;
+static int max_msg_size;
+static int mix_cumulative[KBENCH_MIX_CLASSES];
 
 static char *dst_ip = "192.168.11.93";
 module_param(dst_ip, charp, 0444);
@@ -83,7 +112,11 @@ struct sock_ctx {
 
 static struct sock_ctx *sockets;
 static u64 *latencies;
+static u8 *lat_classes;
 static atomic_t lat_count;
+static atomic_t offered_count;
+static atomic_t skipped_count;
+static atomic_t failures;
 static u64 experiment_start_ns;
 static volatile bool running;
 static volatile bool past_warmup;
@@ -96,12 +129,38 @@ static int results_len;
 
 /* ---------- Latency helpers ---------- */
 
-static void record_latency(u64 ns)
+static int kbench_pick_size(void)
+{
+	u32 draw;
+	int i;
+
+	if (!mixed_workload)
+		return msg_size;
+	draw = get_random_u32_below(100);
+	for (i = 0; i < KBENCH_MIX_CLASSES; i++)
+		if (draw < mix_cumulative[i])
+			return mix_sizes[i];
+	return mix_sizes[KBENCH_MIX_CLASSES - 1];
+}
+
+static u8 kbench_size_class(int size)
+{
+	int i;
+
+	for (i = 0; i < KBENCH_MIX_CLASSES; i++)
+		if (mix_sizes[i] == size)
+			return i;
+	return U8_MAX;
+}
+
+static void record_latency(u64 ns, u8 cls)
 {
 	int idx = atomic_fetch_add(1, &lat_count);
 
-	if (idx < MAX_SAMPLES)
+	if (idx < MAX_SAMPLES) {
 		latencies[idx] = ns;
+		lat_classes[idx] = cls;
+	}
 }
 
 static int cmp_u64(const void *a, const void *b)
@@ -120,13 +179,41 @@ static void compute_results(void)
 {
 	int n = min_t(int, atomic_read(&lat_count), MAX_SAMPLES);
 	u64 p50, p90, p99;
-	int achieved_rate;
-	int elapsed_ms;
+	int achieved_rate, elapsed_ms;
+	u64 *scratch = NULL;
+	int cls, i;
 
 	if (n == 0) {
 		pr_warn("kbench_client: no latency samples collected\n");
 		return;
 	}
+
+	/* Per-size percentiles are computed after collection, not logged
+	 * per I/O, so measurement adds only one size-class byte per sample.
+	 */
+	if (mixed_workload)
+		scratch = kvmalloc_array(n, sizeof(*scratch), GFP_KERNEL);
+
+	results_len = 0;
+	for (cls = 0; scratch && cls < KBENCH_MIX_CLASSES; cls++) {
+		int count = 0;
+
+		for (i = 0; i < n; i++)
+			if (lat_classes[i] == cls)
+				scratch[count++] = latencies[i];
+		if (!count)
+			continue;
+		sort(scratch, count, sizeof(*scratch), cmp_u64, NULL);
+		results_len += scnprintf(results_buf + results_len,
+			PAGE_SIZE - results_len,
+			"  %d KiB: n=%d p50=%llu.%01llu us p99=%llu.%01llu us\n",
+			mix_sizes[cls] / 1024, count,
+			scratch[count / 2] / 1000,
+			(scratch[count / 2] % 1000) / 100,
+			scratch[(count * 99) / 100] / 1000,
+			(scratch[(count * 99) / 100] % 1000) / 100);
+	}
+	kvfree(scratch);
 
 	sort(latencies, n, sizeof(u64), cmp_u64, NULL);
 	p50 = latencies[n / 2];
@@ -134,25 +221,46 @@ static void compute_results(void)
 	p99 = latencies[(n * 99) / 100];
 
 	elapsed_ms = (duration_sec - warmup_sec) * 1000;
-	achieved_rate = elapsed_ms > 0 ? (int)((u64)n * 1000 / elapsed_ms) : 0;
+	achieved_rate = elapsed_ms > 0 ?
+		(int)((u64)n * 1000 / elapsed_ms) : 0;
 
-	results_len = scnprintf(results_buf, PAGE_SIZE,
-		"HomaKBench results:\n"
-		"  transport=%s  zc=%d  msg_size=%d  rate=%d  num_sockets=%d\n"
-		"  duration=%ds  warmup=%ds  simulate_app_copy=%d\n"
-		"  completed RPCs: %d\n"
-		"  P50: %llu.%01llu us\n"
-		"  P90: %llu.%01llu us\n"
-		"  P99: %llu.%01llu us\n"
-		"  throughput: %d RPCs/sec (achieved)\n",
-		transport, zc, msg_size, rate, num_sockets,
-		duration_sec, warmup_sec, simulate_app_copy,
-		n,
-		p50 / 1000, (p50 % 1000) / 100,
-		p90 / 1000, (p90 % 1000) / 100,
-		p99 / 1000, (p99 % 1000) / 100,
-		achieved_rate);
+	/* Preserve the six-size details after the overall results. */
+	{
+		char *detail = NULL;
+		int detail_len = results_len;
 
+		if (detail_len) {
+			detail = kmemdup_nul(results_buf, detail_len, GFP_KERNEL);
+			if (!detail)
+				detail_len = 0;
+		}
+		results_len = scnprintf(results_buf, PAGE_SIZE,
+			"HomaKBench results:\n"
+			"  transport=%s tx_zc=%d rx_single_copy=%d nonblocking=%d\n"
+			"  workload=%s fixed_msg_size=%d rate=%d num_sockets=%d\n"
+			"  duration=%ds warmup=%ds simulate_app_copy=%d\n"
+			"  offered_slots=%d skipped_busy=%d failed_rpc=%d\n"
+			"  completed RPCs: %d\n"
+			"  P50: %llu.%01llu us\n"
+			"  P90: %llu.%01llu us\n"
+			"  P99: %llu.%01llu us\n"
+			"  throughput: %d RPCs/sec (achieved)\n",
+			transport, tx_zc, rx_single_copy, nonblocking,
+			workload, msg_size, rate, num_sockets,
+			duration_sec, warmup_sec, simulate_app_copy,
+			atomic_read(&offered_count),
+			atomic_read(&skipped_count), atomic_read(&failures),
+			n,
+			p50 / 1000, (p50 % 1000) / 100,
+			p90 / 1000, (p90 % 1000) / 100,
+			p99 / 1000, (p99 % 1000) / 100,
+			achieved_rate);
+		if (detail) {
+			results_len += scnprintf(results_buf + results_len,
+				PAGE_SIZE - results_len, "%s", detail);
+			kfree(detail);
+		}
+	}
 	pr_info("%s", results_buf);
 }
 
@@ -171,7 +279,7 @@ static const struct file_operations results_fops = {
 
 /* ---------- Homa RPC (one round-trip) ---------- */
 
-static int do_homa_rpc(struct sock_ctx *sc)
+static int do_homa_rpc(struct sock_ctx *sc, int size)
 {
 	struct homa_sendmsg_args send_args;
 	struct msghdr smsg, rmsg;
@@ -189,19 +297,13 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	smsg.msg_name = NULL;
 	smsg.msg_namelen = 0;
 
-	if (zc) {
-		iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, sc->tx_bvecs,
-			      sc->nr_tx_bvecs, msg_size);
-		smsg.msg_flags |= MSG_SPLICE_PAGES;
-		/* sock_sendmsg uses msg_iter as-is (kernel_sendmsg would
-		 * overwrite it with the kvec).
-		 */
-		ret = sock_sendmsg(sc->sock, &smsg);
-	} else {
+	{
 		struct kvec iov = { .iov_base = sc->tx_buf,
-				    .iov_len = msg_size };
+				    .iov_len = size };
 
-		ret = kernel_sendmsg(sc->sock, &smsg, &iov, 1, msg_size);
+		ret = kbench_homa_send(sc->sock, &smsg, &iov, size,
+					 sc->tx_bvecs, sc->nr_tx_bvecs,
+					 tx_zc, nonblocking);
 	}
 	if (ret < 0)
 		return ret;
@@ -214,10 +316,12 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	sc->recv_args.id = 0;
 	sc->recv_args.completion_cookie = 0;
 
-	if (zc) {
+	if (rx_single_copy) {
 		sc->actor_ctx.bytes_received = 0;
 		sc->recv_args.rx_actor_ctx =
 			(__u64)(uintptr_t)&sc->actor_ctx;
+	} else {
+		sc->recv_args.rx_actor_ctx = 0;
 	}
 
 	memset(&rmsg, 0, sizeof(rmsg));
@@ -227,12 +331,15 @@ static int do_homa_rpc(struct sock_ctx *sc)
 	rmsg.msg_namelen = sizeof(peer);
 	rmsg.msg_control_is_user = false;
 
-	ret = kernel_recvmsg(sc->sock, &rmsg, NULL, 0, 0, 0);
+	ret = kbench_homa_recv(sc->sock, &rmsg, nonblocking);
 	if (ret < 0)
 		return ret;
+	if (ret != size ||
+	    (rx_single_copy && sc->actor_ctx.bytes_received != ret))
+		return -EIO;
 
-	/* Simulate app copy if configured and not using ZC. */
-	if (simulate_app_copy && !zc && sc->app_copy_scratch &&
+	/* Simulate the second pool-to-app copy for baseline mode. */
+	if (simulate_app_copy && !rx_single_copy && sc->app_copy_scratch &&
 	    sc->recv_args.num_bpages > 0) {
 		int copied = 0, i;
 
@@ -252,27 +359,27 @@ static int do_homa_rpc(struct sock_ctx *sc)
 
 /* ---------- TCP RPC (one round-trip) ---------- */
 
-static int do_tcp_rpc(struct sock_ctx *sc)
+static int do_tcp_rpc(struct sock_ctx *sc, int size)
 {
 	__be32 net_len;
 	int ret, reply_len;
 
 	/* TX: length prefix + payload */
-	net_len = htonl(msg_size);
+	net_len = htonl(size);
 	ret = kbench_tcp_send_full(sc->sock, &net_len, KBENCH_TCP_HDR_SIZE,
 				   MSG_MORE);
 	if (ret < 0)
 		return ret;
 
-	if (zc) {
+	if (tx_zc) {
 		struct msghdr smsg = {};
 
 		iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, sc->tx_bvecs,
-			      sc->nr_tx_bvecs, msg_size);
+			      sc->nr_tx_bvecs, size);
 		smsg.msg_flags = MSG_SPLICE_PAGES;
 		ret = sock_sendmsg(sc->sock, &smsg);
 	} else {
-		ret = kbench_tcp_send_full(sc->sock, sc->tx_buf, msg_size, 0);
+		ret = kbench_tcp_send_full(sc->sock, sc->tx_buf, size, 0);
 	}
 	if (ret < 0)
 		return ret;
@@ -283,6 +390,8 @@ static int do_tcp_rpc(struct sock_ctx *sc)
 		return ret;
 
 	reply_len = ntohl(net_len);
+	if (reply_len != size || reply_len > max_msg_size)
+		return -EIO;
 	ret = kbench_tcp_recv_full(sc->sock, sc->rx_buf, reply_len);
 	return ret;
 }
@@ -306,14 +415,26 @@ static int worker_fn(void *data)
 		if (atomic_read(&sc->pending) <= 0)
 			continue;
 
-		atomic_dec(&sc->pending);
+		/* pending remains 1 while this RPC is in flight. The pacer
+		 * can schedule at most one request per socket.
+		 */
+		{
+			int size = kbench_pick_size();
 
-		t_start = ktime_get_ns();
-		ret = is_homa ? do_homa_rpc(sc) : do_tcp_rpc(sc);
-		t_end = ktime_get_ns();
+			t_start = ktime_get_ns();
+			ret = is_homa ? do_homa_rpc(sc, size) :
+					do_tcp_rpc(sc, size);
+			t_end = ktime_get_ns();
 
-		if (ret >= 0 && past_warmup)
-			record_latency(t_end - t_start);
+			if (ret >= 0 && past_warmup)
+				record_latency(t_end - t_start,
+					       kbench_size_class(size));
+			else if (ret < 0) {
+				atomic_inc(&failures);
+				pr_warn_ratelimited("kbench_client: RPC failed: %d\n", ret);
+			}
+		}
+		atomic_set(&sc->pending, 0);
 	}
 	return 0;
 }
@@ -353,9 +474,14 @@ static int pacer_fn(void *data)
 			continue;
 		}
 
-		/* Dispatch RPC to next socket. */
-		atomic_inc(&sockets[sock_idx].pending);
-		wake_up(&sockets[sock_idx].wq);
+		/* Rate-controlled offered slots, bounded by one in-flight RPC
+		 * per socket. Count skipped slots instead of building a backlog.
+		 */
+		atomic_inc(&offered_count);
+		if (atomic_cmpxchg(&sockets[sock_idx].pending, 0, 1) == 0)
+			wake_up(&sockets[sock_idx].wq);
+		else
+			atomic_inc(&skipped_count);
 		sock_idx = (sock_idx + 1) % num_sockets;
 		next_send += interval_ns;
 	}
@@ -485,6 +611,38 @@ static int __init kbench_client_init(void)
 	bool is_homa = (strcmp(transport, "homa") == 0);
 	int i, ret;
 
+	int j, total = 0;
+
+	if (tx_zc < 0)
+		tx_zc = zc;
+	if ((tx_zc != 0 && tx_zc != 1) ||
+	    (rx_single_copy != 0 && rx_single_copy != 1) ||
+	    (nonblocking != 0 && nonblocking != 1) ||
+	    rate <= 0 || duration_sec <= warmup_sec || warmup_sec < 0)
+		return -EINVAL;
+
+	if (!strcmp(workload, "blksw6")) {
+		mixed_workload = true;
+		if (weights_count != KBENCH_MIX_CLASSES)
+			return -EINVAL;
+		for (j = 0; j < KBENCH_MIX_CLASSES; j++) {
+			if (blksw_weights[j] < 0)
+				return -EINVAL;
+			total += blksw_weights[j];
+			mix_cumulative[j] = total;
+		}
+		if (total != 100)
+			return -EINVAL;
+		max_msg_size = mix_sizes[KBENCH_MIX_CLASSES - 1];
+	} else if (!strcmp(workload, "fixed")) {
+		max_msg_size = msg_size;
+	} else {
+		return -EINVAL;
+	}
+	if (max_msg_size > KBENCH_MAX_MSG_SIZE ||
+	    (is_homa && max_msg_size > HOMA_MAX_MESSAGE_LENGTH))
+		return -EINVAL;
+
 	if (msg_size <= 0 || msg_size > KBENCH_MAX_MSG_SIZE) {
 		pr_err("kbench_client: invalid msg_size %d\n", msg_size);
 		return -EINVAL;
@@ -498,9 +656,20 @@ static int __init kbench_client_init(void)
 	if (!latencies)
 		return -ENOMEM;
 	atomic_set(&lat_count, 0);
+	atomic_set(&offered_count, 0);
+	atomic_set(&skipped_count, 0);
+	atomic_set(&failures, 0);
+
+	lat_classes = kvmalloc_array(MAX_SAMPLES, sizeof(*lat_classes),
+				     GFP_KERNEL);
+	if (!lat_classes) {
+		kvfree(latencies);
+		return -ENOMEM;
+	}
 
 	results_buf = (char *)get_zeroed_page(GFP_KERNEL);
 	if (!results_buf) {
+		kvfree(lat_classes);
 		kvfree(latencies);
 		return -ENOMEM;
 	}
@@ -519,13 +688,13 @@ static int __init kbench_client_init(void)
 		init_waitqueue_head(&sc->wq);
 		atomic_set(&sc->pending, 0);
 
-		sc->rx_buf = kvmalloc(msg_size, GFP_KERNEL);
+		sc->rx_buf = kvmalloc(max_msg_size, GFP_KERNEL);
 		if (!sc->rx_buf) {
 			ret = -ENOMEM;
 			goto err_socks;
 		}
 
-		if (zc) {
+		if (tx_zc) {
 			/* ZC TX: use order-4 compound pages (64KB physically
 			 * contiguous) to match the frag layout of Homa's
 			 * non-ZC page pool (HOMA_SKB_PAGE_ORDER=4). This
@@ -534,8 +703,8 @@ static int __init kbench_client_init(void)
 			 */
 #define TX_PAGE_ORDER 4
 #define TX_PAGE_SIZE (PAGE_SIZE << TX_PAGE_ORDER)
-			int ncompound = DIV_ROUND_UP(msg_size, TX_PAGE_SIZE);
-			int remaining = msg_size, j;
+			int ncompound = DIV_ROUND_UP(max_msg_size, TX_PAGE_SIZE);
+			int remaining = max_msg_size, j;
 
 			sc->tx_pages = kmalloc_array(ncompound,
 						     sizeof(struct page *),
@@ -567,27 +736,27 @@ static int __init kbench_client_init(void)
 				remaining -= chunk;
 			}
 		} else {
-			sc->tx_buf = kvmalloc(msg_size, GFP_KERNEL);
+			sc->tx_buf = kvmalloc(max_msg_size, GFP_KERNEL);
 			if (!sc->tx_buf) {
 				ret = -ENOMEM;
 				goto err_socks;
 			}
-			memset(sc->tx_buf, KBENCH_REQ_PATTERN, msg_size);
+			memset(sc->tx_buf, KBENCH_REQ_PATTERN, max_msg_size);
 		}
 
-		/* Actor buffer for ZC RX. */
-		if (zc && is_homa) {
-			sc->actor_ctx.app_buf = kvmalloc(msg_size, GFP_KERNEL);
+		/* Actor destination for RX single-copy (independent of TX). */
+		if (rx_single_copy && is_homa) {
+			sc->actor_ctx.app_buf = kvmalloc(max_msg_size, GFP_KERNEL);
 			if (!sc->actor_ctx.app_buf) {
 				ret = -ENOMEM;
 				goto err_socks;
 			}
-			sc->actor_ctx.buf_size = msg_size;
+			sc->actor_ctx.buf_size = max_msg_size;
 		}
 
 		/* Pool-to-app scratch for simulate_app_copy. */
-		if (simulate_app_copy && !zc && is_homa) {
-			sc->app_copy_scratch = kvmalloc(msg_size, GFP_KERNEL);
+		if (simulate_app_copy && !rx_single_copy && is_homa) {
+			sc->app_copy_scratch = kvmalloc(max_msg_size, GFP_KERNEL);
 			if (!sc->app_copy_scratch) {
 				ret = -ENOMEM;
 				goto err_socks;
@@ -631,8 +800,9 @@ static int __init kbench_client_init(void)
 		goto err_threads;
 	}
 
-	pr_info("kbench_client: started transport=%s zc=%d dst=%s msg=%d rate=%d socks=%d\n",
-		transport, zc, dst_ip, msg_size, rate, num_sockets);
+	pr_info("kbench_client: started transport=%s tx_zc=%d rx_sc=%d nonblocking=%d workload=%s max_msg=%d rate=%d sockets=%d\n",
+		transport, tx_zc, rx_single_copy, nonblocking, workload,
+		max_msg_size, rate, num_sockets);
 	return 0;
 
 err_threads:
@@ -666,6 +836,7 @@ err_socks:
 	kfree(sockets);
 err_lat:
 	free_page((unsigned long)results_buf);
+	kvfree(lat_classes);
 	kvfree(latencies);
 	return ret;
 }
@@ -709,6 +880,7 @@ static void __exit kbench_client_exit(void)
 	}
 	kfree(sockets);
 	free_page((unsigned long)results_buf);
+	kvfree(lat_classes);
 	kvfree(latencies);
 
 	pr_info("kbench_client: stopped\n");
