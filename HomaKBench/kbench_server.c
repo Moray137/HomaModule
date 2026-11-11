@@ -22,9 +22,24 @@ static char *transport = "homa";
 module_param(transport, charp, 0444);
 MODULE_PARM_DESC(transport, "Transport: homa or tcp");
 
+/* Compatibility parameter: enables both directions if the new independent
+ * switches have not been set.
+ */
 static int rx_actor_used;
 module_param(rx_actor_used, int, 0444);
-MODULE_PARM_DESC(rx_actor_used, "1=ZC (RX actor + TX splice), 0=copy");
+MODULE_PARM_DESC(rx_actor_used, "Legacy: 1 enables both RX actor and TX splice");
+
+static int tx_zc = -1;
+module_param(tx_zc, int, 0444);
+MODULE_PARM_DESC(tx_zc, "TX MSG_SPLICE_PAGES, independent of RX");
+
+static int rx_single_copy = -1;
+module_param(rx_single_copy, int, 0444);
+MODULE_PARM_DESC(rx_single_copy, "RX full-message actor, independent of TX");
+
+static int nonblocking;
+module_param(nonblocking, int, 0444);
+MODULE_PARM_DESC(nonblocking, "Use MSG_DONTWAIT with socket-readiness waits");
 
 static char *bind_ip = "192.168.11.93";
 module_param(bind_ip, charp, 0444);
@@ -67,10 +82,12 @@ static int homa_worker_fn(void *data)
 
 	while (!stopping && !kthread_should_stop()) {
 		recv_args.id = 0;
-		if (rx_actor_used) {
+		if (rx_single_copy) {
 			w->actor_ctx.bytes_received = 0;
 			recv_args.rx_actor_ctx =
 				(__u64)(uintptr_t)&w->actor_ctx;
+		} else {
+			recv_args.rx_actor_ctx = 0;
 		}
 
 		memset(&rmsg, 0, sizeof(rmsg));
@@ -80,12 +97,17 @@ static int homa_worker_fn(void *data)
 		rmsg.msg_namelen = sizeof(peer);
 		rmsg.msg_control_is_user = false;
 
-		ret = kernel_recvmsg(srv_sock, &rmsg, NULL, 0, 0, 0);
+		ret = kbench_homa_recv(srv_sock, &rmsg, nonblocking);
 		if (ret < 0) {
 			if (stopping || kthread_should_stop())
 				break;
 			if (ret != -EINTR)
 				pr_warn("kbench_server: recvmsg err %d\n", ret);
+			continue;
+		}
+		if (ret > KBENCH_MAX_MSG_SIZE ||
+		    (rx_single_copy && w->actor_ctx.bytes_received != ret)) {
+			pr_warn_ratelimited("kbench_server: invalid RX length %d\n", ret);
 			continue;
 		}
 
@@ -100,21 +122,18 @@ static int homa_worker_fn(void *data)
 		smsg.msg_name = &peer;
 		smsg.msg_namelen = sizeof(peer);
 
-		if (rx_actor_used) {
-			/* ZC TX: use pre-allocated alloc_page() pages with
-			 * bvec_set_page + MSG_SPLICE_PAGES. Slab pages
-			 * (kvmalloc) are invalid for MSG_SPLICE_PAGES because
-			 * put_page() on a slab page corrupts page state.
+		if (tx_zc) {
+			/* Preallocated page-backed reply, no payload allocation
+			 * inside the benchmark's timed request/response loop.
 			 */
 			int npages, i, remaining, reply_sz;
 			struct bio_vec *bvecs;
 
-			reply_sz = min_t(int, ret, KBENCH_MAX_MSG_SIZE);
+			reply_sz = ret;
 			npages = DIV_ROUND_UP(reply_sz, PAGE_SIZE);
-			bvecs = kmalloc_array(npages, sizeof(*bvecs),
-					      GFP_KERNEL);
+			bvecs = kmalloc_array(npages, sizeof(*bvecs), GFP_KERNEL);
 			if (!bvecs) {
-				pr_warn("kbench_server: bvec alloc failed\n");
+				pr_warn("kbench_server: bvec allocation failed\n");
 				continue;
 			}
 			remaining = reply_sz;
@@ -127,19 +146,20 @@ static int homa_worker_fn(void *data)
 					      chunk, 0);
 				remaining -= chunk;
 			}
-			iov_iter_bvec(&smsg.msg_iter, ITER_SOURCE, bvecs,
-				      npages, reply_sz);
-			smsg.msg_flags |= MSG_SPLICE_PAGES;
-			sock_sendmsg(srv_sock, &smsg);
+			ret = kbench_homa_send(srv_sock, &smsg, NULL, reply_sz,
+						bvecs, npages, true, nonblocking);
 			kfree(bvecs);
 		} else {
-			int reply_sz = min_t(int, ret, KBENCH_MAX_MSG_SIZE);
+			int reply_sz = ret;
 
 			memset(w->reply_buf, KBENCH_REPLY_PATTERN, reply_sz);
 			siov.iov_base = w->reply_buf;
 			siov.iov_len = reply_sz;
-			kernel_sendmsg(srv_sock, &smsg, &siov, 1, reply_sz);
+			ret = kbench_homa_send(srv_sock, &smsg, &siov, reply_sz,
+						NULL, 0, false, nonblocking);
 		}
+		if (ret < 0 && !stopping && !kthread_should_stop())
+			pr_warn_ratelimited("kbench_server: sendmsg error %d\n", ret);
 	}
 	return 0;
 }
@@ -182,7 +202,7 @@ static int start_homa_server(void)
 		goto err_pool;
 	}
 
-	if (rx_actor_used) {
+	if (rx_single_copy) {
 		struct homa_sock *hsk = homa_sk(srv_sock->sk);
 
 		homa_sock_set_rx_actor(hsk, kbench_rx_actor);
@@ -201,8 +221,9 @@ static int start_homa_server(void)
 		wake_up_process(workers[i]);
 	}
 
-	pr_info("kbench_server: Homa server listening on %s:%d (zc=%d, workers=%d)\n",
-		bind_ip, server_port, rx_actor_used, nr_workers);
+	pr_info("kbench_server: Homa server listening on %s:%d (tx_zc=%d rx_sc=%d nonblocking=%d workers=%d)\n",
+		bind_ip, server_port, tx_zc, rx_single_copy,
+		nonblocking, nr_workers);
 	return 0;
 
 err_threads:
@@ -358,6 +379,15 @@ static int __init kbench_server_init(void)
 	int i, ret;
 	bool is_homa = (strcmp(transport, "homa") == 0);
 
+	if (tx_zc < 0)
+		tx_zc = !!rx_actor_used;
+	if (rx_single_copy < 0)
+		rx_single_copy = !!rx_actor_used;
+	if ((tx_zc != 0 && tx_zc != 1) ||
+	    (rx_single_copy != 0 && rx_single_copy != 1) ||
+	    (nonblocking != 0 && nonblocking != 1))
+		return -EINVAL;
+
 	nr_workers = num_online_cpus();
 	workers = kcalloc(nr_workers, sizeof(*workers), GFP_KERNEL);
 	if (!workers)
@@ -371,10 +401,8 @@ static int __init kbench_server_init(void)
 
 	for (i = 0; i < nr_workers; i++) {
 		worker_state[i].id = i;
-		if (rx_actor_used && is_homa) {
-			/* ZC TX: alloc_page() pages for MSG_SPLICE_PAGES. */
-			int npages = DIV_ROUND_UP(KBENCH_MAX_MSG_SIZE,
-						  PAGE_SIZE);
+		if (tx_zc && is_homa) {
+			int npages = DIV_ROUND_UP(KBENCH_MAX_MSG_SIZE, PAGE_SIZE);
 			int j;
 
 			worker_state[i].reply_pages =
@@ -393,13 +421,6 @@ static int __init kbench_server_init(void)
 					goto err_bufs;
 				}
 			}
-			worker_state[i].actor_ctx.app_buf =
-				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
-			if (!worker_state[i].actor_ctx.app_buf) {
-				ret = -ENOMEM;
-				goto err_bufs;
-			}
-			worker_state[i].actor_ctx.buf_size = KBENCH_MAX_MSG_SIZE;
 		} else {
 			worker_state[i].reply_buf =
 				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
@@ -407,6 +428,16 @@ static int __init kbench_server_init(void)
 				ret = -ENOMEM;
 				goto err_bufs;
 			}
+		}
+		if (rx_single_copy && is_homa) {
+			worker_state[i].actor_ctx.app_buf =
+				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
+			if (!worker_state[i].actor_ctx.app_buf) {
+				ret = -ENOMEM;
+				goto err_bufs;
+			}
+			worker_state[i].actor_ctx.buf_size =
+				KBENCH_MAX_MSG_SIZE;
 		}
 	}
 
