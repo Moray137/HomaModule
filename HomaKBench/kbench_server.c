@@ -110,9 +110,12 @@ static int homa_worker_fn(void *data)
 				pr_warn("kbench_server: recvmsg err %d\n", ret);
 			continue;
 		}
-		if (ret > KBENCH_MAX_MSG_SIZE ||
-		    (rx_single_copy && w->actor_ctx.bytes_received != ret)) {
-			pr_warn_ratelimited("kbench_server: invalid RX length %d\n", ret);
+		if (ret <= 0 || ret > KBENCH_MAX_MSG_SIZE ||
+		    (rx_single_copy && w->actor_ctx.bytes_received != ret) ||
+		    (rx_single_copy &&
+		     !kbench_pattern_ok(w->actor_ctx.app_buf, ret,
+					 KBENCH_REQ_PATTERN))) {
+			pr_warn_ratelimited("kbench_server: invalid RX length or content %d\n", ret);
 			continue;
 		}
 		if (!rx_single_copy && simulate_app_copy) {
@@ -129,8 +132,10 @@ static int homa_worker_fn(void *data)
 				memcpy(w->app_copy_scratch + copied, pool + off, len);
 				copied += len;
 			}
-			if (copied != ret) {
-				pr_warn_ratelimited("kbench_server: incomplete pool-to-app copy (%d/%d)\n",
+			if (copied != ret ||
+			    !kbench_pattern_ok(w->app_copy_scratch, ret,
+						KBENCH_REQ_PATTERN)) {
+				pr_warn_ratelimited("kbench_server: pool-to-app copy mismatch (%d/%d)\n",
 						    copied, ret);
 				continue;
 			}
