@@ -117,6 +117,7 @@ static atomic_t lat_count;
 static atomic_t offered_count;
 static atomic_t skipped_count;
 static atomic_t failures;
+static wait_queue_head_t worker_idle_wq;
 static u64 experiment_start_ns;
 static volatile bool running;
 static volatile bool past_warmup;
@@ -392,6 +393,20 @@ static int do_tcp_rpc(struct sock_ctx *sc, int size)
 	return ret;
 }
 
+/* The pacer stops dispatching before results are computed. Wait until
+ * every socket finishes its in-flight RPC, so sorting cannot race a
+ * worker recording its latency sample.
+ */
+static bool kbench_all_idle(void)
+{
+	int i;
+
+	for (i = 0; i < num_sockets; i++)
+		if (atomic_read(&sockets[i].pending))
+			return false;
+	return true;
+}
+
 /* ---------- Per-socket worker thread ---------- */
 
 static int worker_fn(void *data)
@@ -431,6 +446,7 @@ static int worker_fn(void *data)
 			}
 		}
 		atomic_set(&sc->pending, 0);
+		wake_up(&worker_idle_wq);
 	}
 	return 0;
 }
@@ -490,9 +506,12 @@ static int pacer_fn(void *data)
 			wake_up(&sockets[i].wq);
 	}
 
-	/* Wait a bit for outstanding RPCs, then compute results. */
-	msleep(2000);
-	compute_results();
+	/* Do not sort the latency array while a worker may still write. */
+	if (wait_event_timeout(worker_idle_wq, kbench_all_idle(),
+				msecs_to_jiffies(10000)))
+		compute_results();
+	else
+		pr_warn("kbench_client: outstanding RPCs did not drain; results not finalized\n");
 
 	/* Park until rmmod calls kthread_stop(); returning early would free
 	 * the task_struct, causing a use-after-free in kbench_client_exit.
@@ -652,6 +671,7 @@ static int __init kbench_client_init(void)
 	if (!latencies)
 		return -ENOMEM;
 	atomic_set(&lat_count, 0);
+	init_waitqueue_head(&worker_idle_wq);
 	atomic_set(&offered_count, 0);
 	atomic_set(&skipped_count, 0);
 	atomic_set(&failures, 0);
