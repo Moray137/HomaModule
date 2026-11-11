@@ -156,10 +156,11 @@ void homa_grant_init_rpc(struct homa_rpc *rpc, int unsched)
 	}
 	rpc->msgin.granted = unsched;
 	rpc->msgin.prev_grant = unsched;
-	if (rpc->msgin.num_bpages != 0)
-		/* Can't issue grants unless buffer space has been allocated
-		 * for the message.
-		 */
+	/* RX actors retain skbs until the message is complete, without
+	 * allocating receive pool bpages.
+	 */
+	if (rpc->msgin.num_bpages != 0 ||
+	    (rpc->hsk->in_kernel && rpc->hsk->rx_actor))
 		homa_grant_manage_rpc(rpc);
 }
 
@@ -724,8 +725,9 @@ void homa_grant_check_rpc(struct homa_rpc *rpc)
 	 * Each of these situations requires the grant lock.
 	 */
 
-	if (rpc->msgin.length < 0 || rpc->msgin.num_bpages <= 0 ||
-	    rpc->state == RPC_DEAD)
+	if (rpc->msgin.length < 0 || rpc->state == RPC_DEAD ||
+	    (rpc->msgin.num_bpages <= 0 &&
+	     !(rpc->hsk->in_kernel && rpc->hsk->rx_actor)))
 		return;
 
 	tt_record4("homa_grant_check_rpc starting for id %d, granted %d, recv_end %d, length %d",
