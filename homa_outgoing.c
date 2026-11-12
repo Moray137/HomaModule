@@ -404,13 +404,6 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 	int bytes_left;
 	int gso_size;
 	int err;
-	// NVMe-oH debugfs
-	u64 tl_start = 0;
-	u64 tl_pkts = 0;
-
-	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
-		tl_start = ktime_get_ns();
-
 	/* Zero-copy TX: reference the caller's pages directly rather than
 	 * copying. Requested per-send via MSG_SPLICE_PAGES and only possible
 	 * for kernel-mode iterators (user_backed_iter() is false). User-space
@@ -521,10 +514,6 @@ int homa_message_out_fill(struct homa_rpc *rpc, struct iov_iter *iter, int xmit,
 			homa_rpc_lock(rpc);
 			goto error;
 		}
-		// NVMe-oH debugfs
-		if (tl_start)
-			tl_pkts++;
-
 		bytes_left -= skb_data_bytes;
 
 		homa_rpc_lock(rpc);
@@ -896,10 +885,6 @@ void __homa_xmit_data(struct sk_buff *skb, struct homa_rpc *rpc)
 		rpc->hsk->inet.tos =
 				rpc->hsk->homa->priority_map[priority] << 5;
 		err = ip_queue_xmit(&rpc->hsk->inet.sk, skb, &rpc->peer->flow);
-		// NVMe-oH debugfs
-		if (tl_start)
-		homa_tl_record(rpc->hsk, HOMA_TL_IP_XMIT, tl_start,
-			       homa_get_skb_info(skb)->data_bytes, 1);
 #else /* See strip.py */
 		ip_queue_xmit(&rpc->hsk->inet.sk, skb, &rpc->peer->flow);
 #endif /* See strip.py */
