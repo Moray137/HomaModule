@@ -292,7 +292,7 @@ static inline bool kbench_actor_pattern_ok(struct kbench_actor_ctx *ctx,
 
 	if (len <= 0 || len > ctx->buf_size)
 		return false;
-	if (!ctx->use_bvec)
+	if (!ctx->use_bvec && !ctx->use_sgl)
 		return kbench_pattern_ok(ctx->app_buf, len, pattern);
 	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
 		int page_idx = offsets[i] / PAGE_SIZE;
