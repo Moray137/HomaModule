@@ -5,9 +5,9 @@
  * Loaded via insmod with module_param. Runs for duration_sec, then reports
  * P50/P90/P99 latency via dmesg and debugfs. Unloaded via rmmod.
  *
- * Open-loop pacer: distributes RPCs across sockets at the target aggregate
- * rate. Each socket's kthread handles send+recv serially per RPC but can
- * have multiple RPCs queued by the pacer.
+ * Each CPU-bound worker independently paces RPCs on its own socket at
+ * rate RPC/s (per worker), with at most one in-flight RPC per socket.
+ * Missed slots are counted rather than queued when a worker falls behind.
  */
 
 #include <linux/module.h>
@@ -73,6 +73,7 @@ module_param(src_ip, charp, 0444);
 static int msg_size = 4096;
 module_param(msg_size, int, 0444);
 
+/* Offered RPC/s per worker, not aggregate across sockets. */
 static int rate = 10000;
 module_param(rate, int, 0444);
 
@@ -98,8 +99,6 @@ struct sock_ctx {
 	int id;
 	struct socket *sock;
 	struct task_struct *thread;
-	atomic_t pending;
-	wait_queue_head_t wq;
 
 	/* Buffers. */
 	char *tx_buf;
@@ -123,11 +122,10 @@ static atomic_t lat_count;
 static atomic_t offered_count;
 static atomic_t skipped_count;
 static atomic_t failures;
-static wait_queue_head_t worker_idle_wq;
+static atomic_t workers_finished;
+static DECLARE_WAIT_QUEUE_HEAD(start_wq);
 static u64 experiment_start_ns;
-static volatile bool running;
-static volatile bool past_warmup;
-static struct task_struct *pacer_thread;
+static bool running;
 static struct dentry *dbg_dir;
 
 /* Debugfs results buffer. */
@@ -220,7 +218,7 @@ static void compute_results(void)
 	results_len = scnprintf(results_buf, PAGE_SIZE,
 		"HomaKBench results:\n"
 		"  transport=%s tx_zc=%d rx_single_copy=%d rx_bvec=%d nonblocking=%d\n"
-		"  workload=%s fixed_msg_size=%d rate=%d num_sockets=%d\n"
+		"  workload=%s fixed_msg_size=%d rate_per_worker=%d total_offered_rate=%llu num_sockets=%d\n"
 		"  duration=%ds warmup=%ds simulate_app_copy=%d\n"
 		"  offered_slots_total=%d skipped_busy_total=%d failed_rpc=%d\n"
 		"  completed RPCs: %d\n"
@@ -229,8 +227,8 @@ static void compute_results(void)
 		"  P99: %llu.%01llu us\n"
 		"  throughput: %d RPCs/sec (achieved)\n",
 		transport, tx_zc, rx_single_copy, rx_bvec, nonblocking,
-		workload, msg_size, rate, num_sockets,
-		duration_sec, warmup_sec, simulate_app_copy,
+		workload, msg_size, rate, (u64)rate * num_sockets,
+        num_sockets, duration_sec, warmup_sec, simulate_app_copy,
 		atomic_read(&offered_count),
 		atomic_read(&skipped_count), atomic_read(&failures),
 		n,
@@ -411,134 +409,85 @@ static int do_tcp_rpc(struct sock_ctx *sc, int size)
 	return ret;
 }
 
-/* The pacer stops dispatching before results are computed. Wait until
- * every socket finishes its in-flight RPC, so sorting cannot race a
- * worker recording its latency sample.
- */
-static bool kbench_all_idle(void)
-{
-	int i;
-
-	for (i = 0; i < num_sockets; i++)
-		if (atomic_read(&sockets[i].pending))
-			return false;
-	return true;
-}
-
-/* ---------- Per-socket worker thread ---------- */
+/* ---------- Per-socket, per-CPU rate-controlled workers ---------- */
 
 static int worker_fn(void *data)
 {
-	struct sock_ctx *sc = data;
-	bool is_homa = (strcmp(transport, "homa") == 0);
+    struct sock_ctx *sc = data;
+    bool is_homa = (strcmp(transport, "homa") == 0);
+    u64 interval_ns = max_t(u64, 1, NSEC_PER_SEC / (u64)rate);
+    u64 next_send, end_ns, warmup_end_ns;
+    u64 phase_ns;
 
-	while (!kthread_should_stop()) {
-		u64 t_start, t_end;
-		int ret;
+    /* Start together, but let each worker pace its own independent
+     * stream. Phase staggering avoids an artificial initial burst.
+     */
+    wait_event_interruptible(start_wq,
+        READ_ONCE(running) || kthread_should_stop());
+    if (kthread_should_stop())
+        goto done;
 
-		wait_event_interruptible(sc->wq,
-			atomic_read(&sc->pending) > 0 ||
-			kthread_should_stop());
-		if (kthread_should_stop())
-			break;
-		if (atomic_read(&sc->pending) <= 0)
-			continue;
+    phase_ns = (interval_ns * (u64)sc->id) / num_sockets;
+    next_send = experiment_start_ns + phase_ns;
+    end_ns = experiment_start_ns + (u64)duration_sec * NSEC_PER_SEC;
+    warmup_end_ns = experiment_start_ns +
+        (u64)warmup_sec * NSEC_PER_SEC;
 
-		/* pending remains 1 while this RPC is in flight. The pacer
-		 * can schedule at most one request per socket.
-		 */
-		{
-			int size = kbench_pick_size();
+    while (!kthread_should_stop()) {
+        u64 now = ktime_get_ns();
+        u64 t_start, t_end, slots;
+        int ret, size;
 
-			t_start = ktime_get_ns();
-			ret = is_homa ? do_homa_rpc(sc, size) :
-					do_tcp_rpc(sc, size);
-			t_end = ktime_get_ns();
+        if (now >= end_ns)
+            break;
+        if (now < next_send) {
+            u64 wait_ns = next_send - now;
 
-			if (ret >= 0 && past_warmup)
-				record_latency(t_end - t_start,
-					       kbench_size_class(size));
-			else if (ret < 0) {
-				atomic_inc(&failures);
-				pr_warn_ratelimited("kbench_client: RPC failed: %d\n", ret);
-			}
-		}
-		atomic_set(&sc->pending, 0);
-		wake_up(&worker_idle_wq);
-	}
-	return 0;
-}
+            if (wait_ns > 10000) {
+                unsigned long us = (unsigned long)(wait_ns / 1000);
 
-/* ---------- Pacer thread ---------- */
+                usleep_range(us, us + 1);
+            } else if (wait_ns > 100) {
+                ndelay(wait_ns);
+            }
+            continue;
+        }
 
-static int pacer_fn(void *data)
-{
-	u64 interval_ns = (rate > 0) ? (1000000000ULL / rate) : 1000000000ULL;
-	int sock_idx = 0;
-	u64 next_send;
+        /* One outstanding RPC per worker. Missed pacing slots
+         * while processing the previous RPC are dropped, never queued.
+         */
+        slots = div64_u64(now - next_send, interval_ns) + 1;
+        atomic_add((int)slots, &offered_count);
+        if (slots > 1)
+            atomic_add((int)(slots - 1), &skipped_count);
+        next_send += slots * interval_ns;
 
-	experiment_start_ns = ktime_get_ns();
-	next_send = experiment_start_ns;
+        size = kbench_pick_size();
+        t_start = ktime_get_ns();
+        ret = is_homa ? do_homa_rpc(sc, size) : do_tcp_rpc(sc, size);
+        t_end = ktime_get_ns();
 
-	while (running && !kthread_should_stop()) {
-		u64 now = ktime_get_ns();
-		u64 elapsed_ns = now - experiment_start_ns;
+        if (ret >= 0 && t_start >= warmup_end_ns)
+            record_latency(t_end - t_start, kbench_size_class(size));
+        else if (ret < 0) {
+            atomic_inc(&failures);
+            pr_warn_ratelimited("kbench_client: RPC failed: %d\n", ret);
+        }
+    }
 
-		if (elapsed_ns >= (u64)duration_sec * NSEC_PER_SEC) {
-			running = false;
-			break;
-		}
-		if (!past_warmup &&
-		    elapsed_ns >= (u64)warmup_sec * NSEC_PER_SEC)
-			past_warmup = true;
-
-		if (now < next_send) {
-			u64 wait_ns = next_send - now;
-
-			if (wait_ns > 10000) {
-				unsigned long us = (unsigned long)(wait_ns / 1000);
-				usleep_range(us, us + 1);
-			} else if (wait_ns > 100) {
-				ndelay(wait_ns);
-			}
-			continue;
-		}
-
-		/* Rate-controlled offered slots, bounded by one in-flight RPC
-		 * per socket. Count skipped slots instead of building a backlog.
-		 */
-		atomic_inc(&offered_count);
-		if (atomic_cmpxchg(&sockets[sock_idx].pending, 0, 1) == 0)
-			wake_up(&sockets[sock_idx].wq);
-		else
-			atomic_inc(&skipped_count);
-		sock_idx = (sock_idx + 1) % num_sockets;
-		next_send += interval_ns;
-	}
-
-	/* Signal all workers to stop. */
-	running = false;
-	{
-		int i;
-		for (i = 0; i < num_sockets; i++)
-			wake_up(&sockets[i].wq);
-	}
-
-	/* Do not sort the latency array while a worker may still write. */
-	if (wait_event_timeout(worker_idle_wq, kbench_all_idle(),
-				msecs_to_jiffies(10000)))
-		compute_results();
-	else
-		pr_warn("kbench_client: outstanding RPCs did not drain; results not finalized\n");
-
-	/* Park until rmmod calls kthread_stop(); returning early would free
-	 * the task_struct, causing a use-after-free in kbench_client_exit.
-	 */
-	while (!kthread_should_stop()) {
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
-	}
-	return 0;
+done:
+    /* The last worker finalizes after all other workers have finished
+     * recording samples. Keep task_struct alive until rmmod.
+     */
+    if (atomic_inc_return(&workers_finished) == num_sockets &&
+        READ_ONCE(running))
+        compute_results();
+    while (!kthread_should_stop()) {
+        set_current_state(TASK_INTERRUPTIBLE);
+        schedule();
+    }
+    __set_current_state(TASK_RUNNING);
+    return 0;
 }
 
 /* ---------- Socket setup ---------- */
@@ -652,7 +601,8 @@ static int __init kbench_client_init(void)
 	    (rx_bvec != 0 && rx_bvec != 1) ||
 	    (rx_single_copy != 0 && rx_single_copy != 1) ||
 	    (nonblocking != 0 && nonblocking != 1) ||
-	    rate <= 0 || duration_sec <= warmup_sec || warmup_sec < 0)
+	    rate <= 0 || rate > 1000000 ||
+        duration_sec <= warmup_sec || warmup_sec < 0)
 		return -EINVAL;
 
 	if (!strcmp(workload, "blksw6")) {
@@ -690,10 +640,10 @@ static int __init kbench_client_init(void)
 	if (!latencies)
 		return -ENOMEM;
 	atomic_set(&lat_count, 0);
-	init_waitqueue_head(&worker_idle_wq);
 	atomic_set(&offered_count, 0);
 	atomic_set(&skipped_count, 0);
 	atomic_set(&failures, 0);
+	atomic_set(&workers_finished, 0);
 
 	lat_classes = kvmalloc_array(MAX_SAMPLES, sizeof(*lat_classes),
 				     GFP_KERNEL);
@@ -720,8 +670,6 @@ static int __init kbench_client_init(void)
 		struct sock_ctx *sc = &sockets[i];
 
 		sc->id = i;
-		init_waitqueue_head(&sc->wq);
-		atomic_set(&sc->pending, 0);
 
 		sc->rx_buf = kvmalloc(max_msg_size, GFP_KERNEL);
 		if (!sc->rx_buf) {
@@ -823,23 +771,20 @@ static int __init kbench_client_init(void)
 		debugfs_create_file("results", 0444, dbg_dir, NULL,
 				    &results_fops);
 
-	/* Start pacer. */
-	running = true;
-	past_warmup = false;
-	pacer_thread = kthread_run(pacer_fn, NULL, "kbench_pacer");
-	if (IS_ERR(pacer_thread)) {
-		ret = PTR_ERR(pacer_thread);
-		pacer_thread = NULL;
-		goto err_threads;
-	}
+    /* A common start timestamp is used only to align sampling windows.
+     * Scheduling decisions belong to the individual workers.
+     */
+    experiment_start_ns = ktime_get_ns();
+    WRITE_ONCE(running, true);
+    wake_up_all(&start_wq);
 
-	pr_info("kbench_client: started transport=%s tx_zc=%d rx_sc=%d rx_bvec=%d nonblocking=%d workload=%s max_msg=%d rate=%d sockets=%d\n",
-		transport, tx_zc, rx_single_copy, rx_bvec, nonblocking, workload,
-		max_msg_size, rate, num_sockets);
+    pr_info("kbench_client: started transport=%s tx_zc=%d rx_sc=%d rx_bvec=%d nonblocking=%d workload=%s max_msg=%d rate_per_worker=%d workers=%d total_offered_rate=%llu\n",
+            transport, tx_zc, rx_single_copy, rx_bvec, nonblocking, workload,
+            max_msg_size, rate, num_sockets, (u64)rate * num_sockets);
 	return 0;
 
 err_threads:
-	running = false;
+    WRITE_ONCE(running, false);
 	for (i = 0; i < num_sockets; i++) {
 		if (sockets[i].thread)
 			kthread_stop(sockets[i].thread);
@@ -878,10 +823,7 @@ static void __exit kbench_client_exit(void)
 {
 	int i;
 
-	running = false;
-
-	if (pacer_thread)
-		kthread_stop(pacer_thread);
+    WRITE_ONCE(running, false);
 
 	for (i = 0; i < num_sockets; i++) {
 		if (sockets[i].thread)
