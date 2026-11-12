@@ -419,6 +419,21 @@ char *homa_metrics_print(void)
 		  "Grant packets passed directly to homa_softirq by homa_gro_receive\n");
 		M("gro_data_bypasses", m->gro_data_bypasses,
 		  "Data packets passed directly to homa_softirq by homa_gro_receive\n");
+		M("rx_add_packet_ns", m->rx_add_packet_ns, "RX add_packet: elapsed ns total\n");
+		M("rx_add_packet_count", m->rx_add_packet_count, "RX add_packet: operations total\n");
+		M("rx_add_packet_bytes", m->rx_add_packet_bytes, "RX add_packet: payload bytes total\n");
+		M("rx_copy_to_pool_ns", m->rx_copy_to_pool_ns, "RX copy_to_pool: elapsed ns total\n");
+		M("rx_copy_to_pool_count", m->rx_copy_to_pool_count, "RX copy_to_pool: operations total\n");
+		M("rx_copy_to_pool_bytes", m->rx_copy_to_pool_bytes, "RX copy_to_pool: payload bytes total\n");
+		M("rx_actor_copy_ns", m->rx_actor_copy_ns, "RX actor_copy: elapsed ns total\n");
+		M("rx_actor_copy_count", m->rx_actor_copy_count, "RX actor_copy: operations total\n");
+		M("rx_actor_copy_bytes", m->rx_actor_copy_bytes, "RX actor_copy: payload bytes total\n");
+		M("rx_app_copy_ns", m->rx_app_copy_ns, "RX app_copy: elapsed ns total\n");
+		M("rx_app_copy_count", m->rx_app_copy_count, "RX app_copy: operations total\n");
+		M("rx_app_copy_bytes", m->rx_app_copy_bytes, "RX app_copy: payload bytes total\n");
+		M("rx_skb_free_ns", m->rx_skb_free_ns, "RX skb_free: elapsed ns total\n");
+		M("rx_skb_free_count", m->rx_skb_free_count, "RX skb_free: operations total\n");
+		M("rx_skb_free_bytes", m->rx_skb_free_bytes, "RX skb_free: payload bytes total\n");
 		for (i = 0; i < NUM_TEMP_METRICS;  i++) {
 			snprintf(name, sizeof(name), "temp%d", i);
 			M(name, m->temp[i], "Temporary use in testing\n");
