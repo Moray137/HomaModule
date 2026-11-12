@@ -174,10 +174,7 @@ void homa_add_packet(struct homa_rpc *rpc, struct sk_buff *skb)
 	int length = homa_data_len(skb);
 	enum skb_drop_reason reason;
 	int end = start + length;
-	u64 tl_start = 0;
-
-	if (READ_ONCE(homa_tl_stats_enabled) && rpc->hsk->in_kernel)
-		tl_start = ktime_get_ns();
+	u64 rx_start = ktime_get_ns();
 
 	if ((start + length) > rpc->msgin.length) {
 		tt_record3("Packet extended past message end; id %d, offset %d, length %d",
@@ -310,9 +307,9 @@ keep:
 			   rpc->msgin.bytes_remaining == 0);
 	}
 #endif /* See strip.py */
-	if (tl_start)
-		homa_tl_record(rpc->hsk, HOMA_TL_ADD_PACKET,
-			       tl_start, length, 1);
+	INC_METRIC(rx_add_packet_ns, ktime_get_ns() - rx_start);
+	INC_METRIC(rx_add_packet_count, 1);
+	INC_METRIC(rx_add_packet_bytes, length);
 }
 
 /**
@@ -342,8 +339,8 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	int error = 0;
 	int n = 0;
 	int copied = 0;
-	u64 tl_copy_start;
-	u64 tl_free_start;
+	u64 rx_copy_start;
+	u64 rx_free_start;
 #ifndef __STRIP__ /* See strip.py */
 	u64 start;
 #endif /* See strip.py */
@@ -388,13 +385,11 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 		int pkt_length = homa_data_len(skb);
 		int used;
 
-		tl_copy_start = READ_ONCE(homa_tl_stats_enabled) ?
-			ktime_get_ns() : 0;
+		rx_copy_start = ktime_get_ns();
 		used = rpc->hsk->rx_actor(&desc, skb, sizeof(*h), pkt_length);
-		if (tl_copy_start)
-			homa_tl_record(rpc->hsk, HOMA_TL_ACTOR_COPY,
-				       tl_copy_start,
-				       used > 0 ? used : 0, 1);
+		INC_METRIC(rx_actor_copy_ns, ktime_get_ns() - rx_copy_start);
+		INC_METRIC(rx_actor_copy_count, 1);
+		INC_METRIC(rx_actor_copy_bytes, used > 0 ? used : 0);
 		if (desc.error) {
 			error = desc.error;
 			break;
@@ -411,13 +406,12 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 #ifndef __STRIP__ /* See strip.py */
 	start = homa_clock();
 #endif /* See strip.py */
-	tl_free_start = READ_ONCE(homa_tl_stats_enabled) ?
-		ktime_get_ns() : 0;
+	rx_free_start = ktime_get_ns();
 	while ((skb = __skb_dequeue(&sorted)))
 		kfree_skb(skb);
-	if (tl_free_start)
-		homa_tl_record(rpc->hsk, HOMA_TL_SKB_FREE,
-			       tl_free_start, 0, n);
+	INC_METRIC(rx_skb_free_ns, ktime_get_ns() - rx_free_start);
+	INC_METRIC(rx_skb_free_count, n);
+	INC_METRIC(rx_skb_free_bytes, copied);
 	INC_METRIC(skb_free_cycles, homa_clock() - start);
 	INC_METRIC(skb_frees, n);
 	tt_record2("finished zero-copy delivery of %d skbs for id %d",
@@ -469,8 +463,9 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 #endif /* See strip.py */
 	int i;
 	bool in_kernel = rpc->hsk->in_kernel;
-	u64 tl_copy_start;
-	u64 tl_free_start;
+	u64 rx_copy_start;
+	u64 rx_free_start;
+	u64 batch_copied_bytes = 0;
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -513,9 +508,6 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 			struct homa_data_hdr *h = (struct homa_data_hdr *)
 					skbs[i]->data;
 			int pkt_length = homa_data_len(skbs[i]);
-			// NVMe-oH debugfs
-			if (tl_copy_start)
-				tl_bytes += pkt_length;
 			int offset = ntohl(h->seg.offset);
 			int buf_bytes, chunk_size;
 			struct iov_iter iter;
@@ -544,8 +536,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 					chunk_size = buf_bytes;
 				}
 
-				tl_copy_start = READ_ONCE(homa_tl_stats_enabled) ?
-					ktime_get_ns() : 0;
+				rx_copy_start = ktime_get_ns();
 				if (in_kernel) {
 					// printk(KERN_INFO"you are copying homa skb to a in-kernel buffer.skb no.%d\n", i);
 					if (skb_copy_bits(skbs[i], sizeof(*h) + copied, dst, chunk_size)) {
@@ -567,9 +558,11 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 					if (error)
 						goto free_skbs;
 				}
-				if (tl_copy_start)
-					homa_tl_record(rpc->hsk, HOMA_TL_COPY_TO_POOL,
-					       tl_copy_start, chunk_size, 1);
+				INC_METRIC(rx_copy_to_pool_ns,
+					   ktime_get_ns() - rx_copy_start);
+				INC_METRIC(rx_copy_to_pool_count, 1);
+				INC_METRIC(rx_copy_to_pool_bytes, chunk_size);
+				batch_copied_bytes += chunk_size;
 				copied += chunk_size;
 			}
 #ifndef __UPSTREAM__ /* See strip.py */
@@ -596,13 +589,13 @@ free_skbs:
 		start = homa_clock();
 #endif /* See strip.py */
 
-		tl_free_start = READ_ONCE(homa_tl_stats_enabled) ?
-			ktime_get_ns() : 0;
+		rx_free_start = ktime_get_ns();
 		for (i = 0; i < n; i++)
 			consume_skb(skbs[i]);
-		if (tl_free_start)
-			homa_tl_record(rpc->hsk, HOMA_TL_SKB_FREE,
-				       tl_free_start, 0, n);
+		INC_METRIC(rx_skb_free_ns, ktime_get_ns() - rx_free_start);
+		INC_METRIC(rx_skb_free_count, n);
+		INC_METRIC(rx_skb_free_bytes, batch_copied_bytes);
+		batch_copied_bytes = 0;
 
 		INC_METRIC(skb_free_cycles, homa_clock() - start);
 		INC_METRIC(skb_frees, n);
