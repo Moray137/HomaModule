@@ -124,6 +124,8 @@ duration=$DURATION
 warmup=$WARMUP
 tx_zc=$TX_ZC
 rx_bvec=$RX_BVEC
+client_rx_destination=$([[ "$RX_BVEC" == "1" ]] && echo bvec || echo linear)
+server_rx_destination=sgl
 nonblocking=$NONBLOCKING
 EOF
 printf 'size_bytes,rx_single_copy,rate_per_worker,target_aggregate_rps,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
