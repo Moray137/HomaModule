@@ -12,6 +12,7 @@
 #include <linux/highmem.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <net/sock.h>
 #include <net/inet_sock.h>
 
@@ -124,10 +125,15 @@ struct kbench_actor_ctx {
 	size_t buf_size;
 	size_t bytes_received;
 	bool use_bvec;
+	bool use_sgl;
 	struct bio_vec *bvecs;
 	struct page **pages;
-	int nr_bvecs;
+	int nr_pages;
 	struct iov_iter iter;
+	/* Server destination: a real, page-backed Linux scatterlist. */
+	struct sg_table sgt;
+	struct scatterlist *sg_cursor;
+	size_t sg_offset;
 };
 
 static inline void kbench_actor_free(struct kbench_actor_ctx *ctx)
@@ -135,16 +141,20 @@ static inline void kbench_actor_free(struct kbench_actor_ctx *ctx)
 	int i;
 
 	if (ctx->pages) {
-		for (i = 0; i < ctx->nr_bvecs; i++)
+		for (i = 0; i < ctx->nr_pages; i++)
 			if (ctx->pages[i])
 				__free_page(ctx->pages[i]);
 	}
+	if (ctx->sgt.sgl)
+		sg_free_table(&ctx->sgt);
 	kfree(ctx->pages);
 	kfree(ctx->bvecs);
 	kvfree(ctx->app_buf);
 	ctx->pages = NULL;
 	ctx->bvecs = NULL;
 	ctx->app_buf = NULL;
+	ctx->sgt.sgl = NULL;
+	ctx->sg_cursor = NULL;
 }
 
 static inline int kbench_actor_init(struct kbench_actor_ctx *ctx,
@@ -159,13 +169,13 @@ static inline int kbench_actor_init(struct kbench_actor_ctx *ctx,
 		return ctx->app_buf ? 0 : -ENOMEM;
 	}
 
-	ctx->nr_bvecs = DIV_ROUND_UP(length, PAGE_SIZE);
-	ctx->pages = kcalloc(ctx->nr_bvecs, sizeof(*ctx->pages), GFP_KERNEL);
-	ctx->bvecs = kcalloc(ctx->nr_bvecs, sizeof(*ctx->bvecs), GFP_KERNEL);
+	ctx->nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
+	ctx->pages = kcalloc(ctx->nr_pages, sizeof(*ctx->pages), GFP_KERNEL);
+	ctx->bvecs = kcalloc(ctx->nr_pages, sizeof(*ctx->bvecs), GFP_KERNEL);
 	if (!ctx->pages || !ctx->bvecs)
 		goto error;
 	remaining = length;
-	for (i = 0; i < ctx->nr_bvecs; i++) {
+	for (i = 0; i < ctx->nr_pages; i++) {
 		int chunk = min_t(int, remaining, PAGE_SIZE);
 
 		ctx->pages[i] = alloc_page(GFP_KERNEL);
@@ -180,12 +190,98 @@ error:
 	return -ENOMEM;
 }
 
+/* Allocate a synthetic NVMe-SGL destination once per server worker.
+ * There is no block device or DMA mapping involved.
+ */
+static inline int kbench_actor_init_sgl(struct kbench_actor_ctx *ctx,
+				       size_t length)
+{
+	struct scatterlist *sg;
+	int i, remaining, ret;
+
+	ctx->buf_size = length;
+	ctx->use_sgl = true;
+	ctx->nr_pages = DIV_ROUND_UP(length, PAGE_SIZE);
+	ctx->pages = kcalloc(ctx->nr_pages, sizeof(*ctx->pages), GFP_KERNEL);
+	if (!ctx->pages)
+		goto error;
+
+	ret = sg_alloc_table(&ctx->sgt, ctx->nr_pages, GFP_KERNEL);
+	if (ret)
+		goto error;
+
+	remaining = length;
+	sg = ctx->sgt.sgl;
+	for (i = 0; i < ctx->nr_pages; i++, sg = sg_next(sg)) {
+		int chunk = min_t(int, remaining, PAGE_SIZE);
+
+		ctx->pages[i] = alloc_page(GFP_KERNEL);
+		if (!ctx->pages[i])
+			goto error;
+		sg_set_page(sg, ctx->pages[i], chunk, 0);
+		remaining -= chunk;
+	}
+	return 0;
+error:
+	kbench_actor_free(ctx);
+	return -ENOMEM;
+}
+
 static inline void kbench_actor_reset(struct kbench_actor_ctx *ctx)
 {
 	ctx->bytes_received = 0;
 	if (ctx->use_bvec)
 		iov_iter_bvec(&ctx->iter, ITER_DEST, ctx->bvecs,
-			      ctx->nr_bvecs, ctx->buf_size);
+			      ctx->nr_pages, ctx->buf_size);
+	if (ctx->use_sgl) {
+		ctx->sg_cursor = ctx->sgt.sgl;
+		ctx->sg_offset = 0;
+	}
+}
+
+/* One direct copy to the page-backed scatterlist, without an
+ * intermediate linear bounce buffer. Source can be an skb or a pool page.
+ */
+static inline int kbench_sgl_copy(struct kbench_actor_ctx *ctx,
+				  struct sk_buff *skb, unsigned int skb_offset,
+				  const char *pool_src, size_t len)
+{
+	size_t copied = 0;
+
+	if (!ctx->use_sgl || len > ctx->buf_size - ctx->bytes_received)
+		return -EMSGSIZE;
+
+	while (copied < len) {
+		struct scatterlist *sg = ctx->sg_cursor;
+		void *mapped;
+		size_t chunk;
+		int ret = 0;
+
+		if (!sg || ctx->sg_offset >= sg->length)
+			return -EFAULT;
+		chunk = min_t(size_t, len - copied,
+				      sg->length - ctx->sg_offset);
+		mapped = kmap_local_page(sg_page(sg));
+		if (skb)
+			ret = skb_copy_bits(skb, skb_offset + copied,
+					    (char *)mapped + sg->offset +
+					    ctx->sg_offset, chunk);
+		else
+			memcpy((char *)mapped + sg->offset + ctx->sg_offset,
+			       pool_src + copied, chunk);
+		kunmap_local(mapped);
+		if (ret)
+			return -EFAULT;
+
+		copied += chunk;
+		ctx->sg_offset += chunk;
+		if (ctx->sg_offset == sg->length) {
+			ctx->sg_cursor = sg_next(sg);
+			ctx->sg_offset = 0;
+		}
+	}
+	ctx->bytes_received += len;
+	return 0;
 }
 
 static inline bool kbench_actor_pattern_ok(struct kbench_actor_ctx *ctx,
@@ -218,6 +314,9 @@ static inline int kbench_rx_actor(read_descriptor_t *desc, struct sk_buff *skb,
 
 	if (!ctx || len > ctx->buf_size - ctx->bytes_received)
 		return -EMSGSIZE;
+	if (ctx->use_sgl)
+		return kbench_sgl_copy(ctx, skb, offset, NULL, len) ?
+			-EFAULT : len;
 	if (ctx->use_bvec) {
 		if (skb_copy_datagram_iter(skb, offset, &ctx->iter, len))
 			return -EFAULT;
