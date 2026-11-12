@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
+#include <linux/math64.h>
 #include <linux/sort.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
