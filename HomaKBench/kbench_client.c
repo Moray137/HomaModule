@@ -39,6 +39,8 @@ module_param(tx_zc, int, 0444);
 
 static int rx_single_copy;
 module_param(rx_single_copy, int, 0444);
+static int rx_bvec = 1;
+module_param(rx_bvec, int, 0444);
 
 static int nonblocking;
 module_param(nonblocking, int, 0444);
@@ -213,7 +215,7 @@ static void compute_results(void)
 
 	results_len = scnprintf(results_buf, PAGE_SIZE,
 		"HomaKBench results:\n"
-		"  transport=%s tx_zc=%d rx_single_copy=%d nonblocking=%d\n"
+		"  transport=%s tx_zc=%d rx_single_copy=%d rx_bvec=%d nonblocking=%d\n"
 		"  workload=%s fixed_msg_size=%d rate=%d num_sockets=%d\n"
 		"  duration=%ds warmup=%ds simulate_app_copy=%d\n"
 		"  offered_slots_total=%d skipped_busy_total=%d failed_rpc=%d\n"
@@ -222,7 +224,7 @@ static void compute_results(void)
 		"  P90: %llu.%01llu us\n"
 		"  P99: %llu.%01llu us\n"
 		"  throughput: %d RPCs/sec (achieved)\n",
-		transport, tx_zc, rx_single_copy, nonblocking,
+		transport, tx_zc, rx_single_copy, rx_bvec, nonblocking,
 		workload, msg_size, rate, num_sockets,
 		duration_sec, warmup_sec, simulate_app_copy,
 		atomic_read(&offered_count),
@@ -314,7 +316,7 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 	sc->recv_args.completion_cookie = 0;
 
 	if (rx_single_copy) {
-		sc->actor_ctx.bytes_received = 0;
+		kbench_actor_reset(&sc->actor_ctx);
 		sc->recv_args.rx_actor_ctx =
 			(__u64)(uintptr_t)&sc->actor_ctx;
 	} else {
@@ -335,13 +337,15 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 	    (rx_single_copy && sc->actor_ctx.bytes_received != ret))
 		return -EIO;
 	if (rx_single_copy &&
-	    !kbench_pattern_ok(sc->actor_ctx.app_buf, ret,
+	    !kbench_actor_pattern_ok(&sc->actor_ctx, ret,
 				KBENCH_REPLY_PATTERN))
 		return -EBADMSG;
 
 	/* Simulate the second pool-to-app copy for baseline mode. */
 	if (simulate_app_copy && !rx_single_copy && sc->app_copy_scratch &&
 	    sc->recv_args.num_bpages > 0) {
+		u64 tl_copy_start = READ_ONCE(homa_tl_stats_enabled) ?
+			ktime_get_ns() : 0;
 		int copied = 0, i;
 
 		for (i = 0; i < sc->recv_args.num_bpages && copied < ret; i++) {
@@ -353,6 +357,9 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 			       sc->pool_region + off, chunk);
 			copied += chunk;
 		}
+		if (tl_copy_start)
+			homa_tl_record(homa_sk(sc->sock->sk), HOMA_TL_APP_COPY,
+				       tl_copy_start, copied, 1);
 		if (copied != ret ||
 		    !kbench_pattern_ok(sc->app_copy_scratch, ret,
 				KBENCH_REPLY_PATTERN))
@@ -639,6 +646,7 @@ static int __init kbench_client_init(void)
 	if (tx_zc < 0)
 		tx_zc = zc;
 	if ((tx_zc != 0 && tx_zc != 1) ||
+	    (rx_bvec != 0 && rx_bvec != 1) ||
 	    (rx_single_copy != 0 && rx_single_copy != 1) ||
 	    (nonblocking != 0 && nonblocking != 1) ||
 	    rate <= 0 || duration_sec <= warmup_sec || warmup_sec < 0)
@@ -768,14 +776,12 @@ static int __init kbench_client_init(void)
 			memset(sc->tx_buf, KBENCH_REQ_PATTERN, max_msg_size);
 		}
 
-		/* Actor destination for RX single-copy (independent of TX). */
+		/* Page-backed bvec or linear actor destination. */
 		if (rx_single_copy && is_homa) {
-			sc->actor_ctx.app_buf = kvmalloc(max_msg_size, GFP_KERNEL);
-			if (!sc->actor_ctx.app_buf) {
-				ret = -ENOMEM;
+			ret = kbench_actor_init(&sc->actor_ctx, max_msg_size,
+						!!rx_bvec);
+			if (ret)
 				goto err_socks;
-			}
-			sc->actor_ctx.buf_size = max_msg_size;
 		}
 
 		/* Pool-to-app scratch for simulate_app_copy. */
@@ -824,8 +830,8 @@ static int __init kbench_client_init(void)
 		goto err_threads;
 	}
 
-	pr_info("kbench_client: started transport=%s tx_zc=%d rx_sc=%d nonblocking=%d workload=%s max_msg=%d rate=%d sockets=%d\n",
-		transport, tx_zc, rx_single_copy, nonblocking, workload,
+	pr_info("kbench_client: started transport=%s tx_zc=%d rx_sc=%d rx_bvec=%d nonblocking=%d workload=%s max_msg=%d rate=%d sockets=%d\n",
+		transport, tx_zc, rx_single_copy, rx_bvec, nonblocking, workload,
 		max_msg_size, rate, num_sockets);
 	return 0;
 
@@ -854,7 +860,7 @@ err_socks:
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
 		kvfree(sc->app_copy_scratch);
-		kvfree(sc->actor_ctx.app_buf);
+		kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);
@@ -899,7 +905,7 @@ static void __exit kbench_client_exit(void)
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
 		kvfree(sc->app_copy_scratch);
-		kvfree(sc->actor_ctx.app_buf);
+		kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);
