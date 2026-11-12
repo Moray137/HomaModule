@@ -50,7 +50,7 @@ if [[ ! -r /proc/net/homa_metrics ]]; then
     echo "Missing /proc/net/homa_metrics (is homa.ko loaded?)" >&2
     exit 1
 fi
-printf 'Preflight: server=%s, server_dir=%s, server_ip=%s\\n' \
+printf 'Preflight: server=%s, server_dir=%s, server_ip=%s\n' \
     "$SERVER_SSH" "$SERVER_DIR" "$SERVER_IP"
 printf -v remote_check 'test -f %q && test -f %q' \
     "$SERVER_DIR/run_server.sh" "$SERVER_DIR/kbench_server.ko"
