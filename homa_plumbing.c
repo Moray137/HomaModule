@@ -32,6 +32,8 @@ static const char * const homa_tl_name[HOMA_TL_MAX] = {
 	[HOMA_TL_IP_XMIT]      = "ip_queue_xmit",
 	[HOMA_TL_ADD_PACKET]   = "add_packet",
 	[HOMA_TL_COPY_TO_POOL] = "copy_to_pool",
+	[HOMA_TL_ACTOR_COPY]   = "actor_copy",
+	[HOMA_TL_APP_COPY]     = "app_copy",
 	[HOMA_TL_SKB_FREE]     = "skb_free",
 };
 
