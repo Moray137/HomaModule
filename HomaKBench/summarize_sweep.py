@@ -93,6 +93,18 @@ for entry in entries:
     achieved = result_value(text, r"throughput:\s*(\d+)\s+RPCs/sec", int)
     per_worker = result_value(text, r"rate_per_worker=(\d+)", int)
     aggregate_target = result_value(text, r"total_offered_rate=(\d+)", int)
+    # New manifest stores rate explicitly. Check it against the client
+    # output to prevent mixing/mislabeling rate sweep results.
+    if entry.get("rate_per_worker"):
+        recorded_rate = int(entry["rate_per_worker"])
+        recorded_target = int(entry["target_aggregate_rps"])
+        if per_worker != recorded_rate or aggregate_target != recorded_target:
+            raise ValueError(
+                f"Rate mismatch in {entry['client_result']}: "
+                f"manifest={recorded_rate}/{recorded_target}, "
+                f"client={per_worker}/{aggregate_target}")
+        per_worker = recorded_rate
+        aggregate_target = recorded_target
     offered = result_value(text, r"offered_slots_total=(\d+)", int)
     failures = result_value(text, r"failed_rpc=(\d+)", int)
     skipped = result_value(text, r"skipped_busy_total=(\d+)", int)
@@ -125,9 +137,11 @@ for entry in entries:
         )
         for row in rows:
             item = dict(size_bytes=size, size_kib=size // 1024,
-                        rx_single_copy=rx, repeat=repeat, side=side, **row)
+                        rx_single_copy=rx, rate_per_worker=per_worker,
+                        target_aggregate_rps=aggregate_target,
+                        repeat=repeat, side=side, **row)
             stages.append(item)
-            stage_index[(size, rx, repeat, side, row["stage"])] = row
+            stage_index[(size, rx, per_worker, repeat, side, row["stage"])] = row
 
 write_csv(root / "runs.csv", runs, [
     "size_bytes", "size_kib", "rx_single_copy", "repeat", "valid",
@@ -136,13 +150,14 @@ write_csv(root / "runs.csv", runs, [
     "skipped_busy_total",
 ])
 write_csv(root / "stages.csv", stages, [
-    "size_bytes", "size_kib", "rx_single_copy", "repeat", "side",
+    "size_bytes", "size_kib", "rx_single_copy",
+    "rate_per_worker", "target_aggregate_rps", "repeat", "side",
     "stage", "count", "ns_total", "avg_ns", "bytes", "ns_per_4k",
 ])
 
 groups = defaultdict(list)
 for run in runs:
-    groups[(run["size_bytes"], run["rx_single_copy"])].append(run)
+    groups[(run["size_bytes"], run["rx_single_copy"], run["rate_per_worker"])].append(run)
 
 summary, stage_columns = [], [
     f"{side}_{stage}_ns4k"
@@ -152,26 +167,33 @@ stage_columns.extend(
     f"{side}_{stage}_avg_ns"
     for side in ("client", "server") for stage in TX_STAGES
 )
-for (size, rx), group in sorted(groups.items()):
+for (size, rx, rate), group in sorted(
+        groups.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or -1)):
     valid = [r for r in group if r["valid"]]
+    p50s = [r["p50_us"] for r in valid if r["p50_us"] is not None]
     p99s = [r["p99_us"] for r in valid]
     rates = [r["achieved_rps"] for r in valid]
+    skips = [r["skipped_busy_total"] for r in valid
+             if r["skipped_busy_total"] is not None]
     output = {
         "size_bytes": size, "size_kib": size // 1024,
         "rx_single_copy": rx, "repeats": len(group),
         "valid_repeats": len(valid),
-        "rate_per_worker": group[0]["rate_per_worker"],
+        "rate_per_worker": rate,
         "target_aggregate_rps": group[0]["target_aggregate_rps"],
+        "median_p50_us": statistics.median(p50s) if p50s else None,
         "median_p99_us": statistics.median(p99s) if p99s else None,
         "mean_p99_us": round(statistics.mean(p99s), 3) if p99s else None,
         "stdev_p99_us": round(statistics.stdev(p99s), 3)
                         if len(p99s) > 1 else None,
         "mean_achieved_rps": round(statistics.mean(rates), 1) if rates else None,
+        "mean_skipped_busy_total": round(statistics.mean(skips), 1)
+                                   if skips else None,
     }
     for side in ("client", "server"):
         for stage in RX_STAGES:
             values = [
-                stage_index[(size, rx, run["repeat"], side, stage)]["ns_per_4k"]
+                stage_index[(size, rx, rate, run["repeat"], side, stage)]["ns_per_4k"]
                 for run in valid
             ]
             values = [v for v in values if v is not None]
@@ -180,7 +202,7 @@ for (size, rx), group in sorted(groups.items()):
             )
         for stage in TX_STAGES:
             values = [
-                stage_index[(size, rx, run["repeat"], side, stage)]["avg_ns"]
+                stage_index[(size, rx, rate, run["repeat"], side, stage)]["avg_ns"]
                 for run in valid
             ]
             values = [v for v in values if v is not None]
@@ -191,13 +213,18 @@ for (size, rx), group in sorted(groups.items()):
 
 write_csv(root / "summary.csv", summary, [
     "size_bytes", "size_kib", "rx_single_copy", "repeats", "valid_repeats",
-    "rate_per_worker", "target_aggregate_rps", "median_p99_us", "mean_p99_us", "stdev_p99_us", "mean_achieved_rps",
+    "rate_per_worker", "target_aggregate_rps",
+    "median_p50_us", "median_p99_us", "mean_p99_us", "stdev_p99_us",
+    "mean_achieved_rps", "mean_skipped_busy_total",
     *stage_columns,
 ])
 
 for row in summary:
     print(f'{row["size_kib"]:>5} KiB RX={row["rx_single_copy"]} '
+          f'rate/worker={row["rate_per_worker"]} '
+          f'target={row["target_aggregate_rps"]} RPC/s '
           f'valid={row["valid_repeats"]}/{row["repeats"]} '
+          f'median P50={row["median_p50_us"]} us '
           f'median P99={row["median_p99_us"]} us '
           f'mean achieved={row["mean_achieved_rps"]} RPC/s')
 print(f"Wrote {root / 'runs.csv'}, {root / 'stages.csv'}, "
