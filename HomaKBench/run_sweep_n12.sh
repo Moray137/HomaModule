@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Run on n12 as root. SSH to n11 must work without interactive prompts.
+# Run on server n12 (192.168.11.93) as root; SSH to client n11 (192.168.11.97).
 # Each trial uses one fixed Homa message size; request and reply sizes match.
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOMA_DIR="$(dirname "$HERE")"
-SERVER_SSH="${SERVER_SSH:-root@n11}"
-SERVER_DIR="${SERVER_DIR:-$HERE}"
+CLIENT_SSH="${CLIENT_SSH:-root@n11}"
+CLIENT_DIR="${CLIENT_DIR:-$HERE}"
+CLIENT_IP="${CLIENT_IP:-192.168.11.97}"
 SERVER_IP="${SERVER_IP:-192.168.11.93}"
 PORT="${PORT:-5000}"
 SIZES="${SIZES:-4096 8192 12288 16384 131072 1048576}"
@@ -35,14 +36,20 @@ OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 remote() {
     local quoted
     printf -v quoted '%q' "$1"
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$SERVER_SSH" "bash -lc $quoted"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$CLIENT_SSH" "bash -lc $quoted"
 }
+client_result_tmp=""
 cleanup() {
-    remote 'rmmod kbench_server 2>/dev/null || true' >/dev/null 2>&1 || true
+    rmmod kbench_server 2>/dev/null || true
+    if [[ -n "$client_result_tmp" ]]; then
+        local quoted_tmp
+        printf -v quoted_tmp '%q' "$client_result_tmp"
+        remote "rm -f $quoted_tmp" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
-# The local Homa module must exist before stats can be reset.
+# The local Homa module must be loaded for server-side metrics.
 if ! lsmod | grep -q '^homa '; then
     insmod "$HOMA_DIR/homa.ko"
 fi
@@ -50,22 +57,37 @@ if [[ ! -r /proc/net/homa_metrics ]]; then
     echo "Missing /proc/net/homa_metrics (is homa.ko loaded?)" >&2
     exit 1
 fi
-printf 'Preflight: server=%s, server_dir=%s, server_ip=%s\n' \
-    "$SERVER_SSH" "$SERVER_DIR" "$SERVER_IP"
+printf 'Preflight: server=n12 (%s), client=%s (%s), client_dir=%s\n' \
+    "$SERVER_IP" "$CLIENT_SSH" "$CLIENT_IP" "$CLIENT_DIR"
+if [[ ! -f "$HERE/run_server.sh" || ! -f "$HERE/kbench_server.ko" ]]; then
+    echo "ERROR: n12 server needs $HERE/run_server.sh and $HERE/kbench_server.ko" >&2
+    echo "Build HomaKBench on n12 first." >&2
+    exit 1
+fi
 printf -v remote_check 'test -f %q && test -f %q' \
-    "$SERVER_DIR/run_server.sh" "$SERVER_DIR/kbench_server.ko"
+    "$CLIENT_DIR/run_client.sh" "$CLIENT_DIR/kbench_client.ko"
 if ! remote "$remote_check"; then
-    echo "ERROR: Cannot find required KBench files on $SERVER_SSH in $SERVER_DIR." >&2
-    echo "Expected: $SERVER_DIR/run_server.sh and $SERVER_DIR/kbench_server.ko" >&2
-    echo "Check SERVER_DIR (remote path), SSH access, and whether KBench was built on n11." >&2
+    echo "ERROR: Cannot find client files on $CLIENT_SSH in $CLIENT_DIR." >&2
+    echo "Expected: $CLIENT_DIR/run_client.sh and $CLIENT_DIR/kbench_client.ko" >&2
+    echo "Check CLIENT_DIR, SSH access, and whether HomaKBench was built on n11." >&2
+    exit 1
+fi
+# Ensure n11 has a loaded Homa module before taking metrics snapshots.
+printf -v client_homa_check \
+    'if ! lsmod | grep -q "^homa "; then insmod %q || exit 1; fi; test -r /proc/net/homa_metrics' \
+    "$CLIENT_DIR/../homa.ko"
+if ! remote "$client_homa_check"; then
+    echo "ERROR: Cannot load/read Homa metrics on client $CLIENT_SSH." >&2
     exit 1
 fi
 
 cat > "$OUT_DIR/config.txt" <<EOF
 host=n12
-server_ssh=$SERVER_SSH
-server_dir=$SERVER_DIR
+server_node=n12
 server_ip=$SERVER_IP
+client_ssh=$CLIENT_SSH
+client_dir=$CLIENT_DIR
+client_ip=$CLIENT_IP
 sizes=$SIZES
 rx_modes=$RX_MODES
 repeats=$REPEATS
@@ -93,34 +115,45 @@ for rx in $RX_MODES; do
             mkdir -p "$case_dir"
             echo "=== $name (TX ZC=$TX_ZC, RX bvec=$RX_BVEC, nonblock=$NONBLOCKING) ==="
 
-            # run_server accepts the original 4 positional args and now
-            # forwards additional module parameters.
-            printf -v start_server \
-              'cd %q && bash ./run_server.sh homa %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q simulate_app_copy=%q' \
-              "$SERVER_DIR" "$rx" "$SERVER_IP" "$PORT" \
-              "$TX_ZC" "$rx" "$RX_BVEC" "$NONBLOCKING" "$sim_copy"
-            remote "$start_server" > "$case_dir/server_start.log" 2>&1
-
-            # Homa metrics are free-running. Snapshot both endpoints
-            # before/after; summarize_sweep.py subtracts per-CPU totals.
-            # Counter deltas include warmup, unlike sampled RTTs.
-            cat /proc/net/homa_metrics > "$case_dir/client.before"
-            remote 'cat /proc/net/homa_metrics' > "$case_dir/server.before"
-
-            if ! (cd "$HERE" && \
-                DURATION="$DURATION" WARMUP="$WARMUP" PORT="$PORT" \
-                SIM_APP_COPY="$sim_copy" RESULT_FILE="$case_dir/client.result" \
-                bash ./run_client.sh homa "$TX_ZC" "$SERVER_IP" "$size" \
-                  "$RATE" "$NUM_SOCKETS" \
-                  "tx_zc=$TX_ZC" "rx_single_copy=$rx" \
-                  "rx_bvec=$RX_BVEC" "nonblocking=$NONBLOCKING") \
-                > "$case_dir/client.log" 2>&1; then
-                echo "Client run failed: $case_dir/client.log" >&2
+            # n12 is the server. The RX mode and app-copy baseline
+            # must match on both sides of the RPC.
+            if ! bash "$HERE/run_server.sh" homa "$rx" "$SERVER_IP" "$PORT" \
+                    "tx_zc=$TX_ZC" "rx_single_copy=$rx" \
+                    "rx_bvec=$RX_BVEC" "nonblocking=$NONBLOCKING" \
+                    "simulate_app_copy=$sim_copy" \
+                    > "$case_dir/server_start.log" 2>&1; then
+                echo "Server start failed: $case_dir/server_start.log" >&2
+                tail -n 20 "$case_dir/server_start.log" >&2
                 exit 1
             fi
-            cat /proc/net/homa_metrics > "$case_dir/client.after"
-            remote 'cat /proc/net/homa_metrics' > "$case_dir/server.after"
-            remote 'rmmod kbench_server' > "$case_dir/server_stop.log" 2>&1
+
+            # Homa metrics are free-running. Read client from n11, server
+            # locally from n12. Deltas include warmup, unlike sampled RTTs.
+            remote 'cat /proc/net/homa_metrics' > "$case_dir/client.before"
+            cat /proc/net/homa_metrics > "$case_dir/server.before"
+
+            # Keep the client's result on n11 temporarily, then fetch it
+            # to the n12 result directory alongside both metrics snapshots.
+            client_result_tmp="$(remote 'mktemp /tmp/homakbench-client.XXXXXXXX')"
+            printf -v start_client \
+              'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q' \
+              "$CLIENT_DIR" "$DURATION" "$WARMUP" "$PORT" "$sim_copy" \
+              "$client_result_tmp" "$TX_ZC" "$SERVER_IP" "$size" \
+              "$RATE" "$NUM_SOCKETS" "$TX_ZC" "$rx" "$RX_BVEC" \
+              "$NONBLOCKING" "$CLIENT_IP"
+            if ! remote "$start_client" > "$case_dir/client.log" 2>&1; then
+                echo "Client run failed on n11: $case_dir/client.log" >&2
+                tail -n 20 "$case_dir/client.log" >&2
+                exit 1
+            fi
+            remote 'cat /proc/net/homa_metrics' > "$case_dir/client.after"
+            cat /proc/net/homa_metrics > "$case_dir/server.after"
+
+            printf -v quoted_tmp '%q' "$client_result_tmp"
+            remote "cat $quoted_tmp" > "$case_dir/client.result"
+            remote "rm -f $quoted_tmp"
+            client_result_tmp=""
+            rmmod kbench_server > "$case_dir/server_stop.log" 2>&1
 
             if [[ ! -s "$case_dir/client.result" ]]; then
                 echo "Missing result in $name" >&2
