@@ -473,6 +473,17 @@ static int worker_fn(void *data)
             atomic_inc(&failures);
             pr_warn_ratelimited("kbench_client: RPC failed: %d\n", ret);
         }
+
+        /* If this RPC crossed the experiment deadline, its remaining
+         * scheduled slots still count as offered but skipped (QD=1).
+         */
+        if (t_end >= end_ns && next_send < end_ns) {
+            u64 missed = div64_u64(end_ns - 1 - next_send,
+                                   interval_ns) + 1;
+
+            atomic_add((int)missed, &offered_count);
+            atomic_add((int)missed, &skipped_count);
+        }
     }
 
 done:
