@@ -23,7 +23,9 @@
 //Transport-layer stats debugfs
 
 DEFINE_PER_CPU(struct homa_tl_cpu_stats, homa_tl_stats);
+EXPORT_PER_CPU_SYMBOL_GPL(homa_tl_stats);
 bool homa_tl_stats_enabled __read_mostly;
+EXPORT_SYMBOL_GPL(homa_tl_stats_enabled);
 
 static struct dentry *homa_tl_dbg_dir;
 
