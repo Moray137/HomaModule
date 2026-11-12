@@ -46,8 +46,8 @@ trap cleanup EXIT
 if ! lsmod | grep -q '^homa '; then
     insmod "$HOMA_DIR/homa.ko"
 fi
-if [[ ! -e /sys/kernel/debug/homa/transport_stats ]]; then
-    echo "Missing local /sys/kernel/debug/homa/transport_stats" >&2
+if [[ ! -r /proc/net/homa_metrics ]]; then
+    echo "Missing /proc/net/homa_metrics (is homa.ko loaded?)" >&2
     exit 1
 fi
 printf -v remote_check 'test -f %q && test -f %q' \
@@ -70,7 +70,7 @@ tx_zc=$TX_ZC
 rx_bvec=$RX_BVEC
 nonblocking=$NONBLOCKING
 EOF
-printf 'size_bytes,rx_single_copy,repeat,client_result,client_stats,server_stats\n' > "$OUT_DIR/manifest.csv"
+printf 'size_bytes,rx_single_copy,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
 
 for rx in $RX_MODES; do
     if [[ "$rx" != 0 && "$rx" != 1 ]]; then
@@ -94,11 +94,11 @@ for rx in $RX_MODES; do
               "$TX_ZC" "$rx" "$RX_BVEC" "$NONBLOCKING" "$sim_copy"
             remote "$start_server" > "$case_dir/server_start.log" 2>&1
 
-            # Reset immediately before the client loads. Counts include
-            # warmup; RTT summaries exclude warmup.
-            echo 1 > /sys/kernel/debug/homa/enable
-            echo reset > /sys/kernel/debug/homa/reset
-            remote 'echo 1 > /sys/kernel/debug/homa/enable; echo reset > /sys/kernel/debug/homa/reset'
+            # Homa metrics are free-running. Snapshot both endpoints
+            # before/after; summarize_sweep.py subtracts per-CPU totals.
+            # Counter deltas include warmup, unlike sampled RTTs.
+            cat /proc/net/homa_metrics > "$case_dir/client.before"
+            remote 'cat /proc/net/homa_metrics' > "$case_dir/server.before"
 
             if ! (cd "$HERE" && \
                 DURATION="$DURATION" WARMUP="$WARMUP" PORT="$PORT" \
@@ -111,17 +111,19 @@ for rx in $RX_MODES; do
                 echo "Client run failed: $case_dir/client.log" >&2
                 exit 1
             fi
-            cat /sys/kernel/debug/homa/transport_stats > "$case_dir/client.stats"
-            remote 'cat /sys/kernel/debug/homa/transport_stats' > "$case_dir/server.stats"
+            cat /proc/net/homa_metrics > "$case_dir/client.after"
+            remote 'cat /proc/net/homa_metrics' > "$case_dir/server.after"
             remote 'rmmod kbench_server' > "$case_dir/server_stop.log" 2>&1
 
             if [[ ! -s "$case_dir/client.result" ]]; then
                 echo "Missing result in $name" >&2
                 exit 1
             fi
-            printf '%s,%s,%s,%s,%s,%s\n' \
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
                "$size" "$rx" "$rep" \
-               "$name/client.result" "$name/client.stats" "$name/server.stats" \
+               "$name/client.result" \
+               "$name/client.before" "$name/client.after" \
+               "$name/server.before" "$name/server.after" \
                >> "$OUT_DIR/manifest.csv"
         done
     done
