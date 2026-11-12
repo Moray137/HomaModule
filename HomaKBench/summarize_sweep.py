@@ -91,6 +91,9 @@ for entry in entries:
     p99 = result_value(text, r"^\s*P99:\s*([0-9]+(?:\.[0-9]+)?)\s+us")
     p50 = result_value(text, r"^\s*P50:\s*([0-9]+(?:\.[0-9]+)?)\s+us")
     achieved = result_value(text, r"throughput:\s*(\d+)\s+RPCs/sec", int)
+    per_worker = result_value(text, r"rate_per_worker=(\d+)", int)
+    aggregate_target = result_value(text, r"total_offered_rate=(\d+)", int)
+    offered = result_value(text, r"offered_slots_total=(\d+)", int)
     failures = result_value(text, r"failed_rpc=(\d+)", int)
     skipped = result_value(text, r"skipped_busy_total=(\d+)", int)
     completed = result_value(text, r"completed RPCs:\s*(\d+)", int)
@@ -99,6 +102,8 @@ for entry in entries:
         "size_bytes": size, "size_kib": size // 1024,
         "rx_single_copy": rx, "repeat": repeat, "valid": int(valid),
         "p50_us": p50, "p99_us": p99,
+        "rate_per_worker": per_worker, "target_aggregate_rps": aggregate_target,
+        "offered_slots_total": offered,
         "achieved_rps": achieved, "completed": completed,
         "failed_rpc": failures, "skipped_busy_total": skipped,
     }
@@ -126,7 +131,8 @@ for entry in entries:
 
 write_csv(root / "runs.csv", runs, [
     "size_bytes", "size_kib", "rx_single_copy", "repeat", "valid",
-    "p50_us", "p99_us", "achieved_rps", "completed", "failed_rpc",
+    "p50_us", "p99_us", "rate_per_worker", "target_aggregate_rps",
+    "offered_slots_total", "achieved_rps", "completed", "failed_rpc",
     "skipped_busy_total",
 ])
 write_csv(root / "stages.csv", stages, [
@@ -154,6 +160,8 @@ for (size, rx), group in sorted(groups.items()):
         "size_bytes": size, "size_kib": size // 1024,
         "rx_single_copy": rx, "repeats": len(group),
         "valid_repeats": len(valid),
+        "rate_per_worker": group[0]["rate_per_worker"],
+        "target_aggregate_rps": group[0]["target_aggregate_rps"],
         "median_p99_us": statistics.median(p99s) if p99s else None,
         "mean_p99_us": round(statistics.mean(p99s), 3) if p99s else None,
         "stdev_p99_us": round(statistics.stdev(p99s), 3)
@@ -183,7 +191,7 @@ for (size, rx), group in sorted(groups.items()):
 
 write_csv(root / "summary.csv", summary, [
     "size_bytes", "size_kib", "rx_single_copy", "repeats", "valid_repeats",
-    "median_p99_us", "mean_p99_us", "stdev_p99_us", "mean_achieved_rps",
+    "rate_per_worker", "target_aggregate_rps", "median_p99_us", "mean_p99_us", "stdev_p99_us", "mean_achieved_rps",
     *stage_columns,
 ])
 
