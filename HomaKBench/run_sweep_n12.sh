@@ -14,6 +14,7 @@ SIZES="${SIZES:-4096 8192 12288 16384 131072 1048576}"
 RX_MODES="${RX_MODES:-0 1}"
 REPEATS="${REPEATS:-3}"
 RATE="${RATE:-12}"
+RATES="${RATES:-$RATE}"  # Space-separated per-worker RPC/s; RATE remains a single-rate fallback.
 NUM_SOCKETS="${NUM_SOCKETS:-16}"
 DURATION="${DURATION:-30}"
 WARMUP="${WARMUP:-5}"
@@ -30,11 +31,32 @@ if (( REPEATS < 1 )); then
     echo "REPEATS must be >= 1" >&2
     exit 1
 fi
-if (( RATE < 1 || RATE > 1000000 || NUM_SOCKETS < 1 || NUM_SOCKETS > 64 )); then
-    echo "RATE must be 1..1000000 RPC/s per worker, NUM_SOCKETS must be 1..64." >&2
+if [[ ! "$NUM_SOCKETS" =~ ^[1-9][0-9]*$ ]] ||
+   (( NUM_SOCKETS > 64 )); then
+    echo "NUM_SOCKETS must be 1..64." >&2
     exit 1
 fi
-echo "KBench offered load: ${RATE} RPC/s/worker x ${NUM_SOCKETS} workers = $((RATE * NUM_SOCKETS)) RPC/s aggregate"
+# Parse all rate values before starting any modules or experiments.
+read -r -a RATE_VALUES <<< "$RATES"
+if (( ${#RATE_VALUES[@]} == 0 )); then
+    echo "RATES must contain at least one per-worker RPC/s value." >&2
+    exit 1
+fi
+declare -A seen_rates=()
+for rate in "${RATE_VALUES[@]}"; do
+    if [[ ! "$rate" =~ ^[1-9][0-9]*$ ]] ||
+       (( ${#rate} > 7 )) ||
+       (( rate > 1000000 )); then
+        echo "Invalid per-worker rate: '$rate' (expected integer 1..1000000)." >&2
+        exit 1
+    fi
+    if [[ -n "${seen_rates[$rate]:-}" ]]; then
+        echo "Duplicate rate '$rate' in RATES; each rate must appear once." >&2
+        exit 1
+    fi
+    seen_rates[$rate]=1
+    echo "KBench offered load: ${rate} RPC/s/worker x ${NUM_SOCKETS} workers = $((rate * NUM_SOCKETS)) RPC/s aggregate"
+done
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
@@ -96,8 +118,7 @@ client_ip=$CLIENT_IP
 sizes=$SIZES
 rx_modes=$RX_MODES
 repeats=$REPEATS
-rate_per_worker=$RATE
-target_aggregate_rps=$((RATE * NUM_SOCKETS))
+rates_per_worker=$RATES
 num_sockets=$NUM_SOCKETS
 duration=$DURATION
 warmup=$WARMUP
@@ -105,8 +126,9 @@ tx_zc=$TX_ZC
 rx_bvec=$RX_BVEC
 nonblocking=$NONBLOCKING
 EOF
-printf 'size_bytes,rx_single_copy,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
+printf 'size_bytes,rx_single_copy,rate_per_worker,target_aggregate_rps,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
 
+for rate in "${RATE_VALUES[@]}"; do
 for rx in $RX_MODES; do
     if [[ "$rx" != 0 && "$rx" != 1 ]]; then
         echo "RX_MODES entries must be 0 or 1" >&2
@@ -116,10 +138,10 @@ for rx in $RX_MODES; do
     if [[ "$rx" == 0 ]]; then sim_copy=1; else sim_copy=0; fi
     for size in $SIZES; do
         for ((rep=1; rep<=REPEATS; rep++)); do
-            name="size${size}_rx${rx}_rep${rep}"
+            name="rate${rate}_size${size}_rx${rx}_rep${rep}"
             case_dir="$OUT_DIR/$name"
             mkdir -p "$case_dir"
-            echo "=== $name (TX ZC=$TX_ZC, RX bvec=$RX_BVEC, nonblock=$NONBLOCKING) ==="
+            echo "=== $name (aggregate target=$((rate * NUM_SOCKETS)) RPC/s, TX ZC=$TX_ZC, RX bvec=$RX_BVEC, nonblock=$NONBLOCKING) ==="
 
             # n12 is the server. The RX mode and app-copy baseline
             # must match on both sides of the RPC.
@@ -145,7 +167,7 @@ for rx in $RX_MODES; do
               'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q' \
               "$CLIENT_DIR" "$DURATION" "$WARMUP" "$PORT" "$sim_copy" \
               "$client_result_tmp" "$TX_ZC" "$SERVER_IP" "$size" \
-              "$RATE" "$NUM_SOCKETS" "$TX_ZC" "$rx" "$RX_BVEC" \
+              "$rate" "$NUM_SOCKETS" "$TX_ZC" "$rx" "$RX_BVEC" \
               "$NONBLOCKING" "$CLIENT_IP"
             if ! remote "$start_client" > "$case_dir/client.log" 2>&1; then
                 echo "Client run failed on n11: $case_dir/client.log" >&2
@@ -165,14 +187,15 @@ for rx in $RX_MODES; do
                 echo "Missing result in $name" >&2
                 exit 1
             fi
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
-               "$size" "$rx" "$rep" \
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+               "$size" "$rx" "$rate" "$((rate * NUM_SOCKETS))" "$rep" \
                "$name/client.result" \
                "$name/client.before" "$name/client.after" \
                "$name/server.before" "$name/server.after" \
                >> "$OUT_DIR/manifest.csv"
         done
     done
+done
 done
 
 python3 "$HERE/summarize_sweep.py" "$OUT_DIR"
