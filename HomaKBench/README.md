@@ -92,31 +92,35 @@ drawing throughput/latency conclusions.
 
 ## n12-driven repeated fixed-size sweep
 
-The script `run_sweep_n12.sh` runs on **n12 as root** and SSHes to
-`root@n11` (change `SERVER_SSH` if necessary). It uses the existing
-`run_server.sh` and `run_client.sh` runners, which must be built on
-their respective machines. Both sides should run HomaModule from the
-same `rx-side-zc-impl-reverse-walk` revision. SSH must be
-non-interactive; configure `SERVER_DIR` if the two checkouts live in
-different locations.
+Topology: **n12 is the server (192.168.11.93)** and **n11 is the client
+(192.168.11.97)**. Run `run_sweep_n12.sh` **on n12 as root**. It starts
+`run_server.sh` locally and SSHes to n11 to run `run_client.sh`;
+the benchmark output and per-node metrics snapshots are collected under
+n12's `OUT_DIR`. SSH to n11 must be non-interactive. Both nodes must
+have built the matching HomaModule and HomaKBench revision; set `CLIENT_DIR`
+to the absolute path of the n11 checkout if it differs from n12.
+
+The client binds its sockets to `src_ip=192.168.11.97` by default.
+Override `src_ip` for a different testbed; the sweep forwards
+`CLIENT_IP` as `src_ip` when starting the n11 client.
 
 ```sh
-cd HomaKBench
+# From n12 (server)
+cd /usr/src/HomaModule/HomaKBench
 
-# Default: six fixed sizes; 3 repeats; compare RX vanilla and single-copy,
-# TX ZC disabled, MSG_DONTWAIT enabled; 16 independent sockets.
-SERVER_SSH=root@n11 SERVER_IP=192.168.11.93 \
-  SERVER_DIR=/root/HomaModule/HomaKBench \
-  RATE=2000 REPEATS=3 bash ./run_sweep_n12.sh
+# Six fixed sizes, RX vanilla/single-copy, 3 repeats; TX ZC disabled.
+CLIENT_SSH=root@n11 CLIENT_DIR=/usr/src/HomaModule/HomaKBench \
+  CLIENT_IP=192.168.11.97 SERVER_IP=192.168.11.93 \
+  RATE=200 REPEATS=3 bash ./run_sweep_n12.sh
 
-# For five repetitions and another offered rate:
-REPEATS=5 RATE=5000 bash ./run_sweep_n12.sh
+# Alternate offered rate:
+RATE=5000 REPEATS=5 bash ./run_sweep_n12.sh
 ```
 
 Configuration variables: `SIZES` (space-separated sizes in bytes),
 `RX_MODES` (default `"0 1"`), `REPEATS`, `RATE`, `NUM_SOCKETS`,
 `TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`, `WARMUP`, `PORT`,
-`OUT_DIR`, `SERVER_SSH`, `SERVER_DIR`, and `SERVER_IP`.
+`OUT_DIR`, `CLIENT_SSH`, `CLIENT_DIR`, `CLIENT_IP`, and `SERVER_IP`.
 
 Each case captures the client benchmark output and reads
 `/proc/net/homa_metrics` on **both nodes** immediately before and after
