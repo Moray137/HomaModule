@@ -49,13 +49,19 @@ insmod "$SCRIPT_DIR/kbench_client.ko" \
 
 echo "Waiting for completed experiment results (up to ${TOTAL_WAIT}s)..."
 RESULTS_PATH=/sys/kernel/debug/homakbench/results
+RESULTS=""
 for ((elapsed=0; elapsed<TOTAL_WAIT; elapsed++)); do
-    if [[ -s "$RESULTS_PATH" ]]; then
+    # debugfs files can report st_size=0 even after becoming readable.
+    # Check the actual contents, including the final throughput line.
+    RESULTS="$(cat "$RESULTS_PATH" 2>/dev/null || true)"
+    if [[ "$RESULTS" == *"HomaKBench results:"* &&
+          "$RESULTS" == *"throughput:"* ]]; then
         break
     fi
     sleep 1
 done
-if [[ ! -s "$RESULTS_PATH" ]]; then
+if [[ "$RESULTS" != *"HomaKBench results:"* ||
+      "$RESULTS" != *"throughput:"* ]]; then
     echo "ERROR: no finalized KBench results after ${TOTAL_WAIT}s" >&2
     rmmod kbench_client 2>/dev/null || true
     exit 1
@@ -63,9 +69,9 @@ fi
 
 echo ""
 echo "=== Results ==="
-cat "$RESULTS_PATH"
+printf '%s\n' "$RESULTS"
 if [[ -n "${RESULT_FILE:-}" ]]; then
-    cat "$RESULTS_PATH" > "$RESULT_FILE"
+    printf '%s\n' "$RESULTS" > "$RESULT_FILE"
 fi
 
 echo ""
