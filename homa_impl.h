@@ -942,6 +942,8 @@ enum homa_tl_stage {
 	HOMA_TL_IP_XMIT,            /* ip_queue_xmit/ip6_xmit call time */
 	HOMA_TL_ADD_PACKET,         /* homa_add_packet */
 	HOMA_TL_COPY_TO_POOL,       /* homa_copy_to_pool payload copy */
+	HOMA_TL_ACTOR_COPY,         /* full-message skb -> RX actor destination */
+	HOMA_TL_APP_COPY,           /* KBench pool -> final buffer */
 	HOMA_TL_SKB_FREE,           /* free skbs after copy */
 	HOMA_TL_MAX
 };
