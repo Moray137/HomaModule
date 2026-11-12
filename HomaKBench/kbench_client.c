@@ -66,6 +66,10 @@ static int mix_cumulative[KBENCH_MIX_CLASSES];
 static char *dst_ip = "192.168.11.93";
 module_param(dst_ip, charp, 0444);
 
+/* Bind client sockets to n11's testbed address (override for other setups). */
+static char *src_ip = "192.168.11.97";
+module_param(src_ip, charp, 0444);
+
 static int msg_size = 4096;
 module_param(msg_size, int, 0444);
 
@@ -539,7 +543,7 @@ static int pacer_fn(void *data)
 
 /* ---------- Socket setup ---------- */
 
-static int setup_homa_socket(struct sock_ctx *sc, int idx)
+static int setup_homa_socket(struct sock_ctx *sc)
 {
 	struct sockaddr_in src, dst;
 	struct homa_rcvbuf_args rcvbuf;
@@ -553,7 +557,7 @@ static int setup_homa_socket(struct sock_ctx *sc, int idx)
 	/* Bind source IP for RSS fan-out. */
 	memset(&src, 0, sizeof(src));
 	src.sin_family = AF_INET;
-	src.sin_addr.s_addr = htonl(0x0A000001 + (idx % 16));
+	src.sin_addr.s_addr = in_aton(src_ip);
 	ret = kernel_bind(sc->sock, (struct sockaddr *)&src, sizeof(src));
 	if (ret) {
 		pr_warn("kbench_client: bind src IP failed: %d\n", ret);
@@ -597,7 +601,7 @@ err:
 	return ret;
 }
 
-static int setup_tcp_socket(struct sock_ctx *sc, int idx)
+static int setup_tcp_socket(struct sock_ctx *sc)
 {
 	struct sockaddr_in src, dst;
 	int ret;
@@ -609,7 +613,7 @@ static int setup_tcp_socket(struct sock_ctx *sc, int idx)
 
 	memset(&src, 0, sizeof(src));
 	src.sin_family = AF_INET;
-	src.sin_addr.s_addr = htonl(0x0A000001 + (idx % 16));
+	src.sin_addr.s_addr = in_aton(src_ip);
 	ret = kernel_bind(sc->sock, (struct sockaddr *)&src, sizeof(src));
 	if (ret) {
 		pr_warn("kbench_client: tcp bind failed: %d\n", ret);
@@ -793,9 +797,9 @@ static int __init kbench_client_init(void)
 		}
 
 		if (is_homa)
-			ret = setup_homa_socket(sc, i);
+			ret = setup_homa_socket(sc);
 		else
-			ret = setup_tcp_socket(sc, i);
+			ret = setup_tcp_socket(sc);
 		if (ret)
 			goto err_socks;
 	}
