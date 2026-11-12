@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOMA_DIR="$(dirname "$HERE")"
-CLIENT_SSH="${CLIENT_SSH:-root@n11}"
+CLIENT_SSH="${CLIENT_SSH:-root@192.168.11.97}"
 CLIENT_DIR="${CLIENT_DIR:-$HERE}"
 CLIENT_IP="${CLIENT_IP:-192.168.11.97}"
 SERVER_IP="${SERVER_IP:-192.168.11.93}"
