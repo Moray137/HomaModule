@@ -30,7 +30,7 @@ fi
 # Remove old client module if loaded.
 lsmod | grep -q '^kbench_client ' && rmmod kbench_client
 
-TOTAL_WAIT=$((DURATION + 5))
+TOTAL_WAIT=$((DURATION + 12))
 echo "Starting $TRANSPORT client: zc=$ZC dst=$DST_IP msg=$MSG_SIZE rate=$RATE socks=$NUM_SOCKETS"
 echo "Duration: ${DURATION}s (warmup: ${WARMUP}s). Results in ~${TOTAL_WAIT}s."
 
@@ -47,15 +47,25 @@ insmod "$SCRIPT_DIR/kbench_client.ko" \
     server_port="$PORT" \
     "$@"
 
-echo "Waiting ${TOTAL_WAIT}s for experiment to complete..."
-sleep "$TOTAL_WAIT"
+echo "Waiting for completed experiment results (up to ${TOTAL_WAIT}s)..."
+RESULTS_PATH=/sys/kernel/debug/homakbench/results
+for ((elapsed=0; elapsed<TOTAL_WAIT; elapsed++)); do
+    if [[ -s "$RESULTS_PATH" ]]; then
+        break
+    fi
+    sleep 1
+done
+if [[ ! -s "$RESULTS_PATH" ]]; then
+    echo "ERROR: no finalized KBench results after ${TOTAL_WAIT}s" >&2
+    rmmod kbench_client 2>/dev/null || true
+    exit 1
+fi
 
 echo ""
 echo "=== Results ==="
-if [ -f /sys/kernel/debug/homakbench/results ]; then
-    cat /sys/kernel/debug/homakbench/results
-else
-    dmesg | grep "HomaKBench results" -A 20 | tail -10
+cat "$RESULTS_PATH"
+if [[ -n "${RESULT_FILE:-}" ]]; then
+    cat "$RESULTS_PATH" > "$RESULT_FILE"
 fi
 
 echo ""
