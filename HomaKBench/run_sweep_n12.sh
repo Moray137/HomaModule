@@ -13,7 +13,7 @@ PORT="${PORT:-5000}"
 SIZES="${SIZES:-4096 8192 12288 16384 131072 1048576}"
 RX_MODES="${RX_MODES:-0 1}"
 REPEATS="${REPEATS:-3}"
-RATE="${RATE:-2000}"
+RATE="${RATE:-12}"
 NUM_SOCKETS="${NUM_SOCKETS:-16}"
 DURATION="${DURATION:-30}"
 WARMUP="${WARMUP:-5}"
@@ -30,6 +30,11 @@ if (( REPEATS < 1 )); then
     echo "REPEATS must be >= 1" >&2
     exit 1
 fi
+if (( RATE < 1 || RATE > 1000000 || NUM_SOCKETS < 1 || NUM_SOCKETS > 64 )); then
+    echo "RATE must be 1..1000000 RPC/s per worker, NUM_SOCKETS must be 1..64." >&2
+    exit 1
+fi
+echo "KBench offered load: ${RATE} RPC/s/worker x ${NUM_SOCKETS} workers = $((RATE * NUM_SOCKETS)) RPC/s aggregate"
 mkdir -p "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
@@ -91,7 +96,8 @@ client_ip=$CLIENT_IP
 sizes=$SIZES
 rx_modes=$RX_MODES
 repeats=$REPEATS
-rate=$RATE
+rate_per_worker=$RATE
+target_aggregate_rps=$((RATE * NUM_SOCKETS))
 num_sockets=$NUM_SOCKETS
 duration=$DURATION
 warmup=$WARMUP
