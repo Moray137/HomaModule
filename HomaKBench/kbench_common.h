@@ -9,6 +9,9 @@
 #include <linux/kthread.h>
 #include <linux/wait.h>
 #include <linux/jiffies.h>
+#include <linux/highmem.h>
+#include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <net/sock.h>
 #include <net/inet_sock.h>
 
@@ -120,18 +123,109 @@ struct kbench_actor_ctx {
 	char *app_buf;
 	size_t buf_size;
 	size_t bytes_received;
+	bool use_bvec;
+	struct bio_vec *bvecs;
+	struct page **pages;
+	int nr_bvecs;
+	struct iov_iter iter;
 };
+
+static inline void kbench_actor_free(struct kbench_actor_ctx *ctx)
+{
+	int i;
+
+	if (ctx->pages) {
+		for (i = 0; i < ctx->nr_bvecs; i++)
+			if (ctx->pages[i])
+				__free_page(ctx->pages[i]);
+	}
+	kfree(ctx->pages);
+	kfree(ctx->bvecs);
+	kvfree(ctx->app_buf);
+	ctx->pages = NULL;
+	ctx->bvecs = NULL;
+	ctx->app_buf = NULL;
+}
+
+static inline int kbench_actor_init(struct kbench_actor_ctx *ctx,
+				   size_t length, bool use_bvec)
+{
+	int i, remaining;
+
+	ctx->buf_size = length;
+	ctx->use_bvec = use_bvec;
+	if (!use_bvec) {
+		ctx->app_buf = kvmalloc(length, GFP_KERNEL);
+		return ctx->app_buf ? 0 : -ENOMEM;
+	}
+
+	ctx->nr_bvecs = DIV_ROUND_UP(length, PAGE_SIZE);
+	ctx->pages = kcalloc(ctx->nr_bvecs, sizeof(*ctx->pages), GFP_KERNEL);
+	ctx->bvecs = kcalloc(ctx->nr_bvecs, sizeof(*ctx->bvecs), GFP_KERNEL);
+	if (!ctx->pages || !ctx->bvecs)
+		goto error;
+	remaining = length;
+	for (i = 0; i < ctx->nr_bvecs; i++) {
+		int chunk = min_t(int, remaining, PAGE_SIZE);
+
+		ctx->pages[i] = alloc_page(GFP_KERNEL);
+		if (!ctx->pages[i])
+			goto error;
+		bvec_set_page(&ctx->bvecs[i], ctx->pages[i], chunk, 0);
+		remaining -= chunk;
+	}
+	return 0;
+error:
+	kbench_actor_free(ctx);
+	return -ENOMEM;
+}
+
+static inline void kbench_actor_reset(struct kbench_actor_ctx *ctx)
+{
+	ctx->bytes_received = 0;
+	if (ctx->use_bvec)
+		iov_iter_bvec(&ctx->iter, ITER_DEST, ctx->bvecs,
+			      ctx->nr_bvecs, ctx->buf_size);
+}
+
+static inline bool kbench_actor_pattern_ok(struct kbench_actor_ctx *ctx,
+					   int len, u8 pattern)
+{
+	int offsets[3] = { 0, len / 2, len - 1 };
+	int i;
+
+	if (len <= 0 || len > ctx->buf_size)
+		return false;
+	if (!ctx->use_bvec)
+		return kbench_pattern_ok(ctx->app_buf, len, pattern);
+	for (i = 0; i < ARRAY_SIZE(offsets); i++) {
+		int page_idx = offsets[i] / PAGE_SIZE;
+		int off = offsets[i] % PAGE_SIZE;
+		void *addr = kmap_local_page(ctx->pages[page_idx]);
+		bool ok = *((u8 *)addr + off) == pattern;
+
+		kunmap_local(addr);
+		if (!ok)
+			return false;
+	}
+	return true;
+}
 
 static inline int kbench_rx_actor(read_descriptor_t *desc, struct sk_buff *skb,
 				  unsigned int offset, size_t len)
 {
 	struct kbench_actor_ctx *ctx = desc->arg.data;
-	size_t space = ctx->buf_size - ctx->bytes_received;
 
-	if (len > space)
-		len = space;
-	if (skb_copy_bits(skb, offset, ctx->app_buf + ctx->bytes_received, len))
-		return -EFAULT;
+	if (!ctx || len > ctx->buf_size - ctx->bytes_received)
+		return -EMSGSIZE;
+	if (ctx->use_bvec) {
+		if (skb_copy_datagram_iter(skb, offset, &ctx->iter, len))
+			return -EFAULT;
+	} else {
+		if (skb_copy_bits(skb, offset,
+				  ctx->app_buf + ctx->bytes_received, len))
+			return -EFAULT;
+	}
 	ctx->bytes_received += len;
 	return len;
 }
