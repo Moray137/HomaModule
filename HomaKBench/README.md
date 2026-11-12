@@ -52,6 +52,18 @@ Homa's full-message skb actor. The vanilla path continues using the Homa
 receive pool. The older client `zc` and server `rx_actor_used` parameters
 remain supported as compatibility aliases.
 
+**RX destination models:** the client uses page-backed `bio_vec[]`
+(`rx_bvec=1`, representing the Host receive destination), while the
+server uses a separately allocated page-backed Linux `scatterlist`
+(representing the Target NVMe request SGL, without a storage backend or
+DMA mapping). Both Server RX paths copy into the **same SGL layout**:
+`rx_single_copy=1` copies directly `skb -> SGL` and
+`rx_single_copy=0 simulate_app_copy=1` copies
+`skb -> Homa pool -> SGL`. The server accepts `rx_bvec` for runner
+compatibility but does not use it to select the destination. The
+single-copy mode eliminates the intermediate pool-to-SGL copy;
+it does not eliminate copying from the skb.
+
 `nonblocking=1` uses `MSG_DONTWAIT` for each Homa TX/RX syscall,
 retrying `-EAGAIN` only after waiting for socket readiness. This is
 nonblocking **socket I/O**, with an event-waited worker per socket; it is
@@ -76,7 +88,7 @@ cat /sys/kernel/debug/homakbench/results
 For an end-to-end pool-copy baseline that includes the former second copy,
 run `rx_single_copy=0 simulate_app_copy=1` on **both** the client and
 the server. Server-side `simulate_app_copy=1` copies pool bytes into
-a worker-local buffer, approximating the old Target pool-to-SG copy.
+the worker-local SGL destination (the same layout used by the actor).
 Do **not** enable `simulate_app_copy` for `rx_single_copy=1`.
 Run the two-by-two TX/RX combinations without adding sorting as a separate
 benchmark knob.
