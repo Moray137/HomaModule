@@ -89,3 +89,59 @@ compiled or validated on the n11/n12 machines in this chat. Test each
 individual size and the mixed workload, first using the blocking mode and
 then `nonblocking=1`, including both `rx_single_copy` states, before
 drawing throughput/latency conclusions.
+
+## n12-driven repeated fixed-size sweep
+
+The script `run_sweep_n12.sh` runs on **n12 as root** and SSHes to
+`root@n11` (change `SERVER_SSH` if necessary). It uses the existing
+`run_server.sh` and `run_client.sh` runners, which must be built on
+their respective machines. Both sides should run HomaModule from the
+same `rx-side-zc-impl-reverse-walk` revision. SSH must be
+non-interactive; configure `SERVER_DIR` if the two checkouts live in
+different locations.
+
+```sh
+cd HomaKBench
+
+# Default: six fixed sizes; 3 repeats; compare RX vanilla and single-copy,
+# TX ZC disabled, MSG_DONTWAIT enabled; 16 independent sockets.
+SERVER_SSH=root@n11 SERVER_IP=192.168.11.93 \
+  SERVER_DIR=/root/HomaModule/HomaKBench \
+  RATE=2000 REPEATS=3 bash ./run_sweep_n12.sh
+
+# For five repetitions and another offered rate:
+REPEATS=5 RATE=5000 bash ./run_sweep_n12.sh
+```
+
+Configuration variables: `SIZES` (space-separated sizes in bytes),
+`RX_MODES` (default `"0 1"`), `REPEATS`, `RATE`, `NUM_SOCKETS`,
+`TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`, `WARMUP`, `PORT`,
+`OUT_DIR`, `SERVER_SSH`, `SERVER_DIR`, and `SERVER_IP`.
+
+Each case captures the client benchmark output and
+`/sys/kernel/debug/homa/transport_stats` on **both nodes**, resetting
+both counters just before starting the client. The script writes:
+
+- `runs.csv`: every trial's P50/P99, achieved rate, skipped offered slots,
+  error count, and validity
+- `stages.csv`: per-side per-stage timing (including `ns_per_4k`)
+- `summary.csv`: per-size median/mean/stddev of trial P99 and mean
+  per-stage ns/4KiB across valid repeats
+
+`rx_single_copy=1 rx_bvec=1` (default) makes the actor copy skb data
+into page-backed `bio_vec` storage using an `iov_iter`. This is
+**SG-like storage**, not a real NVMe `scatterlist` or command SG. Set
+`RX_BVEC=0` to use the earlier linear `app_buf` actor.
+`actor_copy` measures the Homa-to-actor callback, including the bvec
+copy in this mode; `copy_to_pool` measures native skb-to-pool copy;
+`app_copy` measures the optional second pool-to-application copy.
+`add_packet` and `skb_free` are also measured. Stage statistics
+include warmup, while benchmark P99 excludes warmup.
+
+The summary P99 is the **median of the per-trial P99 values**, not a
+pooled P99 computed from all RPCs. P99 depends on message size, offered
+rate, and the number of active sockets. A run with nonzero
+`failed_rpc` is retained in `runs.csv` but excluded from the summary.
+
+The code and scripts require **kernel compilation and runtime validation**
+on n11/n12 before using the output as research measurements.
