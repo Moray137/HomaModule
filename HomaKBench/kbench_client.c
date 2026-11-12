@@ -344,8 +344,7 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 	/* Simulate the second pool-to-app copy for baseline mode. */
 	if (simulate_app_copy && !rx_single_copy && sc->app_copy_scratch &&
 	    sc->recv_args.num_bpages > 0) {
-		u64 tl_copy_start = READ_ONCE(homa_tl_stats_enabled) ?
-			ktime_get_ns() : 0;
+		u64 app_copy_start = ktime_get_ns();
 		int copied = 0, i;
 
 		for (i = 0; i < sc->recv_args.num_bpages && copied < ret; i++) {
@@ -357,9 +356,9 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 			       sc->pool_region + off, chunk);
 			copied += chunk;
 		}
-		if (tl_copy_start)
-			homa_tl_record(homa_sk(sc->sock->sk), HOMA_TL_APP_COPY,
-				       tl_copy_start, copied, 1);
+		INC_METRIC(rx_app_copy_ns, ktime_get_ns() - app_copy_start);
+		INC_METRIC(rx_app_copy_count, 1);
+		INC_METRIC(rx_app_copy_bytes, copied);
 		if (copied != ret ||
 		    !kbench_pattern_ok(sc->app_copy_scratch, ret,
 				KBENCH_REPLY_PATTERN))
