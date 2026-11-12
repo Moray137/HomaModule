@@ -1,5 +1,5 @@
 #!/bin/bash
-# Usage: ./run_client.sh <transport> <zc> <dst_ip> <msg_size> <rate> <num_sockets> [extra_params]
+# Usage: ./run_client.sh <transport> <zc> <dst_ip> <msg_size> <rate_per_worker> <num_sockets> [extra_params]
 # Example: ./run_client.sh homa 0 192.168.11.93 4096 10000 4
 #          ./run_client.sh homa 1 192.168.11.93 65536 50000 8
 #          ./run_client.sh tcp 0 192.168.11.93 4096 10000 4
@@ -31,7 +31,7 @@ fi
 lsmod | grep -q '^kbench_client ' && rmmod kbench_client
 
 TOTAL_WAIT=$((DURATION + 12))
-echo "Starting $TRANSPORT client: zc=$ZC dst=$DST_IP msg=$MSG_SIZE rate=$RATE socks=$NUM_SOCKETS"
+echo "Starting $TRANSPORT client: zc=$ZC dst=$DST_IP msg=$MSG_SIZE rate_per_worker=$RATE workers=$NUM_SOCKETS aggregate_target=$((RATE * NUM_SOCKETS)) RPC/s"
 echo "Duration: ${DURATION}s (warmup: ${WARMUP}s). Results in ~${TOTAL_WAIT}s."
 
 insmod "$SCRIPT_DIR/kbench_client.ko" \
