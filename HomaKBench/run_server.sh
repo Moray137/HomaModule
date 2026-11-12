@@ -9,6 +9,7 @@ TRANSPORT=${1:-homa}
 RX_ACTOR=${2:-0}
 BIND_IP=${3:-192.168.11.93}
 PORT=${4:-5000}
+if (( $# >= 4 )); then shift 4; else shift "$#"; fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 HOMA_DIR="$(dirname "$SCRIPT_DIR")"
@@ -27,7 +28,8 @@ insmod "$SCRIPT_DIR/kbench_server.ko" \
     transport="$TRANSPORT" \
     rx_actor_used="$RX_ACTOR" \
     bind_ip="$BIND_IP" \
-    server_port="$PORT"
+    server_port="$PORT" \
+    "$@"
 
 echo "Server running. Use 'rmmod kbench_server' to stop."
 echo "Logs: dmesg | grep kbench_server"
