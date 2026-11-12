@@ -768,6 +768,31 @@ struct homa_metrics {
 	 */
 	u64 gro_data_bypasses;
 
+	/*
+	 * Lightweight RX breakdown (nanoseconds, calls, bytes). Update
+	 * these counters using INC_METRIC in the hot path; derive averages
+	 * and ns/4KiB from /proc/net/homa_metrics after each experiment.
+	 *
+	 * copy_to_pool and actor_copy count copied chunks (usually SKBs).
+	 * skb_free counts freed SKBs even when measured as a batch.
+	 * app_copy is the optional KBench pool -> destination copy.
+	 */
+	u64 rx_add_packet_ns;
+	u64 rx_add_packet_count;
+	u64 rx_add_packet_bytes;
+	u64 rx_copy_to_pool_ns;
+	u64 rx_copy_to_pool_count;
+	u64 rx_copy_to_pool_bytes;
+	u64 rx_actor_copy_ns;
+	u64 rx_actor_copy_count;
+	u64 rx_actor_copy_bytes;
+	u64 rx_app_copy_ns;
+	u64 rx_app_copy_count;
+	u64 rx_app_copy_bytes;
+	u64 rx_skb_free_ns;
+	u64 rx_skb_free_count;
+	u64 rx_skb_free_bytes;
+
 	/** @temp: For temporary use during testing. */
 #define NUM_TEMP_METRICS 10
 	u64 temp[NUM_TEMP_METRICS];
