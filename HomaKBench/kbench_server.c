@@ -121,8 +121,7 @@ static int homa_worker_fn(void *data)
 			continue;
 		}
 		if (!rx_single_copy && simulate_app_copy) {
-			u64 tl_copy_start = READ_ONCE(homa_tl_stats_enabled) ?
-				ktime_get_ns() : 0;
+			u64 app_copy_start = ktime_get_ns();
 			/* Match the extra pool-to-final-destination copy that
 			 * Target's vanilla NVMe/Homa receive path performs.
 			 */
@@ -136,10 +135,10 @@ static int homa_worker_fn(void *data)
 				memcpy(w->app_copy_scratch + copied, pool + off, len);
 				copied += len;
 			}
-			if (tl_copy_start)
-				homa_tl_record(homa_sk(srv_sock->sk),
-					       HOMA_TL_APP_COPY,
-					       tl_copy_start, copied, 1);
+			INC_METRIC(rx_app_copy_ns,
+				   ktime_get_ns() - app_copy_start);
+			INC_METRIC(rx_app_copy_count, 1);
+			INC_METRIC(rx_app_copy_bytes, copied);
 			if (copied != ret ||
 			    !kbench_pattern_ok(w->app_copy_scratch, ret,
 						KBENCH_REQ_PATTERN)) {
