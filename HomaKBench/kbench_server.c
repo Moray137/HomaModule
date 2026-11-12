@@ -35,8 +35,12 @@ MODULE_PARM_DESC(tx_zc, "TX MSG_SPLICE_PAGES, independent of RX");
 
 static int rx_single_copy = -1;
 module_param(rx_single_copy, int, 0444);
+/* Compatibility with the existing runner; only the client uses bio_vec.
+ * The server always uses a synthetic NVMe-style scatterlist destination.
+ */
 static int rx_bvec = 1;
 module_param(rx_bvec, int, 0444);
+MODULE_PARM_DESC(rx_bvec, "Compatibility only; server RX destination is SGL");
 MODULE_PARM_DESC(rx_single_copy, "RX full-message actor, independent of TX");
 
 static int nonblocking;
@@ -68,7 +72,6 @@ struct server_worker {
 	int nr_reply_pages;
 	char *pool_region;
 	struct kbench_actor_ctx actor_ctx;
-	char *app_copy_scratch;
 };
 
 static struct server_worker *worker_state;
@@ -122,28 +125,32 @@ static int homa_worker_fn(void *data)
 		}
 		if (!rx_single_copy && simulate_app_copy) {
 			u64 app_copy_start = ktime_get_ns();
-			/* Match the extra pool-to-final-destination copy that
-			 * Target's vanilla NVMe/Homa receive path performs.
+			/* Vanilla target: same final SGL destination as actor mode,
+			 * but via Homa's receive pool (two copies total).
 			 */
-			int copied = 0, i;
+			int copied = 0, i, err = 0;
 			char *pool = worker_state[0].pool_region;
 
+			kbench_actor_reset(&w->actor_ctx);
 			for (i = 0; i < recv_args.num_bpages && copied < ret; i++) {
 				u32 off = recv_args.bpage_offsets[i];
 				int len = min_t(int, ret - copied, HOMA_BPAGE_SIZE);
 
-				memcpy(w->app_copy_scratch + copied, pool + off, len);
+				err = kbench_sgl_copy(&w->actor_ctx, NULL, 0,
+							    pool + off, len);
+				if (err)
+					break;
 				copied += len;
 			}
 			INC_METRIC(rx_app_copy_ns,
 				   ktime_get_ns() - app_copy_start);
 			INC_METRIC(rx_app_copy_count, 1);
 			INC_METRIC(rx_app_copy_bytes, copied);
-			if (copied != ret ||
-			    !kbench_pattern_ok(w->app_copy_scratch, ret,
-						KBENCH_REQ_PATTERN)) {
-				pr_warn_ratelimited("kbench_server: pool-to-app copy mismatch (%d/%d)\n",
-						    copied, ret);
+			if (err || copied != ret ||
+			    !kbench_actor_pattern_ok(&w->actor_ctx, ret,
+							KBENCH_REQ_PATTERN)) {
+				pr_warn_ratelimited("kbench_server: pool-to-SGL copy failed (%d/%d, err=%d)\n",
+							    copied, ret, err);
 				continue;
 			}
 		}
@@ -258,9 +265,9 @@ static int start_homa_server(void)
 		wake_up_process(workers[i]);
 	}
 
-	pr_info("kbench_server: Homa server listening on %s:%d (tx_zc=%d rx_sc=%d rx_bvec=%d nonblocking=%d workers=%d)\n",
+	pr_info("kbench_server: Homa server listening on %s:%d (tx_zc=%d rx_sc=%d rx_dest=sgl nonblocking=%d workers=%d)\n",
 		bind_ip, server_port, tx_zc, rx_single_copy,
-		rx_bvec, nonblocking, nr_workers);
+		nonblocking, nr_workers);
 	return 0;
 
 err_threads:
@@ -468,19 +475,12 @@ static int __init kbench_server_init(void)
 				goto err_bufs;
 			}
 		}
-		if (rx_single_copy && is_homa) {
-			ret = kbench_actor_init(&worker_state[i].actor_ctx,
-						KBENCH_MAX_MSG_SIZE, !!rx_bvec);
+		if (is_homa && (rx_single_copy || simulate_app_copy)) {
+			/* Synthetic NVMe request SGL; no storage backend. */
+			ret = kbench_actor_init_sgl(&worker_state[i].actor_ctx,
+							   KBENCH_MAX_MSG_SIZE);
 			if (ret)
 				goto err_bufs;
-		}
-		if (!rx_single_copy && simulate_app_copy && is_homa) {
-			worker_state[i].app_copy_scratch =
-				kvmalloc(KBENCH_MAX_MSG_SIZE, GFP_KERNEL);
-			if (!worker_state[i].app_copy_scratch) {
-				ret = -ENOMEM;
-				goto err_bufs;
-			}
 		}
 	}
 
@@ -506,7 +506,6 @@ err_bufs:
 		}
 		kvfree(worker_state[i].reply_buf);
 		kbench_actor_free(&worker_state[i].actor_ctx);
-		kvfree(worker_state[i].app_copy_scratch);
 	}
 	kfree(worker_state);
 	kfree(workers);
@@ -565,7 +564,6 @@ static void __exit kbench_server_exit(void)
 		}
 		kvfree(worker_state[i].reply_buf);
 		kbench_actor_free(&worker_state[i].actor_ctx);
-		kvfree(worker_state[i].app_copy_scratch);
 		kvfree(worker_state[i].pool_region);
 	}
 	kfree(worker_state);
