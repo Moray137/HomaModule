@@ -94,7 +94,7 @@ individual size and the mixed workload, first using the blocking mode and
 then `nonblocking=1`, including both `rx_single_copy` states, before
 drawing throughput/latency conclusions.
 
-## n12-driven repeated fixed-size sweep
+## n12-driven fixed-size and per-worker rate sweep
 
 Topology: **n12 is the server (192.168.11.93)** and **n11 is the client
 (192.168.11.97)**. Run `run_sweep_n12.sh` **on n12 as root**. It starts
@@ -112,24 +112,35 @@ Override `src_ip` for a different testbed; the sweep forwards
 # From n12 (server)
 cd /usr/src/HomaModule/HomaKBench
 
-# Six fixed sizes, RX vanilla/single-copy, 3 repeats; TX ZC disabled.
-CLIENT_SSH=root@192.168.11.97 CLIENT_DIR=/usr/src/HomaModule/HomaKBench \
-  CLIENT_IP=192.168.11.97 SERVER_IP=192.168.11.93 \
-  RATE=12 REPEATS=3 bash ./run_sweep_n12.sh
+# Six workers, 1 MiB, compare RX modes at four per-worker rates.
+# Aggregate offered RPC/s = 6 * (32, 64, 128, 256).
+NUM_SOCKETS=6 SIZES="1048576" RX_MODES="0 1" \
+  RATES="32 64 128 256" REPEATS=3 bash ./run_sweep_n12.sh
 
-# Increase load: 100 RPC/s per worker * 16 = 1600 aggregate RPC/s.
-RATE=100 REPEATS=5 bash ./run_sweep_n12.sh
+# Backward-compatible single rate (12 RPC/s per worker).
+RATE=12 REPEATS=3 bash ./run_sweep_n12.sh
 ```
 
 Configuration variables: `SIZES` (space-separated sizes in bytes),
-`RX_MODES` (default `"0 1"`), `REPEATS`, `RATE`, `NUM_SOCKETS`,
-`TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`, `WARMUP`, `PORT`,
-`OUT_DIR`, `CLIENT_SSH`, `CLIENT_DIR`, `CLIENT_IP`, and `SERVER_IP`.
-The sweep defaults to `RATE=12` with `NUM_SOCKETS=16` (192 aggregate
-RPC/s), close to the previous 200-aggregate low-load baseline. **Earlier
-runs used aggregate `RATE` semantics; do not mix their numbers with this
-revision without recording the change.** The runner prints both per-worker
-and aggregate target rates and writes them to `config.txt`.
+`RX_MODES` (default `"0 1"`), `REPEATS`, `RATES` (space-separated
+per-worker RPC/s values), `RATE` (single-rate fallback, default 12),
+`NUM_SOCKETS`, `TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`,
+`WARMUP`, `PORT`, `OUT_DIR`, `CLIENT_SSH`, `CLIENT_DIR`,
+`CLIENT_IP`, and `SERVER_IP`.
+
+`RATES` takes precedence over `RATE`; omitting `RATES` preserves the
+existing single-rate interface. Each value is RPC/s **per worker**:
+aggregate offered target is `rate * NUM_SOCKETS`. The default
+`RATE=12` with `NUM_SOCKETS=16` targets 192 aggregate RPC/s.
+Rate values must be unique integers in 1..1000000.
+Earlier aggregate-rate benchmarks have different semantics.
+
+Each result directory has a unique name
+`rate<per_worker>_size<size_bytes>_rx<mode>_rep<repeat>`.
+`config.txt` records the entire `rates_per_worker` list; `manifest.csv`
+records `rate_per_worker` and `target_aggregate_rps` for each trial.
+All CSV files retain rate as a dimension: `summary.csv` groups by
+(size, RX mode, per-worker rate), never merges multiple offered rates.
 
 Each case captures the client benchmark output and reads
 `/proc/net/homa_metrics` on **both nodes** immediately before and after
@@ -139,11 +150,11 @@ subtracts the before/after snapshots. The script writes:
 
 - `runs.csv`: every trial's P50/P99, rate per worker, aggregate offered
   target, achieved rate, skipped offered slots, error count, and validity
-- `stages.csv`: per-side RX stage ns total, count, bytes, average ns,
-  and ns/4KiB, plus available TX `temp[0..6]` breakdown
-- `summary.csv`: per-size median/mean/stddev of trial P99, per-worker
-  and aggregate offered targets, mean RX ns/4KiB, and available TX average
-  ns across valid repeats
+- `stages.csv`: per-side, per-rate RX stage ns total, count, bytes,
+  average ns and ns/4KiB, plus available TX `temp[0..6]` breakdown
+- `summary.csv`: per-size/per-rate median P50 and median/mean/stddev
+  P99, mean achieved rate and skipped slots, RX ns/4KiB, and available
+  TX average ns across valid repeats
 
 **RX hot-path instrumentation:** The five RX stages are `add_packet`,
 `copy_to_pool`, `actor_copy`, `app_copy` (KBench only), and
