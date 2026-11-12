@@ -50,9 +50,16 @@ if [[ ! -r /proc/net/homa_metrics ]]; then
     echo "Missing /proc/net/homa_metrics (is homa.ko loaded?)" >&2
     exit 1
 fi
+printf 'Preflight: server=%s, server_dir=%s, server_ip=%s\\n' \
+    "$SERVER_SSH" "$SERVER_DIR" "$SERVER_IP"
 printf -v remote_check 'test -f %q && test -f %q' \
     "$SERVER_DIR/run_server.sh" "$SERVER_DIR/kbench_server.ko"
-remote "$remote_check"
+if ! remote "$remote_check"; then
+    echo "ERROR: Cannot find required KBench files on $SERVER_SSH in $SERVER_DIR." >&2
+    echo "Expected: $SERVER_DIR/run_server.sh and $SERVER_DIR/kbench_server.ko" >&2
+    echo "Check SERVER_DIR (remote path), SSH access, and whether KBench was built on n11." >&2
+    exit 1
+fi
 
 cat > "$OUT_DIR/config.txt" <<EOF
 host=n12
