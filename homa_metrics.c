@@ -7,6 +7,7 @@
 #include "homa_impl.h"
 
 DEFINE_PER_CPU(struct homa_metrics, homa_metrics);
+EXPORT_PER_CPU_SYMBOL_GPL(homa_metrics);
 
 /* Describes file operations implemented for /proc/net/homa_metrics. */
 static const struct proc_ops homa_metrics_ops = {
