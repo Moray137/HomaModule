@@ -118,25 +118,41 @@ Configuration variables: `SIZES` (space-separated sizes in bytes),
 `TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`, `WARMUP`, `PORT`,
 `OUT_DIR`, `SERVER_SSH`, `SERVER_DIR`, and `SERVER_IP`.
 
-Each case captures the client benchmark output and
-`/sys/kernel/debug/homa/transport_stats` on **both nodes**, resetting
-both counters just before starting the client. The script writes:
+Each case captures the client benchmark output and reads
+`/proc/net/homa_metrics` on **both nodes** immediately before and after
+the client run. These native Homa per-CPU counters are free-running,
+so `summarize_sweep.py` first sums each counter across cores and then
+subtracts the before/after snapshots. The script writes:
 
 - `runs.csv`: every trial's P50/P99, achieved rate, skipped offered slots,
   error count, and validity
-- `stages.csv`: per-side per-stage timing (including `ns_per_4k`)
-- `summary.csv`: per-size median/mean/stddev of trial P99 and mean
-  per-stage ns/4KiB across valid repeats
+- `stages.csv`: per-side RX stage ns total, count, bytes, average ns,
+  and ns/4KiB, plus available TX `temp[0..6]` breakdown
+- `summary.csv`: per-size median/mean/stddev of trial P99, mean
+  RX ns/4KiB, and available TX average ns across valid repeats
 
-`rx_single_copy=1 rx_bvec=1` (default) makes the actor copy skb data
-into page-backed `bio_vec` storage using an `iov_iter`. This is
-**SG-like storage**, not a real NVMe `scatterlist` or command SG. Set
-`RX_BVEC=0` to use the earlier linear `app_buf` actor.
-`actor_copy` measures the Homa-to-actor callback, including the bvec
-copy in this mode; `copy_to_pool` measures native skb-to-pool copy;
-`app_copy` measures the optional second pool-to-application copy.
-`add_packet` and `skb_free` are also measured. Stage statistics
-include warmup, while benchmark P99 excludes warmup.
+**RX hot-path instrumentation:** The five RX stages are `add_packet`,
+`copy_to_pool`, `actor_copy`, `app_copy` (KBench only), and
+`skb_free`. Each stage uses `ktime_get_ns()` around the operation and
+native `INC_METRIC()` to accumulate ns/count/bytes into
+`struct homa_metrics`. These counters have no enable toggle and do
+not calculate squared latency or standard deviations inside the hot
+path. Average ns and ns/4KiB are calculated offline. `actor_copy`
+includes the callback and skb-to-bvec copy when `rx_bvec=1`;
+`copy_to_pool` covers the native skb-to-pool path. `app_copy`
+accounts for the optional second pool-to-consumer copy.
+
+**TX breakdown:** The original `temp[0..6]` counters in
+`homa_outgoing.c` remain unchanged. `temp[0]/temp[4]` measure
+message-out fill time/count, `temp[1]` packet-allocation time,
+`temp[2]` Homa xmit processing time, `temp[3]` page-stash time, and
+`temp[5]/temp[6]` individual xmit-data time/count. The original
+TX temp fields do not provide per-size variance or a denominator
+for every stage; unavailable summary values are left blank.
+
+The native metrics include warmup, while benchmark P99 excludes warmup.
+Unlike the removed `homa_tl_record()` framework, the stage counters do
+not provide per-stage standard deviation or maximum latency.
 
 The summary P99 is the **median of the per-trial P99 values**, not a
 pooled P99 computed from all RPCs. P99 depends on message size, offered
