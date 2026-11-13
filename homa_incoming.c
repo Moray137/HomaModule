@@ -174,6 +174,7 @@ void homa_add_packet(struct homa_rpc *rpc, struct sk_buff *skb)
 	int length = homa_data_len(skb);
 	enum skb_drop_reason reason;
 	int end = start + length;
+	u32 actor_walk_steps = 0;
 	u64 rx_start = ktime_get_ns();
 
 	if ((start + length) > rpc->msgin.length) {
@@ -285,6 +286,7 @@ keep:
 		 * the sort_rx_packets sysctl behavior.
 		 */
 		skb_queue_reverse_walk(&rpc->msgin.packets, pos) {
+			actor_walk_steps++;
 			h2 = (struct homa_data_hdr *)pos->data;
 			if (ntohl(h2->seg.offset) < start)
 				break;
@@ -310,6 +312,11 @@ keep:
 	INC_METRIC(rx_add_packet_ns, ktime_get_ns() - rx_start);
 	INC_METRIC(rx_add_packet_count, 1);
 	INC_METRIC(rx_add_packet_bytes, length);
+	/* Keep counter updates outside rx_add_packet_ns timing. */
+	if (rpc->hsk->in_kernel && rpc->hsk->rx_actor) {
+		INC_METRIC(rx_actor_order_walk_steps, actor_walk_steps);
+		INC_METRIC(rx_actor_order_packets, 1);
+	}
 }
 
 /**
@@ -341,6 +348,7 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	int copied = 0;
 	u64 rx_copy_start;
 	u64 rx_free_start;
+	u64 delivery_setup_start;
 #ifndef __STRIP__ /* See strip.py */
 	u64 start;
 #endif /* See strip.py */
@@ -363,6 +371,7 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	}
 
 	/* Packet insertion already maintains offset order for RX actors. */
+	delivery_setup_start = ktime_get_ns();
 	__skb_queue_head_init(&sorted);
 	n = skb_queue_len(&rpc->msgin.packets);
 	skb_queue_splice_init(&rpc->msgin.packets, &sorted);
@@ -373,6 +382,9 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	 */
 	homa_rpc_hold(rpc);
 	homa_rpc_unlock(rpc);
+	INC_METRIC(rx_actor_delivery_setup_ns,
+		   ktime_get_ns() - delivery_setup_start);
+	INC_METRIC(rx_actor_deliveries, 1);
 
 	tt_record1("starting zero-copy delivery for id %d", rpc->id);
 
@@ -499,6 +511,7 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 		 * run out of packets); copy any available packets out to
 		 * user space.
 		 */
+		INC_METRIC(rx_pool_copy_batches, 1);
 		homa_rpc_unlock(rpc);
 		tt_record1("starting copy to buffer pool for id %d",
 			   rpc->id);
@@ -907,6 +920,13 @@ void homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc)
 	     rpc->msgin.bytes_remaining == 0) &&
 	    !test_bit(RPC_PKTS_READY, &rpc->flags)) {
 		set_bit(RPC_PKTS_READY, &rpc->flags);
+		if (rpc->hsk->in_kernel && rpc->hsk->rx_actor) {
+			INC_METRIC(rx_actor_handoffs, 1);
+		} else {
+			INC_METRIC(rx_pool_handoffs, 1);
+			if (rpc->msgin.bytes_remaining != 0)
+				INC_METRIC(rx_pool_partial_handoffs, 1);
+		}
 		homa_rpc_handoff(rpc);
 	}
 

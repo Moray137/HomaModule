@@ -49,7 +49,7 @@ MODULE_PARM_DESC(nonblocking, "Use MSG_DONTWAIT with socket-readiness waits");
 
 static int simulate_app_copy;
 module_param(simulate_app_copy, int, 0444);
-MODULE_PARM_DESC(simulate_app_copy, "Copy vanilla RX pool contents into an app-like buffer");
+MODULE_PARM_DESC(simulate_app_copy, "Copy vanilla RX pool into actor-equivalent SGL destination");
 
 static char *bind_ip = "192.168.11.93";
 module_param(bind_ip, charp, 0444);
@@ -92,8 +92,9 @@ static int homa_worker_fn(void *data)
 
 	while (!stopping && !kthread_should_stop()) {
 		recv_args.id = 0;
-		if (rx_single_copy) {
+		if (rx_single_copy || simulate_app_copy)
 			kbench_actor_reset(&w->actor_ctx);
+		if (rx_single_copy) {
 			recv_args.rx_actor_ctx =
 				(__u64)(uintptr_t)&w->actor_ctx;
 		} else {
@@ -131,13 +132,12 @@ static int homa_worker_fn(void *data)
 			int copied = 0, i, err = 0;
 			char *pool = worker_state[0].pool_region;
 
-			kbench_actor_reset(&w->actor_ctx);
 			for (i = 0; i < recv_args.num_bpages && copied < ret; i++) {
 				u32 off = recv_args.bpage_offsets[i];
 				int len = min_t(int, ret - copied, HOMA_BPAGE_SIZE);
 
-				err = kbench_sgl_copy(&w->actor_ctx, NULL, 0,
-							    pool + off, len);
+				err = kbench_copy_pool_to_actor(&w->actor_ctx,
+							      pool + off, len);
 				if (err)
 					break;
 				copied += len;
@@ -147,6 +147,7 @@ static int homa_worker_fn(void *data)
 			INC_METRIC(rx_app_copy_count, 1);
 			INC_METRIC(rx_app_copy_bytes, copied);
 			if (err || copied != ret ||
+			    w->actor_ctx.bytes_received != ret ||
 			    !kbench_actor_pattern_ok(&w->actor_ctx, ret,
 							KBENCH_REQ_PATTERN)) {
 				pr_warn_ratelimited("kbench_server: pool-to-SGL copy failed (%d/%d, err=%d)\n",

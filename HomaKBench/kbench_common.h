@@ -284,6 +284,33 @@ static inline int kbench_sgl_copy(struct kbench_actor_ctx *ctx,
 	return 0;
 }
 
+/* Vanilla's second RX copy uses the same preallocated destination layout
+ * as single-copy RX: the Client's bvec iterator or the Server's SGL.
+ * Keep the actual copy API consistent with nvme_homa / nvmet_homa.
+ * The optional linear Client mode is retained for focused comparisons.
+ */
+static inline int kbench_copy_pool_to_actor(struct kbench_actor_ctx *ctx,
+					   const char *src, size_t len)
+{
+	size_t copied;
+
+	if (!ctx || len > ctx->buf_size - ctx->bytes_received)
+		return -EMSGSIZE;
+	if (ctx->use_bvec)
+		copied = copy_to_iter(src, len, &ctx->iter);
+	else if (ctx->use_sgl)
+		copied = sg_pcopy_from_buffer(ctx->sgt.sgl, ctx->sgt.nents,
+					     src, len, ctx->bytes_received);
+	else {
+		memcpy(ctx->app_buf + ctx->bytes_received, src, len);
+		copied = len;
+	}
+	if (copied != len)
+		return -EFAULT;
+	ctx->bytes_received += copied;
+	return 0;
+}
+
 static inline bool kbench_actor_pattern_ok(struct kbench_actor_ctx *ctx,
 					   int len, u8 pattern)
 {

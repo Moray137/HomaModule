@@ -105,7 +105,6 @@ struct sock_ctx {
 	char *tx_buf;
 	char *rx_buf;
 	char *pool_region;
-	char *app_copy_scratch;
 	struct bio_vec *tx_bvecs;
 	int nr_tx_bvecs;
 	struct page **tx_pages;
@@ -318,8 +317,9 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 	sc->recv_args.id = 0;
 	sc->recv_args.completion_cookie = 0;
 
-	if (rx_single_copy) {
+	if (rx_single_copy || simulate_app_copy)
 		kbench_actor_reset(&sc->actor_ctx);
+	if (rx_single_copy) {
 		sc->recv_args.rx_actor_ctx =
 			(__u64)(uintptr_t)&sc->actor_ctx;
 	} else {
@@ -344,27 +344,32 @@ static int do_homa_rpc(struct sock_ctx *sc, int size)
 				KBENCH_REPLY_PATTERN))
 		return -EBADMSG;
 
-	/* Simulate the second pool-to-app copy for baseline mode. */
-	if (simulate_app_copy && !rx_single_copy && sc->app_copy_scratch &&
-	    sc->recv_args.num_bpages > 0) {
+	/* Vanilla: Homa pool -> the identical bvec/linear destination used
+	 * by single-copy RX. For rx_bvec=1 this uses copy_to_iter(), as in
+	 * the nvme_homa Host receive path.
+	 */
+	if (simulate_app_copy && !rx_single_copy) {
 		u64 app_copy_start = ktime_get_ns();
-		int copied = 0, i;
+		int copied = 0, i, err = 0;
 
 		for (i = 0; i < sc->recv_args.num_bpages && copied < ret; i++) {
 			u32 off = sc->recv_args.bpage_offsets[i];
-			int chunk = min_t(int, ret - copied,
-					  HOMA_BPAGE_SIZE);
+			int chunk = min_t(int, ret - copied, HOMA_BPAGE_SIZE);
 
-			memcpy(sc->app_copy_scratch + copied,
-			       sc->pool_region + off, chunk);
+			err = kbench_copy_pool_to_actor(&sc->actor_ctx,
+							sc->pool_region + off,
+							chunk);
+			if (err)
+				break;
 			copied += chunk;
 		}
 		INC_METRIC(rx_app_copy_ns, ktime_get_ns() - app_copy_start);
 		INC_METRIC(rx_app_copy_count, 1);
 		INC_METRIC(rx_app_copy_bytes, copied);
-		if (copied != ret ||
-		    !kbench_pattern_ok(sc->app_copy_scratch, ret,
-				KBENCH_REPLY_PATTERN))
+		if (err || copied != ret ||
+		    sc->actor_ctx.bytes_received != ret ||
+		    !kbench_actor_pattern_ok(&sc->actor_ctx, ret,
+					     KBENCH_REPLY_PATTERN))
 			return -EBADMSG;
 	}
 
@@ -739,21 +744,12 @@ static int __init kbench_client_init(void)
 			memset(sc->tx_buf, KBENCH_REQ_PATTERN, max_msg_size);
 		}
 
-		/* Page-backed bvec or linear actor destination. */
-		if (rx_single_copy && is_homa) {
+		/* Same bvec (or optional linear) destination in both RX modes. */
+		if (is_homa && (rx_single_copy || simulate_app_copy)) {
 			ret = kbench_actor_init(&sc->actor_ctx, max_msg_size,
 						!!rx_bvec);
 			if (ret)
 				goto err_socks;
-		}
-
-		/* Pool-to-app scratch for simulate_app_copy. */
-		if (simulate_app_copy && !rx_single_copy && is_homa) {
-			sc->app_copy_scratch = kvmalloc(max_msg_size, GFP_KERNEL);
-			if (!sc->app_copy_scratch) {
-				ret = -ENOMEM;
-				goto err_socks;
-			}
 		}
 
 		if (is_homa)
@@ -819,8 +815,7 @@ err_socks:
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
-		kvfree(sc->app_copy_scratch);
-		kbench_actor_free(&sc->actor_ctx);
+			kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);
@@ -861,8 +856,7 @@ static void __exit kbench_client_exit(void)
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
-		kvfree(sc->app_copy_scratch);
-		kbench_actor_free(&sc->actor_ctx);
+			kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);

@@ -780,6 +780,15 @@ struct homa_metrics {
 	u64 rx_add_packet_ns;
 	u64 rx_add_packet_count;
 	u64 rx_add_packet_bytes;
+	/* RX actor ordering and receive handoff (per-CPU totals). */
+	u64 rx_actor_order_walk_steps;
+	u64 rx_actor_order_packets;
+	u64 rx_actor_delivery_setup_ns;
+	u64 rx_actor_deliveries;
+	u64 rx_actor_handoffs;
+	u64 rx_pool_handoffs;
+	u64 rx_pool_partial_handoffs;
+	u64 rx_pool_copy_batches;
 	u64 rx_copy_to_pool_ns;
 	u64 rx_copy_to_pool_count;
 	u64 rx_copy_to_pool_bytes;
