@@ -13,6 +13,7 @@
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
 #include <linux/scatterlist.h>
+#include <linux/uio.h>
 #include <net/sock.h>
 #include <net/inet_sock.h>
 

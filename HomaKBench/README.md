@@ -52,17 +52,19 @@ Homa's full-message skb actor. The vanilla path continues using the Homa
 receive pool. The older client `zc` and server `rx_actor_used` parameters
 remain supported as compatibility aliases.
 
-**RX destination models:** the client uses page-backed `bio_vec[]`
-(`rx_bvec=1`, representing the Host receive destination), while the
-server uses a separately allocated page-backed Linux `scatterlist`
-(representing the Target NVMe request SGL, without a storage backend or
-DMA mapping). Both Server RX paths copy into the **same SGL layout**:
-`rx_single_copy=1` copies directly `skb -> SGL` and
-`rx_single_copy=0 simulate_app_copy=1` copies
-`skb -> Homa pool -> SGL`. The server accepts `rx_bvec` for runner
-compatibility but does not use it to select the destination. The
-single-copy mode eliminates the intermediate pool-to-SGL copy;
-it does not eliminate copying from the skb.
+**RX destination models:** both RX modes use identical preallocated
+destinations. The Client uses page-backed `bio_vec[]` (`rx_bvec=1`)
+and the Server uses a page-backed Linux `scatterlist` (no actual NVMe
+backend or DMA mapping). Client vanilla copies `skb -> Homa pool ->
+bio_vec` via `copy_to_iter()`; Client single-copy copies
+`skb -> bio_vec` via `skb_copy_datagram_iter()`. Server vanilla
+copies `skb -> Homa pool -> SGL` via `sg_pcopy_from_buffer()`;
+Server single-copy copies `skb -> SGL` through the skb actor.
+The server accepts `rx_bvec` for runner compatibility but always
+uses SGL. Client `rx_bvec=0` keeps an optional linear-destination
+comparison (using that destination in both RX modes).
+Copy-count differences are measured with destination layout held fixed;
+the single-copy mode still copies payload from skb.
 
 `nonblocking=1` uses `MSG_DONTWAIT` for each Homa TX/RX syscall,
 retrying `-EAGAIN` only after waiting for socket readiness. This is
@@ -85,10 +87,11 @@ sudo insmod kbench_client.ko transport=homa dst_ip=192.168.11.93 \
 cat /sys/kernel/debug/homakbench/results
 ```
 
-For an end-to-end pool-copy baseline that includes the former second copy,
+For an end-to-end pool-copy baseline that includes the second copy,
 run `rx_single_copy=0 simulate_app_copy=1` on **both** the client and
-the server. Server-side `simulate_app_copy=1` copies pool bytes into
-the worker-local SGL destination (the same layout used by the actor).
+the server. `simulate_app_copy=1` now copies into the same bvec (Client)
+or worker-local SGL (Server) used by the actor, including the same
+destination-data validation.
 Do **not** enable `simulate_app_copy` for `rx_single_copy=1`.
 Run the two-by-two TX/RX combinations without adding sorting as a separate
 benchmark knob.

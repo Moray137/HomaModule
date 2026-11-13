@@ -815,7 +815,7 @@ err_socks:
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
-			kbench_actor_free(&sc->actor_ctx);
+		kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);
@@ -856,7 +856,7 @@ static void __exit kbench_client_exit(void)
 		kvfree(sc->tx_buf);
 		kvfree(sc->rx_buf);
 		kvfree(sc->pool_region);
-			kbench_actor_free(&sc->actor_ctx);
+		kbench_actor_free(&sc->actor_ctx);
 		kfree(sc->tx_bvecs);
 	}
 	kfree(sockets);
