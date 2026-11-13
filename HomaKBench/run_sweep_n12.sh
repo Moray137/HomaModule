@@ -151,9 +151,26 @@ if ! remote "$client_homa_check"; then
     exit 1
 fi
 
+# Record checkout identity and on-disk KBench module hashes. These are
+# provenance for the files on each node, not proof of a loaded Homa build.
+server_source_head="$(git -C "$HOMA_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+printf -v client_git_cmd 'git -C %q rev-parse HEAD' "$CLIENT_DIR/.."
+client_source_head="$(remote "$client_git_cmd" 2>/dev/null || echo unknown)"
+server_kernel="$(uname -r)"
+client_kernel="$(remote 'uname -r')"
+server_kbench_ko_sha256="$(sha256sum "$HERE/kbench_server.ko" | cut -d' ' -f1)"
+printf -v client_hash_cmd 'sha256sum %q' "$CLIENT_DIR/kbench_client.ko"
+client_kbench_ko_sha256="$(remote "$client_hash_cmd" | cut -d' ' -f1)"
+
 cat > "$OUT_DIR/config.txt" <<EOF
 host=n12
 server_node=n12
+server_kernel=$server_kernel
+client_kernel=$client_kernel
+server_checkout_head=$server_source_head
+client_checkout_head=$client_source_head
+server_kbench_ko_sha256=$server_kbench_ko_sha256
+client_kbench_ko_sha256=$client_kbench_ko_sha256
 server_ip=$SERVER_IP
 client_ssh=$CLIENT_SSH
 client_dir=$CLIENT_DIR
@@ -252,4 +269,4 @@ done
 done
 
 python3 "$HERE/summarize_sweep.py" "$OUT_DIR"
-echo "Results: $OUT_DIR/runs.csv, $OUT_DIR/stages.csv, $OUT_DIR/summary.csv"
+echo "Results: $OUT_DIR/runs.csv, $OUT_DIR/stages.csv, $OUT_DIR/summary.csv, $OUT_DIR/size_runs.csv, $OUT_DIR/size_summary.csv"
