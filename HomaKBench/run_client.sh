@@ -50,18 +50,34 @@ insmod "$SCRIPT_DIR/kbench_client.ko" \
 echo "Waiting for completed experiment results (up to ${TOTAL_WAIT}s)..."
 RESULTS_PATH=/sys/kernel/debug/homakbench/results
 RESULTS=""
+COMPLETE=0
 for ((elapsed=0; elapsed<TOTAL_WAIT; elapsed++)); do
-    # debugfs files can report st_size=0 even after becoming readable.
-    # Check the actual contents, including the final throughput line.
+    # debugfs st_size can be 0. Mixed-size percentiles are written
+    # AFTER the throughput line; wait until their counts add up to the
+    # global latency sample count before unloading the kernel module.
     RESULTS="$(cat "$RESULTS_PATH" 2>/dev/null || true)"
     if [[ "$RESULTS" == *"HomaKBench results:"* &&
           "$RESULTS" == *"throughput:"* ]]; then
-        break
+        if [[ "$RESULTS" == *"workload=blksw6"* ]]; then
+            completed="$(printf '%s\n' "$RESULTS" |
+                sed -n -E 's/^[[:space:]]*completed RPCs: ([0-9]+)$/\1/p')"
+            class_total="$(printf '%s\n' "$RESULTS" |
+                awk '$2 == "KiB:" && $3 ~ /^n=[0-9]+$/ {
+                    sub(/^n=/, "", $3); total += $3
+                } END {print total+0}')"
+            if [[ -n "$completed" && "$completed" != 0 &&
+                  "$completed" == "$class_total" ]]; then
+                COMPLETE=1
+                break
+            fi
+        else
+            COMPLETE=1
+            break
+        fi
     fi
     sleep 1
 done
-if [[ "$RESULTS" != *"HomaKBench results:"* ||
-      "$RESULTS" != *"throughput:"* ]]; then
+if [[ "$COMPLETE" != 1 ]]; then
     echo "ERROR: no finalized KBench results after ${TOTAL_WAIT}s" >&2
     rmmod kbench_client 2>/dev/null || true
     exit 1
