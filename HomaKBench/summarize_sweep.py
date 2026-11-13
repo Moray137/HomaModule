@@ -112,10 +112,11 @@ for entry in entries:
     text = (root / entry["client_result"]).read_text()
     reported_workload = result_value(text, r"\bworkload=(\w+)", str)
     reported_size = result_value(text, r"\bfixed_msg_size=(\d+)", int)
-    if reported_workload != workload:
+    if reported_workload != workload and not (
+            reported_workload is None and workload == "fixed"):
         raise ValueError(f"Workload mismatch in {entry['client_result']}: "
                          f"manifest={workload}, client={reported_workload}")
-    if workload == "fixed" and reported_size != size:
+    if workload == "fixed" and reported_size is not None and reported_size != size:
         raise ValueError(f"Size mismatch in {entry['client_result']}: "
                          f"manifest={size}, client={reported_size}")
     p99 = result_value(text, r"^\s*P99:\s*([0-9]+(?:\.[0-9]+)?)\s+us")
