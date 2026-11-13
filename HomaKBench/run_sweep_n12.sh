@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run on server n12 (192.168.11.93) as root; SSH to client n11 (192.168.11.97).
-# Each trial uses one fixed Homa message size; request and reply sizes match.
+# Fixed-size and blksw6 mixed workload; request and reply sizes match.
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,6 +11,8 @@ CLIENT_IP="${CLIENT_IP:-192.168.11.97}"
 SERVER_IP="${SERVER_IP:-192.168.11.93}"
 PORT="${PORT:-5000}"
 SIZES="${SIZES:-4096 8192 12288 16384 131072 1048576}"
+WORKLOAD="${WORKLOAD:-fixed}"
+BLKSW_WEIGHTS="${BLKSW_WEIGHTS:-10,57,10,10,8,5}"
 RX_MODES="${RX_MODES:-0 1}"
 REPEATS="${REPEATS:-3}"
 RATE="${RATE:-12}"
@@ -36,6 +38,47 @@ if [[ ! "$NUM_SOCKETS" =~ ^[1-9][0-9]*$ ]] ||
     echo "NUM_SOCKETS must be 1..64." >&2
     exit 1
 fi
+# Keep the fixed-size loop unchanged; blksw6 needs exactly one trial
+# per (rate, RX mode, repeat), regardless of the SIZES setting.
+case "$WORKLOAD" in
+    fixed)
+        read -r -a CASE_SIZES <<< "$SIZES"
+        if (( ${#CASE_SIZES[@]} == 0 )); then
+            echo "SIZES must contain at least one message size." >&2
+            exit 1
+        fi
+        for size in "${CASE_SIZES[@]}"; do
+            if [[ ! "$size" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Invalid SIZES element: $size" >&2
+                exit 1
+            fi
+        done
+        ;;
+    blksw6)
+        IFS=',' read -r -a weights <<< "$BLKSW_WEIGHTS"
+        if (( ${#weights[@]} != 6 )); then
+            echo "BLKSW_WEIGHTS needs six comma-separated percentages." >&2
+            exit 1
+        fi
+        total_weight=0
+        for weight in "${weights[@]}"; do
+            if [[ ! "$weight" =~ ^(0|[1-9][0-9]*)$ ]]; then
+                echo "Invalid blksw6 weight: $weight" >&2
+                exit 1
+            fi
+            total_weight=$((total_weight + 10#$weight))
+        done
+        if (( total_weight != 100 )); then
+            echo "BLKSW_WEIGHTS must sum to 100 (got $total_weight)." >&2
+            exit 1
+        fi
+        CASE_SIZES=(4096)  # Unused fixed_msg_size parameter must be positive.
+        ;;
+    *)
+        echo "WORKLOAD must be fixed or blksw6 (got '$WORKLOAD')." >&2
+        exit 1
+        ;;
+esac
 # Parse all rate values before starting any modules or experiments.
 read -r -a RATE_VALUES <<< "$RATES"
 if (( ${#RATE_VALUES[@]} == 0 )); then
@@ -115,7 +158,9 @@ server_ip=$SERVER_IP
 client_ssh=$CLIENT_SSH
 client_dir=$CLIENT_DIR
 client_ip=$CLIENT_IP
-sizes=$SIZES
+workload=$WORKLOAD
+sizes_fixed_only=$SIZES
+blksw_weights=$BLKSW_WEIGHTS
 rx_modes=$RX_MODES
 repeats=$REPEATS
 rates_per_worker=$RATES
@@ -128,7 +173,7 @@ client_rx_destination=$([[ "$RX_BVEC" == "1" ]] && echo bvec || echo linear)
 server_rx_destination=sgl
 nonblocking=$NONBLOCKING
 EOF
-printf 'size_bytes,rx_single_copy,rate_per_worker,target_aggregate_rps,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
+printf 'workload,size_bytes,rx_single_copy,rate_per_worker,target_aggregate_rps,repeat,client_result,client_before,client_after,server_before,server_after\n' > "$OUT_DIR/manifest.csv"
 
 for rate in "${RATE_VALUES[@]}"; do
 for rx in $RX_MODES; do
@@ -138,9 +183,15 @@ for rx in $RX_MODES; do
     fi
     # Vanilla must pay for the second pool -> consumer copy.
     if [[ "$rx" == 0 ]]; then sim_copy=1; else sim_copy=0; fi
-    for size in $SIZES; do
+    for size in "${CASE_SIZES[@]}"; do
         for ((rep=1; rep<=REPEATS; rep++)); do
-            name="rate${rate}_size${size}_rx${rx}_rep${rep}"
+            if [[ "$WORKLOAD" == "blksw6" ]]; then
+                name="rate${rate}_blksw6_rx${rx}_rep${rep}"
+                manifest_size=""
+            else
+                name="rate${rate}_size${size}_rx${rx}_rep${rep}"
+                manifest_size="$size"
+            fi
             case_dir="$OUT_DIR/$name"
             mkdir -p "$case_dir"
             echo "=== $name (aggregate target=$((rate * NUM_SOCKETS)) RPC/s, TX ZC=$TX_ZC, RX bvec=$RX_BVEC, nonblock=$NONBLOCKING) ==="
@@ -166,11 +217,11 @@ for rx in $RX_MODES; do
             # to the n12 result directory alongside both metrics snapshots.
             client_result_tmp="$(remote 'mktemp /tmp/homakbench-client.XXXXXXXX')"
             printf -v start_client \
-              'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q' \
+              'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q workload=%q blksw_weights=%q' \
               "$CLIENT_DIR" "$DURATION" "$WARMUP" "$PORT" "$sim_copy" \
               "$client_result_tmp" "$TX_ZC" "$SERVER_IP" "$size" \
               "$rate" "$NUM_SOCKETS" "$TX_ZC" "$rx" "$RX_BVEC" \
-              "$NONBLOCKING" "$CLIENT_IP"
+              "$NONBLOCKING" "$CLIENT_IP" "$WORKLOAD" "$BLKSW_WEIGHTS"
             if ! remote "$start_client" > "$case_dir/client.log" 2>&1; then
                 echo "Client run failed on n11: $case_dir/client.log" >&2
                 tail -n 20 "$case_dir/client.log" >&2
@@ -189,8 +240,8 @@ for rx in $RX_MODES; do
                 echo "Missing result in $name" >&2
                 exit 1
             fi
-            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-               "$size" "$rx" "$rate" "$((rate * NUM_SOCKETS))" "$rep" \
+            printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+               "$WORKLOAD" "$manifest_size" "$rx" "$rate" "$((rate * NUM_SOCKETS))" "$rep" \
                "$name/client.result" \
                "$name/client.before" "$name/client.after" \
                "$name/server.before" "$name/server.after" \
