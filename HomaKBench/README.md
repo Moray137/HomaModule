@@ -182,27 +182,29 @@ subtracts the before/after snapshots. The script writes:
   target, achieved rate, skipped offered slots, error count, and validity
 - `stages.csv`: per-side, per-rate RX stage ns total, count, bytes,
   average ns and ns/4KiB, plus available TX `temp[0..6]` breakdown
-- `summary.csv`: global RTT per workload/size/rate with median P50 and
-  median/mean/stddev P99, mean achieved RPC/s and skipped slots,
-  RX ns/4KiB, and available TX average ns across valid repeats
+- `summary.csv`: the **single aggregated RX-path breakdown** alongside
+  median P50/P99, mean achieved RPC/s, available TX stages, per-side
+  RX stage timings, all actor/pool ordering and handoff counters, and
+  their normalized per-packet/per-message/per-batch costs
 - `size_runs.csv`: mixed-mode per-run per-size count, sample fraction,
   achieved size-class RPC/s, P50 and P99
 - `size_summary.csv`: mixed-mode per-size/per-rate aggregated counts,
   sample fractions, P50/P99 and achieved size-class RPC/s; the
   percentiles are medians of per-run percentiles, not pooled RPCs
 
-**Additional automatic metric exports:** `metrics_all.csv` contains
-before/after/delta for **every per-CPU metric** exported by
-`/proc/net/homa_metrics`, aggregated across cores per run and side;
-`metrics_all_summary.csv` reports mean/median deltas across valid
-repeats. Global `time_cycles`/`cpu_khz` metadata and `core` IDs
+**Automatic metric output:** Only `summarize_sweep.py` parses metrics
+snapshots. The entire aggregated RX breakdown lives in `summary.csv`
+(Client and Server columns for each size/mode/rate), and per-run stage
+measurements stay in the existing `stages.csv`. The single
+`metrics_all.csv` preserves before/after/delta for **every per-CPU metric**
+exported by `/proc/net/homa_metrics`, aggregated across cores per run
+and side. Global `time_cycles`/`cpu_khz` metadata and `core` IDs
 are excluded. A signed delta is retained for derived/non-monotonic
-fields; only the required stage counters are required to be monotonic.
-`rx_extra_raw.csv` and `rx_extra_summary.csv` additionally include
-the actor ordering/handoff and pool-batch counters, plus per-packet,
-per-message, and per-batch ratios. For older snapshots, unrecorded new
-counters remain **blank** rather than being reported as zero.
-All four CSVs are produced by `run_sweep_n12.sh` automatically.
+fields; only the required stage counters must be monotonic.
+For older snapshots, unrecorded new counters remain **blank** rather
+than being reported as zero. `run_sweep_n12.sh` invokes the same
+summarizer automatically. No separate RX-only Python or CSV output
+is required.
 
 **RX hot-path instrumentation:** The five RX stages are `add_packet`,
 `copy_to_pool`, `actor_copy`, `app_copy` (KBench only), and

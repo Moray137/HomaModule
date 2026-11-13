@@ -56,6 +56,20 @@ RX_EXTRA_STAGES = {
     "pool_batch_overhead": ("rx_pool_batch_overhead_ns",
                             "rx_pool_copy_batches"),
 }
+# Include every RX counter and useful per-RPC/packet/batch normalization
+# directly in summary.csv. metrics_all.csv retains every raw run delta.
+RX_EXTRA_SUMMARY_FIELDS = (
+    "rx_messages", *RX_EXTRA_KEYS,
+    "walk_steps_per_packet",
+    "pool_batches_per_rpc",
+    "partial_handoffs_per_rpc",
+    "partial_pct_of_counted_handoffs",
+    "actor_setup_ns_per_delivery",
+    "actor_overhead_ns_per_delivery",
+    "actor_overhead_ns_per_rpc",
+    "pool_overhead_ns_per_batch",
+    "pool_overhead_ns_per_rpc",
+)
 
 def result_value(text, pattern, caster=float):
     match = re.search(pattern, text, flags=re.MULTILINE)
@@ -172,7 +186,7 @@ def write_csv(path, rows, columns):
         writer.writerows(rows)
 
 runs, stages, stage_index, size_runs = [], [], {}, []
-all_metrics_rows, extra_rows = [], []
+all_metrics_rows, extra_index = [], {}
 for entry in entries:
     workload = entry.get("workload") or "fixed"  # Old fixed-size manifests.
     if workload not in ("fixed", "blksw6"):
@@ -271,7 +285,8 @@ for entry in entries:
             **meta, "metric": name, "before": before[name],
             "after": after[name], "delta": delta[name],
         } for name in sorted(delta))
-        extra_rows.append(extra_breakdown(meta, delta))
+        extra_index[(workload, size, rx, per_worker, repeat, side)] = (
+            extra_breakdown(meta, delta))
         rows = [
             per_stage(delta, name,
                       f"rx_{name}_ns", f"rx_{name}_count",
@@ -328,6 +343,10 @@ stage_columns.extend(
     f"{side}_{stage}_avg_ns"
     for side in ("client", "server") for stage in RX_EXTRA_STAGES
 )
+stage_columns.extend(
+    f"{side}_{field}"
+    for side in ("client", "server") for field in RX_EXTRA_SUMMARY_FIELDS
+)
 for (workload, size, rx, rate), group in sorted(
         groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0,
                                        kv[0][2], kv[0][3] or -1)):
@@ -382,6 +401,15 @@ for (workload, size, rx, rate), group in sorted(
             ]
             values = [v for v in values if v is not None]
             output[f"{side}_{stage}_avg_ns"] = (
+                round(statistics.mean(values), 3) if values else None
+            )
+        for field in RX_EXTRA_SUMMARY_FIELDS:
+            values = [
+                extra_index[(workload, size, rx, rate, run["repeat"], side)][field]
+                for run in valid
+            ]
+            values = [v for v in values if v is not None]
+            output[f"{side}_{field}"] = (
                 round(statistics.mean(values), 3) if values else None
             )
     summary.append(output)
@@ -453,61 +481,6 @@ metric_columns = [
 ]
 write_csv(root / "metrics_all.csv", all_metrics_rows, metric_columns)
 
-metric_groups = defaultdict(list)
-for row in all_metrics_rows:
-    key = (row["workload"], row["size_bytes"], row["rx_single_copy"],
-           row["rate_per_worker"], row["side"], row["metric"])
-    metric_groups[key].append(row)
-metric_summary_rows = []
-for key, group in sorted(metric_groups.items(),
-                         key=lambda item: str(item[0])):
-    valid_group = [r for r in group if r["valid"]]
-    values = [r["delta"] for r in valid_group]
-    metric_summary_rows.append({
-        "workload": key[0], "size_bytes": key[1],
-        "size_kib": int(key[1]) // 1024 if key[1] != "" else "",
-        "rx_single_copy": key[2], "rate_per_worker": key[3],
-        "side": key[4], "metric": key[5],
-        "repeats": len(group), "valid_repeats": len(valid_group),
-        "mean_delta": round(statistics.mean(values), 3) if values else None,
-        "median_delta": statistics.median(values) if values else None,
-    })
-write_csv(root / "metrics_all_summary.csv", metric_summary_rows, [
-    "workload", "size_bytes", "size_kib", "rx_single_copy",
-    "rate_per_worker", "side", "metric", "repeats", "valid_repeats",
-    "mean_delta", "median_delta",
-])
-
-# RX-specific raw deltas and normalized costs; the raw column set adapts
-# to old snapshots where the newest counters did not yet exist.
-extra_columns = list(extra_rows[0])
-write_csv(root / "rx_extra_raw.csv", extra_rows, extra_columns)
-extra_groups = defaultdict(list)
-for row in extra_rows:
-    key = (row["workload"], row["size_bytes"], row["rx_single_copy"],
-           row["rate_per_worker"], row["side"])
-    extra_groups[key].append(row)
-extra_summary_rows = []
-for key, group in sorted(extra_groups.items(), key=lambda item: str(item[0])):
-    valid_group = [r for r in group if r["valid"]]
-    summary_row = {
-        "workload": key[0], "size_bytes": key[1],
-        "size_kib": int(key[1]) // 1024 if key[1] != "" else "",
-        "rx_single_copy": key[2], "rate_per_worker": key[3],
-        "side": key[4], "repeats": len(group),
-        "valid_repeats": len(valid_group),
-    }
-    for column in extra_columns:
-        if column in summary_row or column in (
-                "repeat", "valid", "target_aggregate_rps"):
-            continue
-        values = [r[column] for r in valid_group if r[column] is not None]
-        summary_row[column] = (round(statistics.mean(values), 3)
-                               if values else None)
-    extra_summary_rows.append(summary_row)
-write_csv(root / "rx_extra_summary.csv", extra_summary_rows,
-          list(extra_summary_rows[0]))
-
 for row in summary:
     label = (f'{row["size_kib"]:>5} KiB' if row["workload"] == "fixed"
              else "blksw6")
@@ -520,6 +493,4 @@ for row in summary:
           f'mean achieved={row["mean_achieved_rps"]} RPC/s')
 print(f"Wrote {root / 'runs.csv'}, {root / 'stages.csv'}, "
       f"{root / 'summary.csv'}, {root / 'size_runs.csv'}, "
-      f"{root / 'size_summary.csv'}, {root / 'metrics_all.csv'}, "
-      f"{root / 'metrics_all_summary.csv'}, "
-      f"{root / 'rx_extra_raw.csv'}, {root / 'rx_extra_summary.csv'}")
+      f"{root / 'size_summary.csv'}, {root / 'metrics_all.csv'}")

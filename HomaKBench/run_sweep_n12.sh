@@ -281,5 +281,5 @@ done
 
 python3 "$HERE/summarize_sweep.py" "$OUT_DIR"
 echo "Results: $OUT_DIR/runs.csv, $OUT_DIR/stages.csv, $OUT_DIR/summary.csv, $OUT_DIR/size_runs.csv, $OUT_DIR/size_summary.csv"
-echo "RX overhead: $OUT_DIR/rx_extra_raw.csv, $OUT_DIR/rx_extra_summary.csv"
-echo "All Homa metrics: $OUT_DIR/metrics_all.csv, $OUT_DIR/metrics_all_summary.csv"
+echo "RX breakdown: $OUT_DIR/summary.csv (per-run stage detail: $OUT_DIR/stages.csv)"
+echo "All Homa metric deltas: $OUT_DIR/metrics_all.csv"
