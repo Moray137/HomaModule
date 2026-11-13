@@ -152,7 +152,7 @@ per-worker RPC/s values), `RATE` (single-rate fallback, default 12),
 `RATES` takes precedence over `RATE`; omitting `RATES` preserves the
 existing single-rate interface. Each value is RPC/s **per worker**:
 aggregate offered target is `rate * NUM_SOCKETS`. The default
-`RATE=12` with `NUM_SOCKETS=16` targets 192 aggregate RPC/s.
+`RATE=12` with the fixed-workload default `NUM_SOCKETS=16` targets 192 aggregate RPC/s; `blksw6` defaults to six workers unless `NUM_SOCKETS` is explicitly supplied.
 Rate values must be unique integers in 1..1000000.
 Earlier aggregate-rate benchmarks have different semantics.
 
