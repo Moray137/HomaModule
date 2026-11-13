@@ -35,6 +35,28 @@ KEYS = {
 KEYS.update({"temp0", "temp1", "temp2", "temp3",
              "temp4", "temp5", "temp6", "sent_msg_bytes"})
 
+# Optional on older snapshots. New runs include these metrics automatically.
+RX_EXTRA_KEYS = (
+    "rx_actor_order_walk_steps",
+    "rx_actor_order_packets",
+    "rx_actor_delivery_setup_ns",
+    "rx_actor_delivery_overhead_ns",
+    "rx_actor_deliveries",
+    "rx_actor_handoffs",
+    "rx_pool_handoffs",
+    "rx_pool_partial_handoffs",
+    "rx_pool_copy_batches",
+    "rx_pool_batch_overhead_ns",
+)
+RX_EXTRA_STAGES = {
+    "actor_delivery_setup": ("rx_actor_delivery_setup_ns",
+                             "rx_actor_deliveries"),
+    "actor_delivery_overhead": ("rx_actor_delivery_overhead_ns",
+                                "rx_actor_deliveries"),
+    "pool_batch_overhead": ("rx_pool_batch_overhead_ns",
+                            "rx_pool_copy_batches"),
+}
+
 def result_value(text, pattern, caster=float):
     match = re.search(pattern, text, flags=re.MULTILINE)
     return caster(match.group(1)) if match else None
@@ -55,29 +77,79 @@ def parse_size_results(text):
     return rows
 
 def metrics_snapshot(path):
-    """Sum counters across all CPU sections of /proc/net/homa_metrics."""
+    """Sum every per-CPU Homa metric; ignore global clock metadata and core IDs."""
     counters = defaultdict(int)
+    in_cpu_section = False
     for line in path.read_text().splitlines():
         match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+(\d+)\b", line)
-        if match and match.group(1) in KEYS:
-            counters[match.group(1)] += int(match.group(2))
-    return counters
+        if not match:
+            continue
+        name, value = match.group(1), int(match.group(2))
+        if name == "core":
+            in_cpu_section = True
+            continue
+        if in_cpu_section:
+            counters[name] += value
+    return dict(counters)
 
 def metrics_delta(before_path, after_path):
     before = metrics_snapshot(before_path)
     after = metrics_snapshot(after_path)
+    if set(before) != set(after):
+        raise ValueError(
+            f"Metrics differ between {before_path} and {after_path}: "
+            f"only_before={sorted(set(before) - set(after))}, "
+            f"only_after={sorted(set(after) - set(before))}")
     missing = KEYS - set(after)
     if missing:
         raise ValueError(f"Metrics missing in {after_path}: {sorted(missing)}")
-    delta = {}
+    delta = {name: after[name] - before[name] for name in after}
+    # Existing stage counters are monotonically increasing. Other exported
+    # fields may be snapshots/derived quantities, so preserve signed deltas.
     for name in KEYS:
-        value = after[name] - before[name]
-        if value < 0:
+        if delta[name] < 0:
             raise ValueError(
                 f"Counter decreased in {after_path}: {name} "
                 f"{before[name]} -> {after[name]}. Was Homa reloaded?")
-        delta[name] = value
-    return delta
+    return before, after, delta
+
+def ratio(numerator, denominator):
+    return round(numerator / denominator, 3) if (
+        numerator is not None and denominator) else None
+
+def extra_breakdown(meta, delta):
+    """RX-focused counters plus normalized per-message and per-batch costs.
+
+    Message denominator includes warmup (same interval as Homa counters).
+    The server's initial vanilla handoff occurs in homa_rpc_alloc_server
+    and is not included in rx_pool_handoffs.
+    """
+    side = meta["side"]
+    messages = delta.get("client_responses_done" if side == "client"
+                         else "server_requests_done")
+    packets = delta.get("rx_actor_order_packets")
+    deliveries = delta.get("rx_actor_deliveries")
+    batches = delta.get("rx_pool_copy_batches")
+    handoffs = delta.get("rx_pool_handoffs")
+    partial = delta.get("rx_pool_partial_handoffs")
+    setup = delta.get("rx_actor_delivery_setup_ns")
+    actor_overhead = delta.get("rx_actor_delivery_overhead_ns")
+    pool_overhead = delta.get("rx_pool_batch_overhead_ns")
+    return {
+        **meta, "rx_messages": messages,
+        **{key: delta.get(key) for key in RX_EXTRA_KEYS},
+        "walk_steps_per_packet": ratio(
+            delta.get("rx_actor_order_walk_steps"), packets),
+        "pool_batches_per_rpc": ratio(batches, messages),
+        "partial_handoffs_per_rpc": ratio(partial, messages),
+        "partial_pct_of_counted_handoffs": ratio(
+            partial * 100 if partial is not None else None, handoffs),
+        "actor_setup_ns_per_delivery": ratio(setup, deliveries),
+        "actor_overhead_ns_per_delivery": ratio(actor_overhead, deliveries),
+        "actor_overhead_ns_per_rpc": ratio(actor_overhead, messages),
+        "pool_overhead_ns_per_batch": ratio(pool_overhead, batches),
+        "pool_overhead_ns_per_rpc": ratio(pool_overhead, messages),
+    }
 
 def per_stage(counters, stage, name_ns, name_count, name_bytes):
     ns_total = counters[name_ns]
@@ -100,6 +172,7 @@ def write_csv(path, rows, columns):
         writer.writerows(rows)
 
 runs, stages, stage_index, size_runs = [], [], {}, []
+all_metrics_rows, extra_rows = [], []
 for entry in entries:
     workload = entry.get("workload") or "fixed"  # Old fixed-size manifests.
     if workload not in ("fixed", "blksw6"):
@@ -184,10 +257,21 @@ for entry in entries:
                 "p99_us": data["p99_us"] if data else None,
             })
     for side in ("client", "server"):
-        delta = metrics_delta(
+        before, after, delta = metrics_delta(
             root / entry[f"{side}_before"],
             root / entry[f"{side}_after"],
         )
+        meta = dict(workload=workload,
+                    size_bytes=size if size is not None else "",
+                    size_kib=size // 1024 if size is not None else "",
+                    rx_single_copy=rx, rate_per_worker=per_worker,
+                    target_aggregate_rps=aggregate_target,
+                    repeat=repeat, valid=int(valid), side=side)
+        all_metrics_rows.extend({
+            **meta, "metric": name, "before": before[name],
+            "after": after[name], "delta": delta[name],
+        } for name in sorted(delta))
+        extra_rows.append(extra_breakdown(meta, delta))
         rows = [
             per_stage(delta, name,
                       f"rx_{name}_ns", f"rx_{name}_count",
@@ -197,6 +281,11 @@ for entry in entries:
         rows.extend(
             per_stage(delta, name, *sources)
             for name, sources in TX_STAGES.items()
+        )
+        rows.extend(
+            per_stage(delta, name, ns_key, count_key, None)
+            for name, (ns_key, count_key) in RX_EXTRA_STAGES.items()
+            if ns_key in delta and count_key in delta
         )
         for row in rows:
             item = dict(workload=workload,
@@ -234,6 +323,10 @@ summary, stage_columns = [], [
 stage_columns.extend(
     f"{side}_{stage}_avg_ns"
     for side in ("client", "server") for stage in TX_STAGES
+)
+stage_columns.extend(
+    f"{side}_{stage}_avg_ns"
+    for side in ("client", "server") for stage in RX_EXTRA_STAGES
 )
 for (workload, size, rx, rate), group in sorted(
         groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0,
@@ -274,6 +367,17 @@ for (workload, size, rx, rate), group in sorted(
         for stage in TX_STAGES:
             values = [
                 stage_index[(workload, size, rx, rate, run["repeat"], side, stage)]["avg_ns"]
+                for run in valid
+            ]
+            values = [v for v in values if v is not None]
+            output[f"{side}_{stage}_avg_ns"] = (
+                round(statistics.mean(values), 3) if values else None
+            )
+        for stage in RX_EXTRA_STAGES:
+            values = [
+                stage_index.get(
+                    (workload, size, rx, rate, run["repeat"], side, stage),
+                    {}).get("avg_ns")
                 for run in valid
             ]
             values = [v for v in values if v is not None]
@@ -339,6 +443,71 @@ write_csv(root / "size_summary.csv", size_summary, [
     "median_p50_us", "median_p99_us", "mean_p99_us", "stdev_p99_us",
 ])
 
+
+# Export every per-CPU /proc/net/homa_metrics delta, not just stages.
+# These are global node-wide counters over each run (including warmup).
+metric_columns = [
+    "workload", "size_bytes", "size_kib", "rx_single_copy",
+    "rate_per_worker", "target_aggregate_rps", "repeat", "valid",
+    "side", "metric", "before", "after", "delta",
+]
+write_csv(root / "metrics_all.csv", all_metrics_rows, metric_columns)
+
+metric_groups = defaultdict(list)
+for row in all_metrics_rows:
+    key = (row["workload"], row["size_bytes"], row["rx_single_copy"],
+           row["rate_per_worker"], row["side"], row["metric"])
+    metric_groups[key].append(row)
+metric_summary_rows = []
+for key, group in sorted(metric_groups.items(),
+                         key=lambda item: str(item[0])):
+    valid_group = [r for r in group if r["valid"]]
+    values = [r["delta"] for r in valid_group]
+    metric_summary_rows.append({
+        "workload": key[0], "size_bytes": key[1],
+        "size_kib": int(key[1]) // 1024 if key[1] != "" else "",
+        "rx_single_copy": key[2], "rate_per_worker": key[3],
+        "side": key[4], "metric": key[5],
+        "repeats": len(group), "valid_repeats": len(valid_group),
+        "mean_delta": round(statistics.mean(values), 3) if values else None,
+        "median_delta": statistics.median(values) if values else None,
+    })
+write_csv(root / "metrics_all_summary.csv", metric_summary_rows, [
+    "workload", "size_bytes", "size_kib", "rx_single_copy",
+    "rate_per_worker", "side", "metric", "repeats", "valid_repeats",
+    "mean_delta", "median_delta",
+])
+
+# RX-specific raw deltas and normalized costs; the raw column set adapts
+# to old snapshots where the newest counters did not yet exist.
+extra_columns = list(extra_rows[0])
+write_csv(root / "rx_extra_raw.csv", extra_rows, extra_columns)
+extra_groups = defaultdict(list)
+for row in extra_rows:
+    key = (row["workload"], row["size_bytes"], row["rx_single_copy"],
+           row["rate_per_worker"], row["side"])
+    extra_groups[key].append(row)
+extra_summary_rows = []
+for key, group in sorted(extra_groups.items(), key=lambda item: str(item[0])):
+    valid_group = [r for r in group if r["valid"]]
+    summary_row = {
+        "workload": key[0], "size_bytes": key[1],
+        "size_kib": int(key[1]) // 1024 if key[1] != "" else "",
+        "rx_single_copy": key[2], "rate_per_worker": key[3],
+        "side": key[4], "repeats": len(group),
+        "valid_repeats": len(valid_group),
+    }
+    for column in extra_columns:
+        if column in summary_row or column in (
+                "repeat", "valid", "target_aggregate_rps"):
+            continue
+        values = [r[column] for r in valid_group if r[column] is not None]
+        summary_row[column] = (round(statistics.mean(values), 3)
+                               if values else None)
+    extra_summary_rows.append(summary_row)
+write_csv(root / "rx_extra_summary.csv", extra_summary_rows,
+          list(extra_summary_rows[0]))
+
 for row in summary:
     label = (f'{row["size_kib"]:>5} KiB' if row["workload"] == "fixed"
              else "blksw6")
@@ -351,4 +520,6 @@ for row in summary:
           f'mean achieved={row["mean_achieved_rps"]} RPC/s')
 print(f"Wrote {root / 'runs.csv'}, {root / 'stages.csv'}, "
       f"{root / 'summary.csv'}, {root / 'size_runs.csv'}, "
-      f"{root / 'size_summary.csv'}")
+      f"{root / 'size_summary.csv'}, {root / 'metrics_all.csv'}, "
+      f"{root / 'metrics_all_summary.csv'}, "
+      f"{root / 'rx_extra_raw.csv'}, {root / 'rx_extra_summary.csv'}")

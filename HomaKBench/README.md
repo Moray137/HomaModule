@@ -191,6 +191,19 @@ subtracts the before/after snapshots. The script writes:
   sample fractions, P50/P99 and achieved size-class RPC/s; the
   percentiles are medians of per-run percentiles, not pooled RPCs
 
+**Additional automatic metric exports:** `metrics_all.csv` contains
+before/after/delta for **every per-CPU metric** exported by
+`/proc/net/homa_metrics`, aggregated across cores per run and side;
+`metrics_all_summary.csv` reports mean/median deltas across valid
+repeats. Global `time_cycles`/`cpu_khz` metadata and `core` IDs
+are excluded. A signed delta is retained for derived/non-monotonic
+fields; only the required stage counters are required to be monotonic.
+`rx_extra_raw.csv` and `rx_extra_summary.csv` additionally include
+the actor ordering/handoff and pool-batch counters, plus per-packet,
+per-message, and per-batch ratios. For older snapshots, unrecorded new
+counters remain **blank** rather than being reported as zero.
+All four CSVs are produced by `run_sweep_n12.sh` automatically.
+
 **RX hot-path instrumentation:** The five RX stages are `add_packet`,
 `copy_to_pool`, `actor_copy`, `app_copy` (KBench only), and
 `skb_free`. Each stage uses `ktime_get_ns()` around the operation and
@@ -201,6 +214,22 @@ path. Average ns and ns/4KiB are calculated offline. `actor_copy`
 includes the callback and skb-to-bvec copy when `rx_bvec=1`;
 `copy_to_pool` covers the native skb-to-pool path. `app_copy`
 accounts for the optional second pool-to-consumer copy.
+
+The three additional elapsed-time stages are `actor_delivery_setup`,
+`actor_delivery_overhead`, and `pool_batch_overhead`, reported as
+`avg_ns` in `stages.csv` and `summary.csv`. Actor delivery overhead
+covers one complete-message delivery from queue splice through RPC lock
+reacquisition, **excluding separately timed actor callbacks and skb free**.
+Pool batch overhead covers each nonempty pool-copy batch from RPC unlock
+through reacquisition, **excluding separately timed pool payload copy and
+skb free**. Both include bookkeeping, metric updates and potentially
+lock contention / scheduling wait: they are elapsed time, not pure CPU
+time. The actor setup metric is a **subset** of actor delivery overhead
+and must not be added to it. The pool handoff counter only instruments
+`homa_data_pkt()`, so it does not capture the initial Server vanilla
+handoff in `homa_rpc_alloc_server()`; use `rx_pool_copy_batches /
+server_requests_done` to get Server batches per received RPC. All
+metrics counters include warmup.
 
 **TX breakdown:** The original `temp[0..6]` counters in
 `homa_outgoing.c` remain unchanged. `temp[0]/temp[4]` measure
