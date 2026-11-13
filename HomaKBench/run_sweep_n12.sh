@@ -17,7 +17,11 @@ RX_MODES="${RX_MODES:-0 1}"
 REPEATS="${REPEATS:-3}"
 RATE="${RATE:-12}"
 RATES="${RATES:-$RATE}"  # Space-separated per-worker RPC/s; RATE remains a single-rate fallback.
-NUM_SOCKETS="${NUM_SOCKETS:-16}"
+if [[ "$WORKLOAD" == "blksw6" ]]; then
+    NUM_SOCKETS="${NUM_SOCKETS:-6}"
+else
+    NUM_SOCKETS="${NUM_SOCKETS:-16}"
+fi
 DURATION="${DURATION:-30}"
 WARMUP="${WARMUP:-5}"
 TX_ZC="${TX_ZC:-0}"
