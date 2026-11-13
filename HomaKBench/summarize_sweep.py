@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize KBench fixed-size trials using native Homa metrics deltas."""
+"""Summarize KBench fixed-size and blksw6 trials with Homa metrics deltas."""
 import csv
 import re
 import statistics
@@ -10,6 +10,8 @@ from pathlib import Path
 if len(sys.argv) != 2:
     raise SystemExit("Usage: summarize_sweep.py OUTPUT_DIR")
 root = Path(sys.argv[1])
+MIX_SIZES_KIB = (4, 8, 12, 16, 128, 1024)
+MAX_LATENCY_SAMPLES = 2 * 1024 * 1024  # kbench_client.c MAX_SAMPLES
 with (root / "manifest.csv").open(newline="") as f:
     entries = list(csv.DictReader(f))
 if not entries:
@@ -36,6 +38,21 @@ KEYS.update({"temp0", "temp1", "temp2", "temp3",
 def result_value(text, pattern, caster=float):
     match = re.search(pattern, text, flags=re.MULTILINE)
     return caster(match.group(1)) if match else None
+
+def parse_size_results(text):
+    """Read the final debugfs per-size latency lines (mixed workload only)."""
+    pattern = (r"^\\s*(\\d+) KiB:\\s*n=(\\d+)\\s+"
+               r"p50=([0-9]+(?:\\.[0-9]+)?)\\s+us\\s+"
+               r"p99=([0-9]+(?:\\.[0-9]+)?)\\s+us\\s*$")
+    rows = {}
+    for match in re.finditer(pattern, text, flags=re.MULTILINE):
+        size, count, p50, p99 = match.groups()
+        size = int(size)
+        if size not in MIX_SIZES_KIB or size in rows:
+            raise ValueError(f"Unexpected or duplicate blksw6 size: {size} KiB")
+        rows[size] = {"samples": int(count),
+                      "p50_us": float(p50), "p99_us": float(p99)}
+    return rows
 
 def metrics_snapshot(path):
     """Sum counters across all CPU sections of /proc/net/homa_metrics."""
@@ -82,12 +99,25 @@ def write_csv(path, rows, columns):
         writer.writeheader()
         writer.writerows(rows)
 
-runs, stages, stage_index = [], [], {}
+runs, stages, stage_index, size_runs = [], [], {}, []
 for entry in entries:
-    size = int(entry["size_bytes"])
+    workload = entry.get("workload") or "fixed"  # Old fixed-size manifests.
+    if workload not in ("fixed", "blksw6"):
+        raise ValueError(f"Unknown workload: {workload}")
+    size = int(entry["size_bytes"]) if entry["size_bytes"] else None
+    if (workload == "fixed") != (size is not None):
+        raise ValueError(f"Invalid size/workload in manifest: {entry}")
     rx = int(entry["rx_single_copy"])
     repeat = int(entry["repeat"])
     text = (root / entry["client_result"]).read_text()
+    reported_workload = result_value(text, r"\\bworkload=(\\w+)", str)
+    reported_size = result_value(text, r"\\bfixed_msg_size=(\\d+)", int)
+    if reported_workload != workload:
+        raise ValueError(f"Workload mismatch in {entry['client_result']}: "
+                         f"manifest={workload}, client={reported_workload}")
+    if workload == "fixed" and reported_size != size:
+        raise ValueError(f"Size mismatch in {entry['client_result']}: "
+                         f"manifest={size}, client={reported_size}")
     p99 = result_value(text, r"^\s*P99:\s*([0-9]+(?:\.[0-9]+)?)\s+us")
     p50 = result_value(text, r"^\s*P50:\s*([0-9]+(?:\.[0-9]+)?)\s+us")
     achieved = result_value(text, r"throughput:\s*(\d+)\s+RPCs/sec", int)
@@ -109,10 +139,24 @@ for entry in entries:
     failures = result_value(text, r"failed_rpc=(\d+)", int)
     skipped = result_value(text, r"skipped_busy_total=(\d+)", int)
     completed = result_value(text, r"completed RPCs:\s*(\d+)", int)
-    valid = p99 is not None and achieved is not None and failures == 0
+    duration_match = re.search(r"\\bduration=(\\d+)s warmup=(\\d+)s", text)
+    measurement_secs = ((int(duration_match.group(1)) -
+                         int(duration_match.group(2)))
+                        if duration_match else None)
+    class_results = parse_size_results(text) if workload == "blksw6" else {}
+    size_complete = (sum(row["samples"] for row in class_results.values())
+                     == completed) if workload == "blksw6" else True
+    sample_cap_hit = completed is not None and completed >= MAX_LATENCY_SAMPLES
+    valid = (p50 is not None and p99 is not None and achieved is not None
+             and failures == 0 and not sample_cap_hit and size_complete
+             and (workload != "blksw6" or
+                  (measurement_secs is not None and measurement_secs > 0)))
     run = {
-        "size_bytes": size, "size_kib": size // 1024,
+        "workload": workload, "size_bytes": size if size is not None else "",
+        "size_kib": size // 1024 if size is not None else "",
         "rx_single_copy": rx, "repeat": repeat, "valid": int(valid),
+        "sample_cap_hit": int(sample_cap_hit),
+        "size_samples_complete": int(size_complete),
         "p50_us": p50, "p99_us": p99,
         "rate_per_worker": per_worker, "target_aggregate_rps": aggregate_target,
         "offered_slots_total": offered,
@@ -120,6 +164,24 @@ for entry in entries:
         "failed_rpc": failures, "skipped_busy_total": skipped,
     }
     runs.append(run)
+    if workload == "blksw6":
+        for class_kib in MIX_SIZES_KIB:
+            data = class_results.get(class_kib)
+            n_class = data["samples"] if data else 0
+            size_runs.append({
+                "workload": workload, "size_bytes": class_kib * 1024,
+                "size_kib": class_kib,
+                "rx_single_copy": rx, "repeat": repeat,
+                "rate_per_worker": per_worker,
+                "target_aggregate_rps": aggregate_target,
+                "valid": int(valid), "samples": n_class,
+                "sample_fraction": round(n_class / completed, 6)
+                                   if completed else None,
+                "achieved_class_rps": round(n_class / measurement_secs, 3)
+                                      if measurement_secs and measurement_secs > 0 else None,
+                "p50_us": data["p50_us"] if data else None,
+                "p99_us": data["p99_us"] if data else None,
+            })
     for side in ("client", "server"):
         delta = metrics_delta(
             root / entry[f"{side}_before"],
@@ -136,28 +198,33 @@ for entry in entries:
             for name, sources in TX_STAGES.items()
         )
         for row in rows:
-            item = dict(size_bytes=size, size_kib=size // 1024,
+            item = dict(workload=workload,
+                        size_bytes=size if size is not None else "",
+                        size_kib=size // 1024 if size is not None else "",
                         rx_single_copy=rx, rate_per_worker=per_worker,
                         target_aggregate_rps=aggregate_target,
                         repeat=repeat, side=side, **row)
             stages.append(item)
-            stage_index[(size, rx, per_worker, repeat, side, row["stage"])] = row
+            stage_index[(workload, size, rx, per_worker, repeat, side, row["stage"])] = row
 
 write_csv(root / "runs.csv", runs, [
-    "size_bytes", "size_kib", "rx_single_copy", "repeat", "valid",
+    "workload", "size_bytes", "size_kib", "rx_single_copy", "repeat", "valid",
+    "sample_cap_hit", "size_samples_complete",
     "p50_us", "p99_us", "rate_per_worker", "target_aggregate_rps",
     "offered_slots_total", "achieved_rps", "completed", "failed_rpc",
     "skipped_busy_total",
 ])
 write_csv(root / "stages.csv", stages, [
-    "size_bytes", "size_kib", "rx_single_copy",
+    "workload", "size_bytes", "size_kib", "rx_single_copy",
     "rate_per_worker", "target_aggregate_rps", "repeat", "side",
     "stage", "count", "ns_total", "avg_ns", "bytes", "ns_per_4k",
 ])
 
 groups = defaultdict(list)
 for run in runs:
-    groups[(run["size_bytes"], run["rx_single_copy"], run["rate_per_worker"])].append(run)
+    size_key = run["size_bytes"] if run["workload"] == "fixed" else None
+    groups[(run["workload"], size_key,
+            run["rx_single_copy"], run["rate_per_worker"])].append(run)
 
 summary, stage_columns = [], [
     f"{side}_{stage}_ns4k"
@@ -167,8 +234,9 @@ stage_columns.extend(
     f"{side}_{stage}_avg_ns"
     for side in ("client", "server") for stage in TX_STAGES
 )
-for (size, rx, rate), group in sorted(
-        groups.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or -1)):
+for (workload, size, rx, rate), group in sorted(
+        groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0,
+                                       kv[0][2], kv[0][3] or -1)):
     valid = [r for r in group if r["valid"]]
     p50s = [r["p50_us"] for r in valid if r["p50_us"] is not None]
     p99s = [r["p99_us"] for r in valid]
@@ -176,7 +244,9 @@ for (size, rx, rate), group in sorted(
     skips = [r["skipped_busy_total"] for r in valid
              if r["skipped_busy_total"] is not None]
     output = {
-        "size_bytes": size, "size_kib": size // 1024,
+        "workload": workload,
+        "size_bytes": size if size is not None else "",
+        "size_kib": size // 1024 if size is not None else "",
         "rx_single_copy": rx, "repeats": len(group),
         "valid_repeats": len(valid),
         "rate_per_worker": rate,
@@ -193,7 +263,7 @@ for (size, rx, rate), group in sorted(
     for side in ("client", "server"):
         for stage in RX_STAGES:
             values = [
-                stage_index[(size, rx, rate, run["repeat"], side, stage)]["ns_per_4k"]
+                stage_index[(workload, size, rx, rate, run["repeat"], side, stage)]["ns_per_4k"]
                 for run in valid
             ]
             values = [v for v in values if v is not None]
@@ -202,7 +272,7 @@ for (size, rx, rate), group in sorted(
             )
         for stage in TX_STAGES:
             values = [
-                stage_index[(size, rx, rate, run["repeat"], side, stage)]["avg_ns"]
+                stage_index[(workload, size, rx, rate, run["repeat"], side, stage)]["avg_ns"]
                 for run in valid
             ]
             values = [v for v in values if v is not None]
@@ -212,15 +282,66 @@ for (size, rx, rate), group in sorted(
     summary.append(output)
 
 write_csv(root / "summary.csv", summary, [
-    "size_bytes", "size_kib", "rx_single_copy", "repeats", "valid_repeats",
+    "workload", "size_bytes", "size_kib",
+    "rx_single_copy", "repeats", "valid_repeats",
     "rate_per_worker", "target_aggregate_rps",
     "median_p50_us", "median_p99_us", "mean_p99_us", "stdev_p99_us",
     "mean_achieved_rps", "mean_skipped_busy_total",
     *stage_columns,
 ])
 
+# Per-size latency rows are separate: RX/TX Homa stage counters
+# are per-node aggregate and cannot be attributed to individual sizes.
+write_csv(root / "size_runs.csv", size_runs, [
+    "workload", "size_bytes", "size_kib", "rx_single_copy", "repeat",
+    "rate_per_worker", "target_aggregate_rps", "valid",
+    "samples", "sample_fraction", "achieved_class_rps", "p50_us", "p99_us",
+])
+
+class_groups = defaultdict(list)
+for row in size_runs:
+    class_groups[(row["rx_single_copy"], row["rate_per_worker"],
+                  row["size_bytes"])].append(row)
+
+size_summary = []
+for (rx, rate, size), group in sorted(class_groups.items()):
+    valid_rows = [row for row in group if row["valid"]]
+    nonempty = [row for row in valid_rows if row["samples"] > 0]
+    p50s = [row["p50_us"] for row in nonempty]
+    p99s = [row["p99_us"] for row in nonempty]
+    size_summary.append({
+        "workload": "blksw6", "size_bytes": size,
+        "size_kib": size // 1024, "rx_single_copy": rx,
+        "rate_per_worker": rate,
+        "target_aggregate_rps": group[0]["target_aggregate_rps"],
+        "repeats": len(group), "valid_repeats": len(valid_rows),
+        "nonempty_repeats": len(nonempty),
+        "total_samples": sum(row["samples"] for row in valid_rows),
+        "mean_samples": round(statistics.mean(
+            row["samples"] for row in valid_rows), 1) if valid_rows else None,
+        "mean_sample_fraction": round(statistics.mean(
+            row["sample_fraction"] for row in valid_rows), 6) if valid_rows else None,
+        "mean_achieved_class_rps": round(statistics.mean(
+            row["achieved_class_rps"] for row in valid_rows), 3)
+            if valid_rows else None,
+        "median_p50_us": statistics.median(p50s) if p50s else None,
+        "median_p99_us": statistics.median(p99s) if p99s else None,
+        "mean_p99_us": round(statistics.mean(p99s), 3) if p99s else None,
+        "stdev_p99_us": round(statistics.stdev(p99s), 3)
+                        if len(p99s) > 1 else None,
+    })
+write_csv(root / "size_summary.csv", size_summary, [
+    "workload", "size_bytes", "size_kib", "rx_single_copy",
+    "rate_per_worker", "target_aggregate_rps", "repeats", "valid_repeats",
+    "nonempty_repeats", "total_samples", "mean_samples",
+    "mean_sample_fraction", "mean_achieved_class_rps",
+    "median_p50_us", "median_p99_us", "mean_p99_us", "stdev_p99_us",
+])
+
 for row in summary:
-    print(f'{row["size_kib"]:>5} KiB RX={row["rx_single_copy"]} '
+    label = (f'{row["size_kib"]:>5} KiB' if row["workload"] == "fixed"
+             else "blksw6")
+    print(f'{label} RX={row["rx_single_copy"]} '
           f'rate/worker={row["rate_per_worker"]} '
           f'target={row["target_aggregate_rps"]} RPC/s '
           f'valid={row["valid_repeats"]}/{row["repeats"]} '
@@ -228,4 +349,5 @@ for row in summary:
           f'median P99={row["median_p99_us"]} us '
           f'mean achieved={row["mean_achieved_rps"]} RPC/s')
 print(f"Wrote {root / 'runs.csv'}, {root / 'stages.csv'}, "
-      f"{root / 'summary.csv'}")
+      f"{root / 'summary.csv'}, {root / 'size_runs.csv'}, "
+      f"{root / 'size_summary.csv'}")
