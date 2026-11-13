@@ -83,6 +83,13 @@ case "$WORKLOAD" in
         exit 1
         ;;
 esac
+# Keep old fixed-size Client arguments compatible with previous module builds.
+# The two mixed-workload parameters are needed only for blksw6.
+client_workload_args=""
+if [[ "$WORKLOAD" == "blksw6" ]]; then
+    printf -v client_workload_args ' workload=%q blksw_weights=%q' \
+        "$WORKLOAD" "$BLKSW_WEIGHTS"
+fi
 # Parse all rate values before starting any modules or experiments.
 read -r -a RATE_VALUES <<< "$RATES"
 if (( ${#RATE_VALUES[@]} == 0 )); then
@@ -238,11 +245,11 @@ for rx in $RX_MODES; do
             # to the n12 result directory alongside both metrics snapshots.
             client_result_tmp="$(remote 'mktemp /tmp/homakbench-client.XXXXXXXX')"
             printf -v start_client \
-              'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q workload=%q blksw_weights=%q' \
+              'cd %q && DURATION=%q WARMUP=%q PORT=%q SIM_APP_COPY=%q RESULT_FILE=%q bash ./run_client.sh homa %q %q %q %q %q tx_zc=%q rx_single_copy=%q rx_bvec=%q nonblocking=%q src_ip=%q%s' \
               "$CLIENT_DIR" "$DURATION" "$WARMUP" "$PORT" "$sim_copy" \
               "$client_result_tmp" "$TX_ZC" "$SERVER_IP" "$size" \
               "$rate" "$NUM_SOCKETS" "$TX_ZC" "$rx" "$RX_BVEC" \
-              "$NONBLOCKING" "$CLIENT_IP" "$WORKLOAD" "$BLKSW_WEIGHTS"
+              "$NONBLOCKING" "$CLIENT_IP" "$client_workload_args"
             if ! remote "$start_client" > "$case_dir/client.log" 2>&1; then
                 echo "Client run failed on n11: $case_dir/client.log" >&2
                 tail -n 20 "$case_dir/client.log" >&2
