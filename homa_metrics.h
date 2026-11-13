@@ -784,11 +784,19 @@ struct homa_metrics {
 	u64 rx_actor_order_walk_steps;
 	u64 rx_actor_order_packets;
 	u64 rx_actor_delivery_setup_ns;
+	/* Delivery elapsed time outside separately timed copy/free operations.
+	 * Includes the setup subset above plus lock reacquisition and bookkeeping.
+	 */
+	u64 rx_actor_delivery_overhead_ns;
 	u64 rx_actor_deliveries;
 	u64 rx_actor_handoffs;
 	u64 rx_pool_handoffs;
 	u64 rx_pool_partial_handoffs;
 	u64 rx_pool_copy_batches;
+	/* Batch elapsed time excluding separately timed payload copy/skb free.
+	 * May include lock contention and scheduling delays.
+	 */
+	u64 rx_pool_batch_overhead_ns;
 	u64 rx_copy_to_pool_ns;
 	u64 rx_copy_to_pool_count;
 	u64 rx_copy_to_pool_bytes;

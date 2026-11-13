@@ -426,11 +426,13 @@ char *homa_metrics_print(void)
 		M("rx_actor_order_walk_steps", m->rx_actor_order_walk_steps, "RX actor: reverse-list entries examined\n");
 		M("rx_actor_order_packets", m->rx_actor_order_packets, "RX actor: packets inserted in offset order\n");
 		M("rx_actor_delivery_setup_ns", m->rx_actor_delivery_setup_ns, "RX actor: complete-message delivery setup ns\n");
+		M("rx_actor_delivery_overhead_ns", m->rx_actor_delivery_overhead_ns, "RX actor: delivery elapsed ns excluding payload copy and skb free (includes setup)\n");
 		M("rx_actor_deliveries", m->rx_actor_deliveries, "RX actor: complete-message deliveries\n");
 		M("rx_actor_handoffs", m->rx_actor_handoffs, "RX actor: complete-message handoffs\n");
 		M("rx_pool_handoffs", m->rx_pool_handoffs, "RX pool: packet-ready handoffs\n");
 		M("rx_pool_partial_handoffs", m->rx_pool_partial_handoffs, "RX pool: handoffs before message completion\n");
 		M("rx_pool_copy_batches", m->rx_pool_copy_batches, "RX pool: nonempty copy batches\n");
+		M("rx_pool_batch_overhead_ns", m->rx_pool_batch_overhead_ns, "RX pool: batch elapsed ns excluding payload copy and skb free\n");
 		M("rx_copy_to_pool_ns", m->rx_copy_to_pool_ns, "RX copy_to_pool: elapsed ns total\n");
 		M("rx_copy_to_pool_count", m->rx_copy_to_pool_count, "RX copy_to_pool: operations total\n");
 		M("rx_copy_to_pool_bytes", m->rx_copy_to_pool_bytes, "RX copy_to_pool: payload bytes total\n");

@@ -349,6 +349,8 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	u64 rx_copy_start;
 	u64 rx_free_start;
 	u64 delivery_setup_start;
+	u64 actor_copy_elapsed_ns = 0;
+	u64 actor_free_elapsed_ns;
 #ifndef __STRIP__ /* See strip.py */
 	u64 start;
 #endif /* See strip.py */
@@ -399,7 +401,12 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 
 		rx_copy_start = ktime_get_ns();
 		used = rpc->hsk->rx_actor(&desc, skb, sizeof(*h), pkt_length);
-		INC_METRIC(rx_actor_copy_ns, ktime_get_ns() - rx_copy_start);
+		{
+			u64 copy_ns = ktime_get_ns() - rx_copy_start;
+
+			actor_copy_elapsed_ns += copy_ns;
+			INC_METRIC(rx_actor_copy_ns, copy_ns);
+		}
 		INC_METRIC(rx_actor_copy_count, 1);
 		INC_METRIC(rx_actor_copy_bytes, used > 0 ? used : 0);
 		if (desc.error) {
@@ -421,7 +428,8 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 	rx_free_start = ktime_get_ns();
 	while ((skb = __skb_dequeue(&sorted)))
 		kfree_skb(skb);
-	INC_METRIC(rx_skb_free_ns, ktime_get_ns() - rx_free_start);
+	actor_free_elapsed_ns = ktime_get_ns() - rx_free_start;
+	INC_METRIC(rx_skb_free_ns, actor_free_elapsed_ns);
 	INC_METRIC(rx_skb_free_count, n);
 	INC_METRIC(rx_skb_free_bytes, copied);
 	INC_METRIC(skb_free_cycles, homa_clock() - start);
@@ -430,6 +438,18 @@ int homa_deliver_skbs(struct homa_rpc *rpc, void *caller_ctx)
 		   n, rpc->id);
 
 	homa_rpc_lock_preempt(rpc);
+	/* Includes setup, callback-loop bookkeeping and lock reacquisition,
+	 * but excludes the separately timed payload callbacks and skb free.
+	 * delivery_setup_ns is a subset: do not add it again.
+	 */
+	{
+		u64 elapsed_ns = ktime_get_ns() - delivery_setup_start;
+		u64 accounted_ns = actor_copy_elapsed_ns + actor_free_elapsed_ns;
+
+		if (elapsed_ns >= accounted_ns)
+			INC_METRIC(rx_actor_delivery_overhead_ns,
+				   elapsed_ns - accounted_ns);
+	}
 
 	/* The RPC may have been freed while the lock was dropped. */
 	if (rpc->state == RPC_DEAD) {
@@ -478,6 +498,9 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 	u64 rx_copy_start;
 	u64 rx_free_start;
 	u64 batch_copied_bytes = 0;
+	u64 batch_overhead_start;
+	u64 batch_copy_elapsed_ns;
+	u64 batch_free_elapsed_ns;
 
 	/* Tricky note: we can't hold the RPC lock while we're actually
 	 * copying to user space, because (a) it's illegal to hold a spinlock
@@ -512,6 +535,8 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 		 * user space.
 		 */
 		INC_METRIC(rx_pool_copy_batches, 1);
+		batch_overhead_start = ktime_get_ns();
+		batch_copy_elapsed_ns = 0;
 		homa_rpc_unlock(rpc);
 		tt_record1("starting copy to buffer pool for id %d",
 			   rpc->id);
@@ -571,8 +596,12 @@ int homa_copy_to_pool(struct homa_rpc *rpc)
 					if (error)
 						goto free_skbs;
 				}
-				INC_METRIC(rx_copy_to_pool_ns,
-					   ktime_get_ns() - rx_copy_start);
+				{
+					u64 copy_ns = ktime_get_ns() - rx_copy_start;
+
+					batch_copy_elapsed_ns += copy_ns;
+					INC_METRIC(rx_copy_to_pool_ns, copy_ns);
+				}
 				INC_METRIC(rx_copy_to_pool_count, 1);
 				INC_METRIC(rx_copy_to_pool_bytes, chunk_size);
 				batch_copied_bytes += chunk_size;
@@ -605,7 +634,8 @@ free_skbs:
 		rx_free_start = ktime_get_ns();
 		for (i = 0; i < n; i++)
 			consume_skb(skbs[i]);
-		INC_METRIC(rx_skb_free_ns, ktime_get_ns() - rx_free_start);
+		batch_free_elapsed_ns = ktime_get_ns() - rx_free_start;
+		INC_METRIC(rx_skb_free_ns, batch_free_elapsed_ns);
 		INC_METRIC(rx_skb_free_count, n);
 		INC_METRIC(rx_skb_free_bytes, batch_copied_bytes);
 		batch_copied_bytes = 0;
@@ -616,6 +646,18 @@ free_skbs:
 			   n, rpc->id);
 		n = 0;
 		homa_rpc_lock_preempt(rpc);
+		/* One elapsed interval per nonempty pool-copy batch; subtract
+		 * already measured copy/free spans to avoid double counting.
+		 */
+		{
+			u64 elapsed_ns = ktime_get_ns() - batch_overhead_start;
+			u64 accounted_ns = batch_copy_elapsed_ns +
+						   batch_free_elapsed_ns;
+
+			if (elapsed_ns >= accounted_ns)
+				INC_METRIC(rx_pool_batch_overhead_ns,
+					   elapsed_ns - accounted_ns);
+		}
 		if (error)
 			break;
 	}
