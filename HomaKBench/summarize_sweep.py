@@ -41,9 +41,9 @@ def result_value(text, pattern, caster=float):
 
 def parse_size_results(text):
     """Read the final debugfs per-size latency lines (mixed workload only)."""
-    pattern = (r"^\\s*(\\d+) KiB:\\s*n=(\\d+)\\s+"
-               r"p50=([0-9]+(?:\\.[0-9]+)?)\\s+us\\s+"
-               r"p99=([0-9]+(?:\\.[0-9]+)?)\\s+us\\s*$")
+    pattern = (r"^\s*(\d+) KiB:\s*n=(\d+)\s+"
+               r"p50=([0-9]+(?:\.[0-9]+)?)\s+us\s+"
+               r"p99=([0-9]+(?:\.[0-9]+)?)\s+us\s*$")
     rows = {}
     for match in re.finditer(pattern, text, flags=re.MULTILINE):
         size, count, p50, p99 = match.groups()
@@ -110,8 +110,8 @@ for entry in entries:
     rx = int(entry["rx_single_copy"])
     repeat = int(entry["repeat"])
     text = (root / entry["client_result"]).read_text()
-    reported_workload = result_value(text, r"\\bworkload=(\\w+)", str)
-    reported_size = result_value(text, r"\\bfixed_msg_size=(\\d+)", int)
+    reported_workload = result_value(text, r"\bworkload=(\w+)", str)
+    reported_size = result_value(text, r"\bfixed_msg_size=(\d+)", int)
     if reported_workload != workload:
         raise ValueError(f"Workload mismatch in {entry['client_result']}: "
                          f"manifest={workload}, client={reported_workload}")
@@ -139,7 +139,7 @@ for entry in entries:
     failures = result_value(text, r"failed_rpc=(\d+)", int)
     skipped = result_value(text, r"skipped_busy_total=(\d+)", int)
     completed = result_value(text, r"completed RPCs:\s*(\d+)", int)
-    duration_match = re.search(r"\\bduration=(\\d+)s warmup=(\\d+)s", text)
+    duration_match = re.search(r"\bduration=(\d+)s warmup=(\d+)s", text)
     measurement_secs = ((int(duration_match.group(1)) -
                          int(duration_match.group(2)))
                         if duration_match else None)
