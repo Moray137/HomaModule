@@ -106,7 +106,7 @@ individual size and the mixed workload, first using the blocking mode and
 then `nonblocking=1`, including both `rx_single_copy` states, before
 drawing throughput/latency conclusions.
 
-## n12-driven fixed-size and per-worker rate sweep
+## n12-driven fixed-size or blksw6 mixed-workload rate sweep
 
 Topology: **n12 is the server (192.168.11.93)** and **n11 is the client
 (192.168.11.97)**. Run `run_sweep_n12.sh` **on n12 as root**. It starts
@@ -131,9 +131,18 @@ NUM_SOCKETS=6 SIZES="1048576" RX_MODES="0 1" \
 
 # Backward-compatible single rate (12 RPC/s per worker).
 RATE=12 REPEATS=3 bash ./run_sweep_n12.sh
+
+# Six independent QD1 workers sampling blksw6 per RPC.
+# Each rate is per worker; aggregate target is 6 * rate.
+WORKLOAD=blksw6 NUM_SOCKETS=6 BLKSW_WEIGHTS=10,57,10,10,8,5 \
+  RX_MODES="0 1" TX_ZC=0 RATES="32 64 128 256" \
+  REPEATS=3 DURATION=30 WARMUP=5 bash ./run_sweep_n12.sh
 ```
 
-Configuration variables: `SIZES` (space-separated sizes in bytes),
+Configuration variables: `WORKLOAD=fixed|blksw6` (default `fixed`),
+`BLKSW_WEIGHTS` (six comma-separated request-count percentages summing
+to 100; default `10,57,10,10,8,5`), `SIZES` (only for fixed,
+space-separated sizes in bytes),
 `RX_MODES` (default `"0 1"`), `REPEATS`, `RATES` (space-separated
 per-worker RPC/s values), `RATE` (single-rate fallback, default 12),
 `NUM_SOCKETS`, `TX_ZC`, `NONBLOCKING`, `RX_BVEC`, `DURATION`,
@@ -147,12 +156,18 @@ aggregate offered target is `rate * NUM_SOCKETS`. The default
 Rate values must be unique integers in 1..1000000.
 Earlier aggregate-rate benchmarks have different semantics.
 
-Each result directory has a unique name
-`rate<per_worker>_size<size_bytes>_rx<mode>_rep<repeat>`.
-`config.txt` records the entire `rates_per_worker` list; `manifest.csv`
-records `rate_per_worker` and `target_aggregate_rps` for each trial.
-All CSV files retain rate as a dimension: `summary.csv` groups by
-(size, RX mode, per-worker rate), never merges multiple offered rates.
+Fixed-size directories retain the original name
+`rate<per_worker>_size<size_bytes>_rx<mode>_rep<repeat>`; mixed
+directories use `rate<per_worker>_blksw6_rx<mode>_rep<repeat>`.
+The mixed mode executes exactly **one** workload trial per rate/RX/repeat
+and does not iterate `SIZES`. `config.txt` records the workload,
+weights, entire rate grid, per-node kernel releases, checkout HEADs,
+and the SHA256 of the KBench .ko files present on the respective nodes.
+Those identities do not independently prove the Homa module that was
+already loaded. `manifest.csv` records the workload and rate of each
+trial; `size_bytes` is empty for mixed global rows.
+`summary.csv` groups by workload, fixed size (if any), RX mode, and
+per-worker rate; different offered rates are never pooled.
 
 Each case captures the client benchmark output and reads
 `/proc/net/homa_metrics` on **both nodes** immediately before and after
@@ -164,9 +179,14 @@ subtracts the before/after snapshots. The script writes:
   target, achieved rate, skipped offered slots, error count, and validity
 - `stages.csv`: per-side, per-rate RX stage ns total, count, bytes,
   average ns and ns/4KiB, plus available TX `temp[0..6]` breakdown
-- `summary.csv`: per-size/per-rate median P50 and median/mean/stddev
-  P99, mean achieved rate and skipped slots, RX ns/4KiB, and available
-  TX average ns across valid repeats
+- `summary.csv`: global RTT per workload/size/rate with median P50 and
+  median/mean/stddev P99, mean achieved RPC/s and skipped slots,
+  RX ns/4KiB, and available TX average ns across valid repeats
+- `size_runs.csv`: mixed-mode per-run per-size count, sample fraction,
+  achieved size-class RPC/s, P50 and P99
+- `size_summary.csv`: mixed-mode per-size/per-rate aggregated counts,
+  sample fractions, P50/P99 and achieved size-class RPC/s; the
+  percentiles are medians of per-run percentiles, not pooled RPCs
 
 **RX hot-path instrumentation:** The five RX stages are `add_packet`,
 `copy_to_pool`, `actor_copy`, `app_copy` (KBench only), and
@@ -186,6 +206,14 @@ message-out fill time/count, `temp[1]` packet-allocation time,
 `temp[5]/temp[6]` individual xmit-data time/count. The original
 TX temp fields do not provide per-size variance or a denominator
 for every stage; unavailable summary values are left blank.
+
+Mixed Client results are not collected until the reported per-size
+sample counts add up to the global completed count (the Client writes
+those lines after the throughput line). The summarizer rejects missing
+size-class output, failures and runs at the 2,097,152-sample cap from
+its valid aggregate; invalid rows remain visible in `runs.csv` and
+`size_runs.csv`. The stage counters are **global for the mixed
+workload**, not per-size measurements.
 
 The native metrics include warmup, while benchmark P99 excludes warmup.
 Unlike the removed `homa_tl_record()` framework, the stage counters do
